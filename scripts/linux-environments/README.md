@@ -28,6 +28,8 @@ sudo /usr/bin/python3 -I bootstrap.py apply --trusted-user andrew
 
 使用已经审查并固定 digest 的 W7/W8 完整工具镜像。基础 Playwright 镜像本身尚不提供 Kaguya helper。镜像必须包含 `/opt/kaguya-tools/init` 和 `/opt/kaguya-tools/helper`，并支持 UID/GID 1000、只读 rootfs、`no-new-privileges`、全部 capability 丢弃、独立 IPC/PID/network 和 Chromium sandbox。禁止通过关闭 sandbox 获得启动成功。
 
+HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设置所有权；不直接传入解析器不支持的 `uid=`/`gid=`。实际挂载所有者、权限与可写性由工具镜像 CI 和生产预检分别核对。
+
 受信宿主用户可将 OCI archive 放入 `/var/lib/kaguya-tools-storage/containers/inbox/<SHA256>.oci`，通过 `image.import` RPC 提交 SHA-256。broker 使用 `O_NOFOLLOW` 打开，复制到不可由宿主用户写入的私有区，校验全文件 SHA-256 后执行固定的 `podman load`。文件大小最多 12 GiB，导入需要预留一份复制空间。随后 `environment.create` 使用完整的 `name@sha256:...`；`--pull=never` 保证执行时不会自行更新镜像。导入和环境管理是宿主管理操作，不注册成模型工具。
 
 所有 RPC 为单连接、单 JSON 行：`{"protocol":1,"method":"health","params":{}}`。请求最多 256 KiB，最多 16 个并发连接。`health` 不启动任务。业务输入错误返回稳定错误码，不输出原始请求或异常堆栈。

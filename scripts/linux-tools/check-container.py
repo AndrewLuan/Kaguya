@@ -68,7 +68,17 @@ def main():
         home_info = backend.command("exec", env["container"], "/usr/bin/stat", "-c", "%u:%g:%a", "/home/tool").decode().strip()
         assert home_info == "1000:1000:700", home_info
         diagnostics = backend.command("exec", env["container"], "/bin/cat", "/proc/self/status").decode()
-        print(json.dumps({"home": home_info, "processStatus": diagnostics}), flush=True)
+        inspected_container = json.loads(backend.command("inspect", env["container"]))[0]
+        oci = json.loads(Path(inspected_container["OCIConfigPath"]).read_text())
+        seccomp = oci.get("linux", {}).get("seccomp", {})
+        relevant = {"mount", "umount", "umount2", "clone", "clone3", "unshare", "setns", "pivot_root"}
+        print(json.dumps({"home": home_info, "processStatus": diagnostics, "effectivePolicy": {
+            "seccompDefaultAction": seccomp.get("defaultAction"),
+            "namespaceRules": [rule for rule in seccomp.get("syscalls", []) if relevant & set(rule.get("names", []))],
+            "maskedPaths": oci.get("linux", {}).get("maskedPaths"), "readonlyPaths": oci.get("linux", {}).get("readonlyPaths"),
+            "apparmorProfile": oci.get("process", {}).get("apparmorProfile"),
+            "noNewPrivileges": oci.get("process", {}).get("noNewPrivileges"), "capabilities": oci.get("process", {}).get("capabilities"),
+            "uidMappings": oci.get("linux", {}).get("uidMappings"), "gidMappings": oci.get("linux", {}).get("gidMappings")}}), flush=True)
         start = operation("start", argv=["/usr/local/bin/node", "-e", "setTimeout(()=>require('fs').writeFileSync('marker','actual-container'),100)"], cwd=".", env={})
         assert start["result"]["accepted"] is True
         limit = time.monotonic() + 10

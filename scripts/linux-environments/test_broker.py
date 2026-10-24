@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from broker import Broker, BrokerError
+from broker import Broker, BrokerError, PodmanBackend
 
 
 class FakeBackend:
@@ -133,6 +133,21 @@ class BrokerTest(unittest.TestCase):
         finally:
             self.backend.fail_stop = False
         self.assertEqual(self.broker.release(self.request())["state"], "quarantined")
+
+    def test_production_tmpfs_ownership_uses_supported_U_option(self):
+        backend = PodmanBackend()
+        calls = []
+        def command(*args, **_kwargs):
+            calls.append(args)
+            return b'[{"State":{"Running":true}}]' if args[0] == "inspect" else b""
+        with patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0}):
+            backend.create({**self.env, "container": "controlled", "network": "none"})
+        args = calls[0]
+        self.assertIn("--user=1000:1000", args)
+        self.assertIn("--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U", args)
+        self.assertIn("--read-only", args)
+        self.assertIn("--cap-drop=ALL", args)
+        self.assertIn("--security-opt=no-new-privileges", args)
 
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()
