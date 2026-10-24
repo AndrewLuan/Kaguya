@@ -20,6 +20,7 @@ import {
 import { z } from "@kaguya/schema";
 import {
   observationCapability,
+  actionRunValidityCapability,
   defineInformationKind,
   defineModuleCapability,
   defineInformationModuleCatalog,
@@ -156,6 +157,7 @@ export async function cognitiveFixture(
       catalog,
       capabilities: [
         { capability: observationCapability, value: database.observations },
+        { capability: actionRunValidityCapability, value: database.actions },
         {
           capability: nativeMemoryCapability,
           value: createNativeMemoryAccess({

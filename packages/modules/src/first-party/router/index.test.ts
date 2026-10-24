@@ -9,7 +9,10 @@
  * 模型替身入口断言观察成功及持久 claim/run 已存在、行动意图尚未创建；观察能力使用真实数据库实现。
  */
 import { closeTestResources } from "../test-support/cleanup.js";
-import { observationCapability } from "@kaguya/sdk";
+import {
+  observationCapability,
+  actionRunValidityCapability,
+} from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import {
@@ -166,6 +169,7 @@ async function fixture(
     now,
     capabilities: [
       { capability: observationCapability, value: database.observations },
+      { capability: actionRunValidityCapability, value: database.actions },
       { capability: rawContextCapability, value: database.rawEvents },
       {
         capability: modelTaskCapability,
@@ -503,6 +507,7 @@ async function all(database: any) {
   });
 }
 
+// 单次状态等待 8s；双阶段用例 25s，双轮加清空 45s，新屏障用例 30s；不重复计算 decide 已确认的 context。
 const PERSISTENCE_WAIT = { timeout: 8000, interval: 20 } as const;
 async function settle(
   database: Awaited<ReturnType<typeof createTestingDatabase>>,
@@ -567,7 +572,7 @@ it("persists the observation and run identity before model execution can create 
   await decide(f.core, opportunity.candidate, "observe");
   await settle(f.database);
   expect(checked).toBe(true);
-});
+}, 25000);
 
 it("freezes before attention and defer does not call Light or advance progress", async () => {
   const { core, database, execute } = await fixture();
@@ -590,7 +595,7 @@ it("freezes before attention and defer does not call Light or advance progress",
     ),
   ).toBe(true);
   expect(execute).not.toHaveBeenCalled();
-});
+}, 25000);
 
 it("freezes exactly the registration-watermark window before observe", async () => {
   const { core, database } = await fixture({
@@ -618,7 +623,7 @@ it("freezes exactly the registration-watermark window before observe", async () 
     opportunity.unread.at(-1)!.informationId,
   );
   await waitFor(database, turnSilentInformationKind.kind);
-});
+}, 25000);
 
 it("processes a later registered opportunity with an earlier event time after a completed turn", async () => {
   const { core, database, execute } = await fixture({
@@ -655,7 +660,7 @@ it("processes a later registered opportunity with an earlier event time after a 
     atoms.filter((atom: any) => atom.kind === "agent.router.turn.superseded"),
   ).toHaveLength(0);
   expect(execute).toHaveBeenCalledTimes(2);
-});
+}, 45000);
 
 it("waits for Identity terminal before freezing the observed batch", async () => {
   const { core, database } = await fixture({
@@ -679,7 +684,7 @@ it("waits for Identity terminal before freezing the observed batch", async () =>
   );
   await waitFor(database, turnContextCompletedInformationKind.kind);
   await decide(core, opportunity.candidate, "observe");
-});
+}, 25000);
 
 it("keeps the earlier frozen input unchanged when attention receives a newer Focus lease", async () => {
   const { core, database } = await fixture({
@@ -741,20 +746,24 @@ it.each([
     { action: "silent", reason: "no-response-needed" },
     turnSilentInformationKind.kind,
   ],
-] as const)("keeps Light ownership of %s", async (action, expectedKind) => {
-  const { core, database } = await fixture({ action });
-  const opportunity = await appendOpportunity(core, {
-    texts: ["planner input"],
-  });
-  await decide(core, opportunity.candidate, "observe");
-  await waitFor(database, expectedKind);
-  if (action.action === "wait")
-    expect(
-      (await all(database)).some(
-        (atom: any) => atom.kind === waitRequestedInformationKind.kind,
-      ),
-    ).toBe(true);
-});
+] as const)(
+  "keeps Light ownership of %s",
+  async (action, expectedKind) => {
+    const { core, database } = await fixture({ action });
+    const opportunity = await appendOpportunity(core, {
+      texts: ["planner input"],
+    });
+    await decide(core, opportunity.candidate, "observe");
+    await waitFor(database, expectedKind);
+    if (action.action === "wait")
+      expect(
+        (await all(database)).some(
+          (atom: any) => atom.kind === waitRequestedInformationKind.kind,
+        ),
+      ).toBe(true);
+  },
+  25000,
+);
 
 it("applies mute after observe and opens Focus only from a direct group signal", async () => {
   const muted = await fixture({ muted: true });
@@ -774,4 +783,72 @@ it("applies mute after observe and opens Focus only from a direct group signal",
     startedAt: "2026-09-22T08:00:10.000Z",
     expiresAt: "2026-09-22T08:02:10.000Z",
   });
-});
+}, 25000);
+
+it.each([false, true])(
+  "preserves work on unrelated input and rejects a persistently invalidated late decision (%s)",
+  async (invalidate) => {
+    let modelEntered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = await fixture({
+      beforeExecute: async () => {
+        modelEntered = true;
+        await gate;
+      },
+    });
+    // closeTestResources 按逆序清理，先释放模型屏障，避免失败污染 Host/Core shutdown。
+    clean.push(async () => {
+      release();
+    });
+    const op = await appendOpportunity(f.core, { texts: ["正在处理的任务"] });
+    await decide(f.core, op.candidate, "observe");
+    try {
+      await vi.waitFor(() => expect(modelEntered).toBe(true), PERSISTENCE_WAIT);
+      const turn = (
+        await f.core.select(routerStateSelector, op.candidate.informationId)
+      ).find((a) => a.kind === turnContextCompletedInformationKind.kind)!;
+      const incoming = await f.core.register(inboundTextInformationKind, {
+        occurredAt: new Date().toISOString(),
+        source: "test:interjection",
+        payload: {
+          text: "无关插话",
+          source: {
+            ...(op.inputs[0]!.payload.source as any),
+            platformMessageId: "later",
+          },
+        },
+        references: [
+          { relation: "core:context", informationId: op.context.informationId },
+        ],
+      });
+      if (invalidate) {
+        const s = turn.payload.source as any,
+          d = s.destination;
+        await f.database.actions.invalidateRun(
+          String(turn.payload.claimInformationId),
+          JSON.stringify([
+            s.platform,
+            s.adapterId,
+            d.kind,
+            d.userId ?? d.groupId ?? d.conversationId ?? null,
+          ]),
+          incoming.informationId,
+        );
+      }
+      release();
+      await settle(f.database);
+      const all = await f.database.information.find({
+        kinds: [messageIntentRequestedInformationKind.kind],
+        limit: 100,
+      });
+      expect(all).toHaveLength(invalidate ? 0 : 1);
+      expect(f.execute).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+    }
+  },
+  30000, // 初始化、8s 模型入口、8s 持久清空和资源清理共享总预算。
+);

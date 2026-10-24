@@ -11,7 +11,7 @@
  * 多次取消、重建与重启场景另设 30 秒总预算；QQ 四至五轮 45 秒、八轮加重启 60 秒。
  * macOS 四轮实测约 26 秒，Windows 八轮约 29 秒，顺序 I/O 不能套用单轮的 15 秒总上限；
  * 每次状态等待仍受 8 秒预算约束，不增加业务 deadline 或允许的重试次数。
- * 尚未提交决策的 Light 可由新输入打断；静默窗后合并旧、新输入重构，已提交决策仍保持唯一终态。
+ * 尚未提交决策的 Light 可由宿主持久确认的干预打断；静默窗后合并旧、新输入重构，已提交决策仍保持唯一终态。
  * 覆盖 message/wait/silent 与 target union 的 JSON mode 本地校验、一次结构修复、耗尽后失败关闭、
  * 累计 usage 和单 requested/terminal/decision；重试复用冻结 Prompt，重放与新输入取消均不重复落地。
  * Light v2 的每轮 schema 在模型修复阶段拒绝超预算 wait 与焦点越界；保留单次结构修复和单一回合终态。
@@ -23,6 +23,8 @@ import {
   closeTestResources,
   createPersistenceWait,
 } from "./test-support/persistence.js";
+import { randomUUID } from "node:crypto";
+import { freezeInformationAtom, informationAtomSchema } from "@kaguya/schema";
 import { readSituation } from "./inspection-situation.js";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createMessageComposition } from "@kaguya/composition";
@@ -260,6 +262,23 @@ async function fixture(
     atoms,
     settle,
     message,
+    invalidateCurrentRun: async () => {
+      const turn = (await atoms())
+        .filter((a) => a.kind === "agent.router.turn.context.completed")
+        .at(-1)!;
+      const source = turn.payload.source as any,
+        d = source.destination;
+      await database.actions.invalidateRun(
+        String(turn.payload.claimInformationId),
+        JSON.stringify([
+          source.platform,
+          source.adapterId,
+          d.kind,
+          d.userId ?? d.groupId ?? d.conversationId ?? null,
+        ]),
+        turn.informationId,
+      );
+    },
     cancel: (id: string) => cancelTask(id),
     core: () => core,
     submit: (m: PlatformInboundMessage) => runtime.submit(m),
@@ -280,6 +299,165 @@ function kinds(
 }
 
 describe("Router Light via DeepSeek-compatible provider", () => {
+  it.each([false, true])(
+    "checks the actual Heavy recall supplement before delivery (withdraw=%s)",
+    async (withdraw) => {
+      let calls = 0,
+        entered = false,
+        release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const term = "紫晶星云超导档案";
+      const f = await fixture([silent, speak], true, async () => {
+        if (calls++ === 0)
+          return { action: "recall", query: term, candidateIds: [] };
+        entered = true;
+        await gate;
+        return { action: "message", text: "补查结果已读取" };
+      });
+      try {
+        await f.submit(f.message("seed", { text: "一条已经处理的历史来源" }));
+        await f.settle();
+        // 已形成的独立历史来源不在本轮 pending 或初始固定摘要中。
+        const source = { informationId: randomUUID() };
+        const scope = JSON.stringify(["qq", "test", "private", "user"]),
+          nodeId = randomUUID();
+        await f.database.information.synchronizeKinds([
+          "memory.native.source.v1",
+          "test.historical.evidence",
+        ]);
+        await f.database.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId: source.informationId,
+              kind: "test.historical.evidence",
+              source: "test:historical-proof",
+              occurredAt: "2020-01-01T00:00:00Z",
+              payload: { text: term },
+              references: [],
+            }),
+          ),
+          [],
+        );
+        await f.database.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId: `memory-native-source:${source.informationId}`,
+              kind: "memory.native.source.v1",
+              source: "test:historical-proof",
+              occurredAt: "2020-01-01T00:00:00Z",
+              payload: {
+                memorySource: {
+                  id: source.informationId,
+                  ownerId: "person:historical",
+                  scope,
+                },
+                sourceProofVersion: 1,
+                sourceOwners: ["person:historical"],
+              },
+              references: [],
+            }),
+          ),
+          [],
+        );
+        await f.database.memoryGraph.native.publish({
+          operationId: "seed-supplement",
+          actor: "manual",
+          nodes: [
+            {
+              expectedRevision: 0,
+              node: {
+                id: nodeId,
+                content: term,
+                metadata: {
+                  system: "native-v1",
+                  kind: "experience",
+                  scope,
+                  ownerId: "person:historical",
+                  level: 1,
+                  revision: 1,
+                  status: "active",
+                  locked: false,
+                  sourceIds: [source.informationId],
+                  aliases: [],
+                  tags: [],
+                  occurredAt: "2020-01-01T00:00:00Z",
+                },
+              },
+            },
+          ],
+        });
+        f.setTime(1000);
+        await f.submit(f.message("question", { text: "请完成另一项任务" }));
+        await f.waitFor("Heavy follow-up sees the persisted recall", () =>
+          expect(entered).toBe(true),
+        );
+        const graph = await f.atoms(),
+          frozen = graph
+            .filter((a) => a.kind === "agent.situation.frozen")
+            .at(-1)!;
+        const original = (frozen.payload.frame as any).memory;
+        expect(
+          [...original.fixed, ...original.recalled.map((r: any) => r.node)].map(
+            (n: any) => n.id,
+          ),
+        ).not.toContain(nodeId);
+        expect(
+          (original.pendingEvidence ?? []).map((e: any) => e.informationId),
+        ).not.toContain(source.informationId);
+        const recall = graph
+          .filter((a) => a.kind === "agent.heavy.recall.completed")
+          .at(-1)!;
+        expect(
+          (recall.payload.snapshot as any).recalled.map((r: any) => r.node.id),
+        ).toContain(nodeId);
+        const followup = graph.find(
+          (a) =>
+            a.kind === "core.model.task.requested" &&
+            a.payload.sourceInformationId === recall.informationId,
+        )!;
+        expect(
+          JSON.stringify(
+            (followup.payload.prompt as any).variables.find(
+              (v: any) => v.name === "memory_recall",
+            ),
+          ),
+        ).toContain(nodeId);
+        if (withdraw)
+          await f.database.memoryGraph.native.publish({
+            operationId: "withdraw-supplement",
+            actor: "manual",
+            nodes: [],
+            invalidations: [
+              {
+                kind: "source-withdrawal",
+                targetId: source.informationId,
+                reason: "synthetic correction",
+              },
+            ],
+          });
+        release();
+        await f.settle();
+        expect(f.delivered).toHaveBeenCalledTimes(withdraw ? 0 : 1);
+        const actions = (
+          await f.database.sql.query<{ input: any; state: string }>(
+            "SELECT input,state FROM information_action_heads",
+          )
+        ).rows;
+        expect(actions).toHaveLength(1);
+        expect(actions[0]!.state).toBe(withdraw ? "rejected" : "succeeded");
+        expect(actions[0]!.input.dependencies.memoryRevisions).toContainEqual({
+          id: nodeId,
+          revision: 1,
+        });
+      } finally {
+        release();
+      }
+    },
+    40000,
+  );
+
   it(
     "freezes first-contact summaries and resumes Heavy from persisted recall after restart",
     async () => {
@@ -703,7 +881,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
   );
 
   it.each([false, true])(
-    "interrupts Light during repair=%s and coalesces incoming messages after the quiet window",
+    "persistent invalidation interrupts Light during repair=%s and coalesces messages after the quiet window",
     async (duringRepair) => {
       let release!: (value: unknown) => void;
       const blocked = new Promise((resolve) => {
@@ -720,6 +898,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(blockedRequestCount),
         );
+        await f.invalidateCurrentRun();
         f.setTime(1000);
         for (let i = 0; i < 8; i++)
           await f.submit(f.message(`m${i + 2}`, { text: `更新的消息 ${i}` }));
@@ -790,7 +969,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
   );
 
   it(
-    "refreshes the interruption quiet window from the latest message",
+    "refreshes the quiet window after persistent invalidation from the latest message",
     async () => {
       let release!: (value: unknown) => void;
       const blocked = new Promise((resolve) => {
@@ -802,6 +981,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(1),
         );
+        await f.invalidateCurrentRun();
         f.setTime(1000);
         await f.submit(f.message("m2"));
         await f.waitFor("speech persistence", async () =>
@@ -835,7 +1015,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
   );
 
   it(
-    "stops interrupting after two Light rebuilds",
+    "keeps explicit invalidation effective after two Light rebuilds",
     async () => {
       const releases: ((value: unknown) => void)[] = [];
       const blocked = () =>
@@ -849,6 +1029,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
           expect(releases).toHaveLength(1),
         );
         for (let round = 1; round <= 2; round++) {
+          await f.invalidateCurrentRun();
           f.setTime(1000);
           await f.submit(f.message(`m${round + 1}`));
           await f.waitFor("speech persistence", async () =>
@@ -866,18 +1047,16 @@ describe("Router Light via DeepSeek-compatible provider", () => {
             expect(releases).toHaveLength(round + 1),
           );
         }
+        await f.invalidateCurrentRun();
         f.setTime(1000);
         await f.submit(f.message("m4"));
-        await f.waitFor("speech persistence", async () =>
-          expect(kinds(await f.atoms())).toContain(
-            "agent.heartbeat.observation.wake",
-          ),
+        await f.waitFor("third persistent invalidation committed", async () =>
+          expect(
+            (await f.atoms()).filter(
+              (a) => a.kind === "agent.router.turn.interrupted",
+            ),
+          ).toHaveLength(3),
         );
-        expect(
-          (await f.atoms()).filter(
-            (a) => a.kind === "agent.router.turn.interrupted",
-          ),
-        ).toHaveLength(2);
         releases[2]!(silent);
         await f.settle();
       } finally {
@@ -888,7 +1067,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
   );
 
   it(
-    "rebuilds on new input without consuming the wait budget",
+    "rebuilds after persistent invalidation without consuming the wait budget",
     async () => {
       let release!: (value: unknown) => void;
       const blocked = new Promise((resolve) => {
@@ -900,6 +1079,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(1),
         );
+        await f.invalidateCurrentRun();
         f.setTime(1000);
         await f.submit(f.message("during-wait"));
         await f.waitFor("speech persistence", async () =>
@@ -1155,7 +1335,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
   });
 
   it(
-    "rebuilds after a decision write failure when new input arrives before decision commit",
+    "rebuilds after persistent invalidation between a decision write failure and retry",
     async () => {
       const f = await fixture([speak, speak]);
       const commit = f.core().commitTerminal.bind(f.core());
@@ -1179,6 +1359,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         await f.waitFor("speech persistence", () =>
           expect(interrupted).toBe(true),
         );
+        await f.invalidateCurrentRun();
         await f.submit(
           f.message("late-history", {
             occurredAt: "2026-09-12T11:59:00.000Z",

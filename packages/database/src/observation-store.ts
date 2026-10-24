@@ -353,6 +353,12 @@ export class PostgresObservationStore implements ObservationAccess {
       })
       .safeParse(manifest.content);
     if (!content.success) throw new ObservationConflictError();
+    const frozenMemory = (manifest.content as any).memory;
+    if (
+      frozenMemory?.cutoff?.publicationPosition !==
+      manifest.knowledgeCutoff.memoryPublicationPosition
+    )
+      throw new ObservationConflictError();
     const memory = content.data.memory;
     const revisions = new Map<string, number>();
     for (const n of [

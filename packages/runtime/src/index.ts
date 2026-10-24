@@ -17,3 +17,5 @@ export * from "./runtime.js";
 export { executionExhaustedInformationKind } from "@kaguya/engine";
 
 export * from "./message-targets.js";
+
+export { ActionExecutor, type ActionExecutorOptions } from "./action.js";

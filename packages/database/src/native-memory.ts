@@ -14,6 +14,8 @@ import {
   type MemoryView,
 } from "./native-memory-history.js";
 import { sourceProofOwners } from "./native-memory-proof.js";
+import { checkActionDependencies } from "./action-dependencies.js";
+import type { ActionDependencies } from "@kaguya/sdk";
 import { randomUUID, createHash } from "node:crypto";
 import {
   memoryPublicationSchema,
@@ -158,6 +160,9 @@ export class PostgresNativeMemoryStore
     private readonly db: SqlDatabase,
     private readonly snapshot = false,
   ) {}
+  async checkDependencies(input: ActionDependencies) {
+    return this.db.transaction((tx) => checkActionDependencies(tx, input));
+  }
   async cutoff(input: MemoryReadContext) {
     return input.cutoff ?? { publicationPosition: await memoryUpper(this.db) };
   }

@@ -178,6 +178,7 @@ export class NapCatActionClient
         this.pending.delete(echo);
         resolve({
           ok: false,
+          outcome: "unknown",
           adapterId: this.options.adapterId,
           platform: "qq",
           target,
@@ -229,6 +230,7 @@ export class NapCatActionClient
       const platformMessageId = extractMessageId(body.data);
       pending.resolve({
         ok: true,
+        outcome: "delivered",
         adapterId: this.options.adapterId,
         platform: "qq",
         target: pending.target,
@@ -240,6 +242,7 @@ export class NapCatActionClient
 
     pending.resolve({
       ok: false,
+      outcome: "unknown",
       adapterId: this.options.adapterId,
       platform: "qq",
       target: pending.target,
@@ -254,6 +257,7 @@ export class NapCatActionClient
       clearTimeout(pending.timer);
       pending.resolve({
         ok: false,
+        outcome: "unknown",
         adapterId: this.options.adapterId,
         platform: "qq",
         target: pending.target,

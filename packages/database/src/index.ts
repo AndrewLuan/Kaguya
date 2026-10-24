@@ -13,6 +13,15 @@
  */
 import { PostgresObservationStore } from "./observation-store.js";
 import { prepareObservationSchema } from "./observation-schema.js";
+import { PostgresActionStore, prepareActionSchema } from "./action-store.js";
+export {
+  PostgresActionStore,
+  actionDigest,
+  actionBasisDigest,
+  actionExecutionDigest,
+  type ActionAuthorization,
+  type ActionClaim,
+} from "./action-store.js";
 import { PgDatabase, type SqlDatabase } from "./driver.js";
 export { PgDatabase, type SqlDatabase } from "./driver.js";
 import { InformationRepository } from "./information-repository.js";
@@ -88,6 +97,7 @@ export {
 } from "./native-memory.js";
 
 export class KaguyaDatabase {
+  readonly actions: PostgresActionStore;
   readonly observations: PostgresObservationStore;
   readonly information: InformationRepository;
   readonly memoryGraph: PostgresMemoryGraphStore;
@@ -95,6 +105,7 @@ export class KaguyaDatabase {
   readonly modelRequestMetrics: ModelRequestMetricsRepository;
 
   constructor(readonly sql: SqlDatabase) {
+    this.actions = new PostgresActionStore(sql);
     this.observations = new PostgresObservationStore(sql);
     this.information = new InformationRepository(sql);
     this.memoryGraph = new PostgresMemoryGraphStore(sql);
@@ -124,6 +135,7 @@ export class KaguyaDatabase {
   async prepareSchema(): Promise<void> {
     await prepareDatabaseSchema(this.sql);
     await prepareObservationSchema(this.sql);
+    await prepareActionSchema(this.sql);
   }
 
   async close(): Promise<void> {

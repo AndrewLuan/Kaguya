@@ -105,6 +105,7 @@ const testMessageTemplates = {
   memoryItem: "{{content}}",
 };
 
+import { ActionExecutor } from "./action.js";
 import { GatewayAllowlist } from "./gateway-allowlist.js";
 import {
   KaguyaRuntime,
@@ -494,6 +495,9 @@ describe("KaguyaRuntime", () => {
       resources.push({ runtime, database });
       await expect(runtime.start()).rejects.toThrow(/capability/i);
       expect(create).not.toHaveBeenCalled();
+      await expect(runtime.actions.execute("unused", "unused")).rejects.toThrow(
+        "action-executor-closed",
+      );
     },
   );
 
@@ -871,6 +875,9 @@ describe("KaguyaRuntime", () => {
       await Promise.allSettled([starting, closing]);
     }
     await closing;
+    await expect(runtime.actions.execute("unused", "unused")).rejects.toThrow(
+      "action-executor-closed",
+    );
   });
 
   it(
@@ -2005,6 +2012,178 @@ it("recovers Light waits after restart, merges new input and exhausts the shared
     graph.filter((atom) => atom.kind === "core.model.task.failed"),
   ).toHaveLength(1);
 }, 30000);
+
+it.each(["finish", "acknowledge", "live-lease"] as const)(
+  "recovers the action ledger when delivery crashes before %s",
+  async (crashPoint) => {
+    let core!: RuntimeCapabilityContext["core"];
+    const composition = createMessageComposition();
+    const { runtime: first, database } = await createRuntime({
+      capabilities: (context) => {
+        core = context.core;
+        return composition.capabilities(context);
+      },
+    });
+    const sendMessage = vi.fn<PlatformOutboundTransport["sendMessage"]>(
+      async (target) => ({
+        ok: true,
+        adapterId: "web.ui.main",
+        platform: "web",
+        target,
+      }),
+    );
+    first.registerTransport({
+      adapterId: "web.ui.main",
+      platform: "web",
+      transport: { sendMessage },
+    });
+    await first.start();
+    const failure = vi
+      .spyOn(
+        database.actions,
+        crashPoint === "live-lease" ? "finish" : crashPoint,
+      )
+      .mockRejectedValue(new Error("synthetic process loss"));
+    const recoveryFailure = vi
+      .spyOn(database.actions, "recoverExpired")
+      .mockResolvedValue(undefined);
+    const commit = core.commitTerminal.bind(core);
+    const projectionFailure = vi
+      .spyOn(core, "commitTerminal")
+      .mockImplementation((...args) =>
+        args[0] === "kaguya.delivery.result.v1"
+          ? Promise.reject(new Error("synthetic projection loss"))
+          : commit(...args),
+      );
+    await first.submit(webMessage());
+    await vi.waitFor(async () => {
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(failure).toHaveBeenCalled();
+      const rows = await database.sql.query<{ live: boolean }>(
+        "SELECT lease_until>clock_timestamp() live FROM information_action_heads",
+      );
+      expect(rows.rows).toEqual([{ live: false }]);
+    }, PERSISTENCE_WAIT);
+    await first.close();
+    const stopped = (
+      await database.sql.query<{ state: string; receipt_id: string | null }>(
+        "SELECT state,receipt_id FROM information_action_heads",
+      )
+    ).rows[0]!;
+    expect(stopped.state).toBe(
+      crashPoint === "acknowledge" ? "succeeded" : "started",
+    );
+    expect(Boolean(stopped.receipt_id)).toBe(crashPoint === "acknowledge");
+    expect(
+      await database.information.find({
+        kinds: ["core.delivery.failed", "core.delivery.delivered"],
+        limit: 10,
+      }),
+    ).toHaveLength(0);
+    failure.mockRestore();
+    recoveryFailure.mockRestore();
+    projectionFailure.mockRestore();
+    if (crashPoint === "live-lease")
+      await database.sql.query(
+        "UPDATE information_action_heads SET lease_until=clock_timestamp()+interval '10 seconds'",
+      );
+    const restored = new KaguyaRuntime({
+      ...createMessageComposition(),
+      database,
+    });
+    resources.find((r) => r.runtime === first)!.runtime = restored;
+    restored.registerTransport({
+      adapterId: "web.ui.main",
+      platform: "web",
+      transport: { sendMessage },
+    });
+    await restored.start();
+    if (crashPoint === "live-lease") {
+      expect(
+        (
+          await database.sql.query(
+            "SELECT state,receipt_id FROM information_action_heads",
+          )
+        ).rows,
+      ).toEqual([{ state: "started", receipt_id: null }]);
+      await vi.waitFor(
+        async () =>
+          expect(
+            (
+              await database.sql.query(
+                "SELECT state FROM information_action_heads",
+              )
+            ).rows,
+          ).toEqual([{ state: "unknown" }]),
+        { timeout: 15000, interval: 20 },
+      );
+    }
+    await settleDeliveries(database);
+    const head = (
+      await database.sql.query<{
+        intent_id: string;
+        input: any;
+        receipt_id: string;
+      }>("SELECT intent_id,input,receipt_id FROM information_action_heads")
+    ).rows[0]!;
+    const view = await database.actions.read(head.intent_id, head.input.scope);
+    expect(view.state).toBe(
+      crashPoint !== "acknowledge" ? "unknown" : "succeeded",
+    );
+    const receipt = await database.actions.readReceipt(
+      head.receipt_id,
+      head.input.scope,
+      head.input.authorizationId,
+    );
+    expect(receipt.outcome.status).toBe(view.state);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    if (crashPoint !== "acknowledge") {
+      const executor = new ActionExecutor({
+        store: database.actions,
+        providers: [
+          {
+            id: "runtime.message",
+            version: "1",
+            capabilities: {
+              cancellation: "none",
+              idempotency: "none",
+              reconciliation: true,
+              successEvidence: "effect-verified",
+              fencing: "none",
+            },
+            execute: async () => {
+              throw new Error("must not replay");
+            },
+            reconcile: async () => ({
+              status: "succeeded",
+              evidence: "effect-verified",
+              result: { journal: "synthetic-sent" },
+              artifacts: [],
+              truncated: false,
+            }),
+          },
+        ],
+      });
+      const reconciled = await executor.reconcile(
+        head.intent_id,
+        head.input.scope,
+        head.input.authorizationId,
+      );
+      expect(reconciled.state).toBe("succeeded");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(
+        (
+          await database.actions.readReceipt(
+            head.receipt_id,
+            head.input.scope,
+            head.input.authorizationId,
+          )
+        ).outcome.status,
+      ).toBe("unknown");
+    }
+  },
+  45000, // 8s 首次效果 + 15s 无输入到期 + 8s 清空，另留两次启动和关闭余量。
+);
 
 it.each([true, false])(
   "does not resend a recovered delivery (started marker: %s)",

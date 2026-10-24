@@ -26,7 +26,10 @@ import {
   recordSituationObservations,
   confirmSituationObservations,
 } from "../observation.js";
-import { observationCapability } from "@kaguya/sdk";
+import {
+  observationCapability,
+  actionRunValidityCapability,
+} from "@kaguya/sdk";
 import {
   frozenLifecycleSelector,
   lifecycleStateInformationKind,
@@ -217,17 +220,27 @@ const lightInterruptSelector = defineInformationSelector({
             }),
           )[0]
         : sourceAtom;
-    const source = (anchor?.payload as any)?.source;
+    const frozenAnchor =
+      anchor?.kind === attentionArousalCompletedInformationKind.kind
+        ? add(
+            await ledger.related({
+              from: [anchor.informationId],
+              relation: "core:uses-context",
+              direction: "outgoing",
+              limit: 100,
+            }),
+          ).find((a) => a.kind === turnContextCompletedInformationKind.kind)
+        : anchor;
+    const source = (frozenAnchor?.payload as any)?.source;
     if (!source) return [...selected.keys()];
     const scopeKey = scopeOf(source);
     const candidate = add(
       await ledger.find({
         kinds: [turnCandidateInformationKind.kind],
-        ...(sourceAtom.kind === "core.model.task.requested" &&
-        (anchor?.payload as any)?.candidateInformationId
+        ...((frozenAnchor?.payload as any)?.candidateInformationId
           ? {
               informationIds: [
-                String((anchor!.payload as any).candidateInformationId),
+                String((frozenAnchor!.payload as any).candidateInformationId),
               ],
             }
           : {
@@ -545,16 +558,8 @@ function createRoutingModule(
   ] as const;
   const maybeInterruptLight = async (
     context: InformationModuleHandlerContext,
-    settings: DeepReadonly<RouterSettings>,
   ): Promise<boolean> => {
     const atoms = await context.select(lightInterruptSelector);
-    const source =
-      context.sourceAtom ??
-      atoms.find(
-        (atom) =>
-          atom.kind === inboundTextInformationKind.kind ||
-          atom.kind === attentionArousalCompletedInformationKind.kind,
-      );
     const candidate = atoms.find(
       (atom) => atom.kind === turnCandidateInformationKind.kind,
     );
@@ -581,7 +586,7 @@ function createRoutingModule(
       for (const requested of requests) {
         await context.use(options.modelTaskCapability).cancel({
           requestedInformationId: requested.informationId,
-          reason: "New message interrupted Light",
+          reason: "Persistent run invalidation interrupted Light",
         });
       }
       return true;
@@ -600,17 +605,22 @@ function createRoutingModule(
     );
     if (!frozen || !attention) return false;
     const attempt = Number((candidate.payload as any).rebuildAttempt ?? 0);
-    if (attempt >= settings.lightInterruptMaxConsecutiveCount) return false;
-    const consumed = new Set(
-      (frozen.payload.inputs as any[]).map((input) => input.informationId),
-    );
-    const incoming = atoms.filter(
-      (atom) =>
-        atom.kind === inboundTextInformationKind.kind &&
-        !consumed.has(atom.informationId),
-    );
-    const trigger = incoming.at(-1);
-    if (!trigger) return false;
+    const source = frozen.payload.source as any;
+    const d = source.destination;
+    const validity = await context
+      .use(actionRunValidityCapability)
+      .runValidity(
+        claim.informationId,
+        JSON.stringify([
+          source.platform,
+          source.adapterId,
+          d.kind,
+          d.userId ?? d.groupId ?? d.conversationId ?? null,
+        ]),
+      );
+    // 普通插话仅进入后续 observation，只有宿主已持久确认的干预才使旧规划失效。
+    if (validity.valid || !validity.causeInformationId) return false;
+    const trigger = { informationId: validity.causeInformationId };
     const runtime = atoms.find((atom) => atom.kind === "core.runtime.context");
     if (!runtime) return false;
     const winner = await context.commitTerminal(
@@ -658,7 +668,7 @@ function createRoutingModule(
     for (const requested of requests) {
       await context.use(options.modelTaskCapability).cancel({
         requestedInformationId: requested.informationId,
-        reason: "New message interrupted Light",
+        reason: "Persistent run invalidation interrupted Light",
       });
     }
     return true;
@@ -751,6 +761,7 @@ function createRoutingModule(
       promptRenderers: [],
       requires: [
         observationCapability,
+        actionRunValidityCapability,
         oneShotScheduleCapability,
         options.modelTaskCapability,
         options.rawContextCapability,
@@ -778,7 +789,7 @@ function createRoutingModule(
             delivery: "durable",
           },
           async (_atom, context) => {
-            await maybeInterruptLight(context, settings);
+            await maybeInterruptLight(context);
           },
         ),
         ...(options.modelTaskRequestedInformationKind
@@ -790,7 +801,7 @@ function createRoutingModule(
                   delivery: "durable",
                 },
                 async (_atom, context) => {
-                  await maybeInterruptLight(context, settings);
+                  await maybeInterruptLight(context);
                 },
               ),
             ]
@@ -1263,7 +1274,7 @@ function createRoutingModule(
                 sourceAtom,
                 frozenSituation,
               );
-              if (await maybeInterruptLight(context, settings)) return;
+              if (await maybeInterruptLight(context)) return;
               const gate = {
                 ...decision.payload,
                 claimInformationId: claim.informationId,
@@ -1400,6 +1411,7 @@ function createRoutingModule(
                   contextAtoms: taskAtoms,
                 });
               if (result.status !== "completed") return;
+              if (await maybeInterruptLight(context)) return;
               const parsed =
                 result.status === "completed"
                   ? lightActionSchema.safeParse(result.output)
