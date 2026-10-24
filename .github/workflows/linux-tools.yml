@@ -21,15 +21,21 @@ jobs:
         with:
           node-version: 24.18.0
       - name: Real subprocess helper contracts
-        run: node --test scripts/linux-tools/check-shell.mjs
+        run: |
+          node --test scripts/linux-tools/check-shell.mjs
+          python3 -B scripts/linux-tools/check_files.py
+      - name: Prepare pinned OCI builder
+        run: |
+          docker buildx create --name kaguya-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
+          docker buildx inspect --bootstrap
       - name: Build fixed Linux amd64 OCI image
         run: >-
           docker buildx build --platform linux/amd64
-          --provenance=false --sbom=false
-          --file scripts/linux-tools/Dockerfile
-          --tag localhost/kaguya-shell:ci
-          --output type=oci,dest=shell-tools.oci
-          --metadata-file shell-image-metadata.json .
+            --provenance=false --sbom=false
+            --file scripts/linux-tools/Dockerfile
+            --tag localhost/kaguya-shell:ci
+            --output type=oci,dest=shell-tools.oci
+            --metadata-file shell-image-metadata.json .
       - name: Record archive and image identities
         run: |
           sha256sum shell-tools.oci > shell-tools.oci.sha256

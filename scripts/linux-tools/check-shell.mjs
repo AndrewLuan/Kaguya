@@ -316,14 +316,6 @@ test("exports are bounded with original file hash; path traversal and symlinks a
 test("fixed stdin/stdout helper uses actual ready service and shuts down socket", async (t) => {
   const f = await fixture(t);
   await f.service.close();
-  const running = await startService({
-    workspace: f.workspace,
-    home: f.home,
-    environmentId: "env",
-    generation: 0,
-    sandbox: false,
-  });
-  f.cleanups.push(() => running.close());
   const child = spawn(
     process.execPath,
     [new URL("./helper", import.meta.url).pathname],
@@ -339,9 +331,21 @@ test("fixed stdin/stdout helper uses actual ready service and shuts down socket"
   let output = "";
   child.stdout.on("data", (d) => (output += d));
   const done = once(child, "close");
+  const waiting = once(child.stderr, "data", {
+    signal: AbortSignal.timeout(8000),
+  });
   child.stdin.end(
     JSON.stringify({ helperProtocolVersion: 1, kind: "health" }) + "\n",
   );
+  assert.match(String((await waiting)[0]), /waiting-for-ready/);
+  const running = await startService({
+    workspace: f.workspace,
+    home: f.home,
+    environmentId: "env",
+    generation: 0,
+    sandbox: false,
+  });
+  f.cleanups.push(() => running.close());
   await done;
   assert.deepEqual(JSON.parse(output), {
     helperProtocolVersion: 1,

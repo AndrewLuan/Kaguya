@@ -106,6 +106,25 @@ class BrokerTest(unittest.TestCase):
         return self.broker.takeover({"environmentId": "env", "scope": "scope", "generation": 0,
                                     "controlAuthorizationId": "human"})
 
+    def test_expired_owner_release_is_idempotent_after_ack_loss_and_cannot_stop_new_generation(self):
+        req = self.request()
+        self.now += 61
+        with self.assertRaises(BrokerError):
+            self.broker.execute(req)
+        with patch.object(self.backend, "isolate", wraps=self.backend.isolate) as isolate:
+            result = self.broker.release(req)
+            self.assertEqual(result["state"], "quarantined")
+            self.assertNotIn("releaseReceipt", result)
+            self.assertEqual(self.broker.release(req), result)
+            self.assertEqual(isolate.call_count, 1)
+            with self.assertRaises(BrokerError):
+                self.broker.release({**req, "token": "wrong"})
+        self.takeover()
+        fresh = self.broker.acquire({"environmentId": "env", "scope": "scope", "workflowId": "new", "ttlSeconds": 60})
+        with self.assertRaises(BrokerError):
+            self.broker.release(req)
+        self.assertEqual(self.broker.execute(self.request("new-operation", fresh))["status"], "succeeded")
+
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()
         result = self.broker.cancel(self.control(req))

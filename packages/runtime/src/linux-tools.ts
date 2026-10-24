@@ -172,6 +172,7 @@ export class LinuxToolsHost {
               }),
               authorize: async ({ intent }) =>
                 !this.closed &&
+                !this.unavailable.has(intent.scope) &&
                 this.configuration.bindings.some(
                   (b) =>
                     b.scope === intent.scope &&
