@@ -1,4 +1,5 @@
 /**
+ * register/readReceipt 可复用宿主已持有的事务，供原生工具绑定与 Memory 桥接在同锁下最终验证。
  * 功能概述：持久保存行动身份、授权、取消、执行 claim 和回执，原子裁决副作用开始资格。
  * 主要职责：register 固定参数；admit 在 Memory 锁→action 行之后重验依据和授权；
  * finish 追加结果/核对事实，unknown 可澄清；intervene/invalidateRun/revoke 保留停止来源。
@@ -385,17 +386,22 @@ export class PostgresActionStore {
         throw new Error("action-decision-domain-mismatch");
     }
   }
-  async register(raw: ActionIntent, guard?: InformationClaim) {
-    return this.registerInternal(raw, false, guard);
+  async register(
+    raw: ActionIntent,
+    guard?: InformationClaim,
+    transaction?: SqlTransaction,
+  ) {
+    return this.registerInternal(raw, false, guard, transaction);
   }
   private async registerInternal(
     raw: ActionIntent,
     legacy: boolean,
     guard?: InformationClaim,
+    transaction?: SqlTransaction,
   ) {
     const input = actionIntentSchema.parse(raw),
       digest = actionDigest(input);
-    return this.transaction(async (tx) => {
+    const run = async (tx: SqlTransaction) => {
       const old = (
         await tx.query<Row>(select + " WHERE operation_id=$1 FOR UPDATE", [
           input.operationId,
@@ -432,7 +438,8 @@ export class PostgresActionStore {
       );
       if (guard) await assertClaimInTransaction(tx, guard);
       return view(await this.row(tx, intentId, input.scope));
-    });
+    };
+    return transaction ? run(transaction) : this.transaction(run);
   }
   async read(id: string, scope: string) {
     return view(await this.row(this.db, id, scope, false));
@@ -685,25 +692,27 @@ export class PostgresActionStore {
           [r.input.dependsOn],
         )
       ).rows;
-      const reason = run.invalidated_id
-        ? "run-invalidated"
-        : !(await this.authorized(tx, r.input))
-          ? "authorization-denied"
-          : !proof.valid
-            ? "dependency-invalid"
-            : Date.parse(r.input.deadline) <= Date.now()
-              ? "deadline-expired"
-              : r.input.dependsOn.some(
-                    (id) =>
-                      !dependencies.some(
-                        (d) =>
-                          d.intent_id === id &&
-                          d.state === "succeeded" &&
-                          d.input.scope === scope,
-                      ),
-                  )
-                ? "action-dependency-unsatisfied"
-                : null;
+      const reason = !(await this.nativeRunActive(tx, id))
+        ? "native-run-stopped"
+        : run.invalidated_id
+          ? "run-invalidated"
+          : !(await this.authorized(tx, r.input))
+            ? "authorization-denied"
+            : !proof.valid
+              ? "dependency-invalid"
+              : Date.parse(r.input.deadline) <= Date.now()
+                ? "deadline-expired"
+                : r.input.dependsOn.some(
+                      (id) =>
+                        !dependencies.some(
+                          (d) =>
+                            d.intent_id === id &&
+                            d.state === "succeeded" &&
+                            d.input.scope === scope,
+                        ),
+                    )
+                  ? "action-dependency-unsatisfied"
+                  : null;
       if (reason) {
         await this.record(
           tx,
@@ -747,15 +756,70 @@ export class PostgresActionStore {
       };
     });
   }
+  private async nativeRunActive(tx: SqlTransaction, intentId: string) {
+    const stopped = (
+      await tx.query<{ stopped: boolean }>(
+        `SELECT EXISTS(
+      SELECT 1 FROM information_native_tool_calls c JOIN information_native_tool_runs r USING(run_id)
+      WHERE c.intent_id=$1 AND (r.stopped_id IS NOT NULL OR (r.spec->>'deadline')::timestamptz<=clock_timestamp())) stopped`,
+        [intentId],
+      )
+    ).rows[0]!;
+    return !stopped.stopped;
+  }
   private assertClaim(r: Row, claim: ActionClaim) {
     if (!r.live || r.attempt_id !== claim.attemptId || r.token !== claim.token)
       throw new Error("action-claim-lost");
+  }
+  /** Memory 内部效果与发布同锁复核；provider 不能靠旧 DTO 越过取消或授权撤回。 */
+  async assertEffectAllowed(
+    input: {
+      intentId: string;
+      attemptId: string;
+      digest: string;
+      intent: ActionIntent;
+    },
+    tx: SqlTransaction,
+    checkDependencies = true,
+  ) {
+    const r = await this.row(tx, input.intentId, input.intent.scope);
+    const run = (
+      await tx.query<{ invalidated_id: string | null }>(
+        "SELECT invalidated_id FROM information_action_runs WHERE run_id=$1",
+        [r.input.runInformationId],
+      )
+    ).rows[0];
+    if (
+      r.state !== "started" ||
+      !r.live ||
+      r.attempt_id !== input.attemptId ||
+      r.digest !== input.digest ||
+      actionDigest(input.intent) !== r.digest ||
+      run?.invalidated_id ||
+      !(await this.nativeRunActive(tx, r.intent_id)) ||
+      !(await this.authorized(tx, r.input)) ||
+      Date.parse(r.input.deadline) <= Date.now() ||
+      (checkDependencies &&
+        !(await checkActionDependencies(tx, r.input.dependencies)).valid)
+    )
+      throw new Error("action-effect-denied");
   }
   async canInvoke(claim: ActionClaim, scope: string) {
     return this.transaction(async (tx) => {
       const r = await this.row(tx, claim.intentId, scope);
       this.assertClaim(r, claim);
-      return r.state === "started" && (await this.authorized(tx, r.input));
+      const run = (
+        await tx.query<{ invalidated_id: string | null }>(
+          "SELECT invalidated_id FROM information_action_runs WHERE run_id=$1",
+          [r.input.runInformationId],
+        )
+      ).rows[0];
+      return (
+        r.state === "started" &&
+        !run?.invalidated_id &&
+        (await this.nativeRunActive(tx, r.intent_id)) &&
+        (await this.authorized(tx, r.input))
+      );
     });
   }
   private async record(
@@ -1007,8 +1071,9 @@ export class PostgresActionStore {
     receiptId: string,
     scope: string,
     authorizationId: string,
+    transaction?: SqlTransaction,
   ): Promise<ActionReceipt> {
-    return this.transaction(async (tx) => {
+    const run = async (tx: SqlTransaction) => {
       const p = (
         await tx.query<{ payload: any; position: string; occurred_at: string }>(
           `SELECT a.payload,l.position::text,a.occurred_at FROM information_action_receipts r JOIN information_atoms a ON a.information_id=r.receipt_id JOIN information_lifecycle l ON l.information_id=a.information_id WHERE r.receipt_id=$1`,
@@ -1076,6 +1141,7 @@ export class PostgresActionStore {
         registeredPosition: p.position,
         recordedAt: p.occurred_at,
       };
-    });
+    };
+    return transaction ? run(transaction) : this.transaction(run);
   }
 }

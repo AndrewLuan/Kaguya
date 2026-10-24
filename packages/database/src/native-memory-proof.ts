@@ -4,10 +4,12 @@
  * 只投影来源 ID/owner，读取时受 publication 上界约束，返回 owner→source 映射。
  * 代码库关系：native-memory 的 publish/ingest 在提交锁内调用；native-memory-history 读取已保存的完整证明，
  * 不按当前绑定回填历史。原始入站消息支持首次摘要，投递来源核对实际成功回执及 request。
+ * action-result 还校验 W3 intent/attempt/call/resultHash，不把任意 JSON owner 声明当作回执证明。
  * 输入输出与副作用：只读指定 sourceIds；保留已拆分身份的绑定，防止重新发布绕过失效；
  * 无法验证的来源不返回证明，由发布边界拒绝。无绑定入站消息属于其实际会话。
  */
 import { canonicalMemorySourceId } from "@kaguya/memory";
+import { actionDigest } from "./action-store.js";
 import type { SqlTransaction } from "./driver.js";
 
 /** 完整证明与旧 owner 依赖分开读取；旧 canonical 的单一 owner 不能填平证明缺口。 */
@@ -26,14 +28,21 @@ export async function persistedSourceProofOwners(
     canonical: boolean;
     owners: unknown;
     version: unknown;
+    source_type: string | null;
+    receipt_proof: any;
+    memory_scope: string | null;
+    receipt: any;
+    intent: any;
   }>(
     `SELECT a.payload->'memorySource'->>'id' id,a.payload->'memorySource'->>'ownerId' owner,
-      a.information_id storage_id,true canonical,a.payload->'sourceOwners' owners,a.payload->'sourceProofVersion' version
+      a.information_id storage_id,true canonical,a.payload->'sourceOwners' owners,a.payload->'sourceProofVersion' version,a.payload->'memorySource'->>'sourceType' source_type,a.payload->'receiptProof' receipt_proof,a.payload->'memorySource'->>'scope' memory_scope,receipt.payload receipt,h.input intent
       FROM information_atoms a JOIN information_lifecycle l USING(information_id)
+      LEFT JOIN information_action_receipts ar ON ar.receipt_id=a.payload->'memorySource'->>'id'
+      LEFT JOIN information_atoms receipt ON receipt.information_id=ar.receipt_id LEFT JOIN information_action_heads h ON h.intent_id=ar.intent_id
       WHERE a.information_id=ANY($1::text[]) AND a.kind='memory.native.source.v1'
         AND jsonb_typeof(a.payload->'memorySource'->'id')='string' AND jsonb_typeof(a.payload->'memorySource'->'ownerId')='string'
         AND ($3::bigint IS NULL OR l.position<=$3::bigint)
-    UNION ALL SELECT source->>'id',source->>'ownerId',id,false,NULL::jsonb,NULL::jsonb FROM memory_native_sources
+    UNION ALL SELECT source->>'id',source->>'ownerId',id,false,NULL::jsonb,NULL::jsonb,source->>'sourceType',NULL::jsonb,source->>'scope',NULL::jsonb,NULL::jsonb FROM memory_native_sources
       WHERE id=ANY($2::text[]) AND $3::bigint IS NULL AND NOT $4::boolean
         AND jsonb_typeof(source->'id')='string' AND jsonb_typeof(source->'ownerId')='string'`,
     [
@@ -52,6 +61,28 @@ export async function persistedSourceProofOwners(
       !row.owner.trim()
     )
       continue;
+    if (row.source_type === "action-result") {
+      const p = row.receipt_proof,
+        r = row.receipt;
+      if (
+        !row.canonical ||
+        !r ||
+        !p ||
+        row.owner !== "self:kaguya" ||
+        row.memory_scope !== r.intent?.scope ||
+        p.intentId !== r.intentId ||
+        p.attemptId !== r.attemptId ||
+        p.toolCallId !== r.intent?.toolCallId ||
+        p.resultHash !== r.resultHash ||
+        actionDigest(r.intent) !== actionDigest(row.intent) ||
+        r.resultHash !==
+          actionDigest({
+            result: r.outcome?.result,
+            artifacts: r.outcome?.artifacts,
+          })
+      )
+        continue;
+    }
     const complete =
       row.version === 1 &&
       Array.isArray(row.owners) &&

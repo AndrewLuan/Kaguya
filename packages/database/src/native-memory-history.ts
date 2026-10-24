@@ -4,6 +4,7 @@
  * scopedNodes 执行读取范围及状态筛选；来源撤回只沿 summarizes/derived-from 依赖传播。
  * 代码库关系：native-memory 的所有读取共用此实现；currentInvalidity 仅读局部依赖元数据；全文历史查询从历史正文计算，
  * 不使用当前索引或当前边。publish 必须持有 7149321 写锁直到提交，保证发布前缀有序。
+ * 回执正规来源通过 sourceDependencies 保留实际依赖；撤回沿该持久闭包投影到来源根。
  * 输入输出与副作用：只读 SQL，返回独立 Map；不修改 epoch、原文或已发布 revision。
  */
 import {
@@ -51,6 +52,20 @@ export async function readMemoryInvalidations(
   owners: readonly string[],
   sources: readonly string[],
 ) {
+  const closure = (
+    await db.query<{ root: string; id: string }>(
+      `WITH RECURSIVE deps(root,id) AS (
+    SELECT id,id FROM unnest($1::text[]) id UNION
+    SELECT d.root,child FROM deps d JOIN information_atoms a ON a.information_id='memory-native-source:'||d.id
+      JOIN information_lifecycle l ON l.information_id=a.information_id
+      CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(a.payload->'sourceDependencies','[]'::jsonb)) child
+      WHERE a.kind='memory.native.source.v1' AND a.payload->>'sourceProofVersion'='1' AND ($2::bigint IS NULL OR l.position<=$2::bigint)
+    ) SELECT root,id FROM deps LIMIT 8193`,
+      [sources, upper ?? null],
+    )
+  ).rows;
+  if (closure.length > 8192) throw new Error("memory-source-closure-budget");
+  const expandedSources = [...new Set(closure.map((d) => d.id))];
   const rows = (
     await db.query<{ kind: string; target: string }>(
       `SELECT effect->>'kind' kind,effect->>'targetId' target
@@ -60,12 +75,17 @@ export async function readMemoryInvalidations(
     WHERE a.kind='memory.native.revision.v1' AND a.payload ? 'invalidations' AND ($1::bigint IS NULL OR l.position<=$1::bigint) AND
       ((effect->>'kind'='identity-split' AND effect->>'targetId'=ANY($2::text[])) OR
        (effect->>'kind'='source-withdrawal' AND effect->>'targetId'=ANY($3::text[])))`,
-      [upper ?? null, owners, sources],
+      [upper ?? null, owners, expandedSources],
     )
   ).rows;
   return {
     withdrawn: new Set(
-      rows.filter((r) => r.kind === "source-withdrawal").map((r) => r.target),
+      rows
+        .filter((r) => r.kind === "source-withdrawal")
+        .flatMap((r) => [
+          r.target,
+          ...closure.filter((d) => d.id === r.target).map((d) => d.root),
+        ]),
     ),
     identities: new Set(
       rows.filter((r) => r.kind === "identity-split").map((r) => r.target),

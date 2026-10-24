@@ -1316,6 +1316,54 @@ describe("unified server composition", () => {
     ]);
   });
 
+  it("isolates an explicitly approved GUI task model from the ordinary Heavy model", async () => {
+    const chat = createRepeatingDeterministicModel({ text: "chat" }),
+      gui = createRepeatingDeterministicModel({ text: "gui" });
+    const composition = createMessageComposition(
+      () => ({ providerId: "chat", modelId: "heavy-current", model: chat }),
+      {
+        moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+        nativeTaskModels: [
+          {
+            definitionId: "agent.heavy",
+            taskId: "agent.gui.inspect",
+            routeId: "gui.approved",
+            tier: "heavy",
+            resolve: () => ({
+              providerId: "approved-vision",
+              modelId: "gui-specific",
+              model: gui,
+            }),
+          },
+        ],
+      },
+    );
+    expect(composition.modelTask.resolveModel({ tier: "heavy" })).toEqual({
+      providerId: "chat",
+      modelId: "heavy-current",
+    });
+    expect(
+      composition.modelTask.resolveModel({
+        tier: "heavy",
+        routeId: "gui.approved",
+      }),
+    ).toEqual({ providerId: "approved-vision", modelId: "gui-specific" });
+    expect(composition.modelTask.approvals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskId: "agent.gui.inspect",
+          selectionPolicy: { tier: "heavy", routeId: "gui.approved" },
+        }),
+      ]),
+    );
+    expect(() =>
+      composition.modelTask.resolveModel({ tier: "heavy", routeId: "missing" }),
+    ).toThrow("Unapproved task model route");
+    expect(composition.modelTask.resolveModel({ tier: "heavy" })).toEqual({
+      providerId: "chat",
+      modelId: "heavy-current",
+    });
+  });
   it("keeps Memory disabled unless composition explicitly enables it", () => {
     expect(
       createMessageComposition(undefined, {

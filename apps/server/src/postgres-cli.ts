@@ -36,6 +36,7 @@ const pnpmExecutable = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 export const POSTGRES_TEST_FILES = [
   "packages/database/src/observation-store.test.ts",
   "packages/runtime/src/action.test.ts",
+  "packages/runtime/src/native-tool-loop.test.ts",
   "packages/runtime/src/observation-runtime.test.ts",
   "packages/database/src/postgres-information-ledger.test.ts",
   "packages/database/src/postgres-index.test.ts",

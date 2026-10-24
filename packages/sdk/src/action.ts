@@ -54,6 +54,7 @@ export const actionEnvironmentSchema = z
     expiresAt: z.iso.datetime(),
   })
   .strict();
+export type ActionEnvironment = z.infer<typeof actionEnvironmentSchema>;
 export const actionIntentSchema = z
   .object({
     operationId: id,

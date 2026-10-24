@@ -1,6 +1,7 @@
 /**
  * 功能概述：在 native 存储内执行原子发布、历史读取、来源正规化与批次恢复。
  * 主要职责：publish 保留操作哈希及修订；当前查询使用同快照现态与局部失效闭包，历史查询服从独立提交上界。
+ * 已有宿主事务中的 snapshot 实例复用同一读取边界，不重新设置事务隔离级别。
  * ingest/recover 保留 epoch 和原始账本，形成失败通过唯一后继重试；historyPage 只投影目标节点。
  * 代码库关系：实现 memory 领域端口，复用 information 与 observation 表；不引入模型或另一存储后端。
  */
@@ -375,6 +376,7 @@ export class PostgresNativeMemoryStore
   async withReadSnapshot<T>(
     run: (store: NativeMemoryStore) => Promise<T>,
   ): Promise<T> {
+    if (this.snapshot) return run(this);
     return this.db.transaction(async (tx) => {
       await tx.exec(
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",

@@ -12,10 +12,11 @@
  * 重放先按指纹读取 requested/terminal，不依赖模型 resolver；新请求仍只经 registerOnce 写入。
  * provider 仅校验由任务输入导出的无 transform schema；本层唯一执行任务 parse/transform，
  * 再检查 JSON 与 informationPayloadSchema。重放不执行任务 transform，存储/fencing 异常不转业务失败。
+ * 工具模式保存单次 dispatch 身份，工具调用不走业务输出 schema；恢复未确认请求时不重复请求。
  * LLM 边界内重试仍只提交一个终态；失败只保存受控结构化分类、Provider 诊断与尝试次数。
  * readFailureMetrics/readProviderFailure 对跨边界值再次校验，非法指标或诊断不会阻断失败终态提交。
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { assembleNativeInput } from "./native-input.js";
 import { InformationCore } from "@kaguya/engine";
 import { KaguyaLlmError, type KaguyaLlmClient } from "@kaguya/llm/client";
@@ -31,6 +32,9 @@ import {
   nativeResponseSchema,
   type NativeMessage,
   type NativeResponse,
+  nativeToolDeclarationSchema,
+  type NativeToolDeclaration,
+  type NativeToolCall,
   z,
 } from "@kaguya/schema";
 import {
@@ -40,9 +44,11 @@ import {
 import {
   informationCompiledPromptSchema,
   modelTaskMetadataSchema,
+  modelTaskContextTrimmingSchema,
   modelTaskResolvedModelSchema,
   modelTaskSelectionPolicySchema,
   modelTaskRequestedInformationKind,
+  modelTaskDispatchedInformationKind,
   modelTaskCompletedInformationKind,
   modelTaskFailedInformationKind,
   modelTaskCancelledInformationKind,
@@ -69,6 +75,15 @@ export interface ModelTaskRequest<TOutput> {
   readonly contextAtoms: readonly DeepReadonly<InformationAtom>[];
   readonly messages?: NativeMessage[];
   readonly nativeContinuation?: boolean;
+  readonly tools?: readonly NativeToolDeclaration[];
+  readonly contextTrimming?: z.infer<typeof modelTaskContextTrimmingSchema>;
+  readonly nativeStep?: {
+    runInformationId: string;
+    stepIndex: number;
+    deadline: string;
+    maxContextBytes: number;
+    maxOutputBytes: number;
+  };
 }
 type ResultIdentity = {
   readonly requestedInformationId: string;
@@ -80,6 +95,11 @@ export type ModelTaskResult<TOutput> = ResultIdentity &
         readonly status: "completed";
         readonly output: TOutput;
         readonly native?: NativeResponse;
+      }
+    | {
+        readonly status: "tool-calls";
+        readonly native: NativeResponse;
+        readonly calls: NativeToolCall[];
       }
     | {
         readonly status: "failed";
@@ -112,6 +132,10 @@ export interface ModelTaskClientOptions {
   ) => z.infer<typeof modelTaskResolvedModelSchema>;
   readonly now?: () => Date;
   readonly renderStructuredOutputPrompt: StructuredOutputPromptRenderer;
+  readonly admitNativeDispatch?: (
+    requestedInformationId: string,
+    step: NonNullable<ModelTaskRequest<unknown>["nativeStep"]>,
+  ) => Promise<boolean>;
 }
 const terminalGroup = "kaguya.model.task.result";
 type Requested = DeepReadonly<
@@ -127,9 +151,11 @@ export class ModelTaskClient implements ModelTaskCapability {
   readonly #resolveModel: ModelTaskClientOptions["resolveModel"];
   readonly #now: () => Date;
   readonly #renderStructuredOutputPrompt: StructuredOutputPromptRenderer;
+  readonly #admitNativeDispatch: ModelTaskClientOptions["admitNativeDispatch"];
   readonly #inflight = new Map<string, Set<AbortController>>();
   constructor(options: ModelTaskClientOptions) {
     this.#core = options.core;
+    this.#admitNativeDispatch = options.admitNativeDispatch;
     this.#client = options.client;
     this.#resolveModel = options.resolveModel;
     this.#now = options.now ?? (() => new Date());
@@ -178,6 +204,20 @@ export class ModelTaskClient implements ModelTaskCapability {
             ...request.messages,
             { role: "user", content: prompt.text },
           ]);
+    if (request.contextTrimming) {
+      const trimming = modelTaskContextTrimmingSchema.parse(
+        request.contextTrimming,
+      );
+      if (
+        !request.messages ||
+        trimming.retainedBytes !==
+          Buffer.byteLength(JSON.stringify(request.messages)) ||
+        trimming.retainedBytes > trimming.budgetBytes ||
+        trimming.originalBytes < trimming.retainedBytes ||
+        trimming.truncated !== trimming.omittedSegments > 0
+      )
+        throw new Error("Invalid native context trimming metadata");
+    }
     const metadata = modelTaskMetadataSchema
       .omit({ resolvedModel: true })
       .parse({
@@ -194,6 +234,11 @@ export class ModelTaskClient implements ModelTaskCapability {
         promptDigest: prompt.promptDigest,
         messagesDigest: messages ? digest(canonical(messages)) : null,
         provenance: prompt.provenance,
+        ...(request.tools ? { tools: request.tools } : {}),
+        ...(request.contextTrimming
+          ? { contextTrimming: request.contextTrimming }
+          : {}),
+        ...(request.nativeStep ? { nativeStep: request.nativeStep } : {}),
       });
     const selected = await this.#core.getMany(metadata.contextInformationIds);
     if (
@@ -260,7 +305,7 @@ export class ModelTaskClient implements ModelTaskCapability {
           taskId: task.taskId,
           instanceId: request.activation.instanceId,
           model: resolvedModel!,
-          maxBytes: 128_000,
+          maxBytes: request.nativeStep?.maxContextBytes ?? 128_000,
         });
       } catch (error) {
         if (!(error instanceof Error)) throw error;
@@ -313,6 +358,7 @@ export class ModelTaskClient implements ModelTaskCapability {
     const startedAt = this.#now().getTime();
     let metrics:
       { durationMs: number; usage?: Record<string, number> } | undefined;
+    let failureReasonCode: "dispatched-without-terminal" | undefined;
     let failureStage:
       | "provider-request"
       | "structured-output-parse"
@@ -344,6 +390,76 @@ export class ModelTaskClient implements ModelTaskCapability {
         failureStage = requested.payload.inputBlocked;
         throw new Error("Native input blocked");
       }
+      if (requested.payload.tools) {
+        if (requested.payload.nativeStep) {
+          if (
+            Date.parse(requested.payload.nativeStep.deadline) <=
+            this.#now().getTime()
+          )
+            throw new Error("Native deadline exhausted");
+          if (
+            Buffer.byteLength(
+              JSON.stringify({
+                model: requested.payload.resolvedModel.modelId,
+                messages: requested.payload.messages ?? [
+                  { role: "user", content: prompt.text },
+                ],
+                tools: requested.payload.tools!.map((t) => ({
+                  type: "function",
+                  function: {
+                    name: t.wireName,
+                    description: t.description,
+                    parameters: t.inputSchema,
+                  },
+                })),
+                tool_choice: "auto",
+              }),
+            ) > requested.payload.nativeStep.maxContextBytes
+          ) {
+            failureStage = "context-budget";
+            throw new Error("Native input budget exhausted");
+          }
+        }
+        const allowed =
+          requested.payload.nativeStep && this.#admitNativeDispatch
+            ? await this.#admitNativeDispatch(
+                requested.informationId,
+                requested.payload.nativeStep,
+              )
+            : await (async () => {
+                const nonce = randomUUID();
+                const dispatched = await this.#core.registerOnce(
+                  "kaguya.model.dispatch",
+                  requested.informationId,
+                  modelTaskDispatchedInformationKind,
+                  {
+                    occurredAt: this.#now().toISOString(),
+                    source: "runtime:model-task",
+                    payload: {
+                      requestedInformationId: requested.informationId,
+                      nonce,
+                    },
+                    references: [
+                      {
+                        relation: "core:caused-by",
+                        informationId: requested.informationId,
+                      },
+                    ],
+                  },
+                );
+                return dispatched.payload.nonce === nonce;
+              })();
+        if (!allowed) {
+          const winner = await this.readTerminal(requested.informationId);
+          if (winner)
+            return resultFromWinner<TOutput>(winner, requested.informationId);
+          failureStage = "native-protocol";
+          failureReasonCode = "dispatched-without-terminal";
+          throw new Error(
+            "Native request outcome unknown; automatic retry denied",
+          );
+        }
+      }
       const generation = await this.#client.generate({
         modelId: persisted.resolvedModel.modelId,
         ...(requested.payload.messages
@@ -353,6 +469,25 @@ export class ModelTaskClient implements ModelTaskCapability {
                 requested.payload.prompt,
               ),
             }),
+        ...(requested.payload.tools
+          ? {
+              tools: requested.payload.tools.map((t) =>
+                nativeToolDeclarationSchema.parse(t),
+              ),
+            }
+          : {}),
+        ...(requested.payload.nativeStep
+          ? {
+              timeoutMs: Math.min(
+                300000,
+                Math.max(
+                  1,
+                  Date.parse(requested.payload.nativeStep.deadline) -
+                    this.#now().getTime(),
+                ),
+              ),
+            }
+          : {}),
         outputMode: persisted.outputMode,
         outputSchema: providerSchema,
         ...(signal ? { signal } : {}),
@@ -370,12 +505,17 @@ export class ModelTaskClient implements ModelTaskCapability {
       informationPayloadSchema.parse(candidateMetrics);
       metrics = candidateMetrics;
       failureStage = "task-schema-validation";
-      const output = jsonValueSchema.parse(
-        await task.outputSchema.parseAsync(generation.output),
-      );
+      const output =
+        generation.kind === "tool-calls"
+          ? null
+          : jsonValueSchema.parse(
+              await task.outputSchema.parseAsync(generation.output),
+            );
       completed = modelTaskCompletedInformationKind.payloadSchema.parse({
         ...persisted,
         output,
+        generationKind: generation.kind ?? "final",
+        toolCalls: generation.kind === "tool-calls" ? generation.calls : [],
         ...(generation.native
           ? { native: nativeResponseSchema.parse(generation.native) }
           : {}),
@@ -384,6 +524,14 @@ export class ModelTaskClient implements ModelTaskCapability {
       // 与 Core 的 atom payload 使用同一边界：账本受限标识字段属于输出失败。
       // 真正 commit 留在此 try 外，数据库故障、关闭及 claim fencing 不生成 failed。
       informationPayloadSchema.parse(completed);
+      if (
+        requested.payload.nativeStep &&
+        Buffer.byteLength(JSON.stringify(completed)) >
+          requested.payload.nativeStep.maxOutputBytes
+      ) {
+        failureStage = "context-budget";
+        throw new Error("Native output budget exhausted");
+      }
     } catch (error) {
       if (this.#core.executionSignal?.aborted || controller.signal.aborted) {
         const winner = await this.readTerminal(requested.informationId);
@@ -416,6 +564,7 @@ export class ModelTaskClient implements ModelTaskCapability {
                   ? (error.stage ?? failureStage)
                   : failureStage,
               message: "Model task generation failed",
+              ...(failureReasonCode ? { reasonCode: failureReasonCode } : {}),
               ...(llmError?.structuredOutputFailure === undefined
                 ? {}
                 : {
@@ -614,8 +763,12 @@ async function resultFromWinner<T = unknown>(
     terminalInformationId: atom.informationId,
   };
   if (atom.kind === modelTaskCompletedInformationKind.kind) {
-    const { output, native } =
+    const { output, native, generationKind, toolCalls } =
       modelTaskCompletedInformationKind.payloadSchema.parse(atom.payload);
+    if (generationKind === "tool-calls") {
+      if (!native) throw new Error("Missing native tool response");
+      return { ...identity, status: "tool-calls", native, calls: toolCalls };
+    }
     return {
       ...identity,
       status: "completed",
@@ -655,7 +808,12 @@ export function modelTaskFingerprint(
     | "promptDigest"
     | "provenance"
     | "selectionPolicy"
-  > & { messagesDigest?: string | null },
+  > & {
+    messagesDigest?: string | null;
+    tools?: readonly NativeToolDeclaration[];
+    nativeStep?: unknown;
+    contextTrimming?: unknown;
+  },
 ): string {
   return digest(
     canonical({
@@ -668,6 +826,11 @@ export function modelTaskFingerprint(
       promptDigest: metadata.promptDigest,
       provenance: metadata.provenance,
       selectionPolicy: metadata.selectionPolicy,
+      ...(metadata.tools ? { tools: metadata.tools } : {}),
+      ...(metadata.nativeStep ? { nativeStep: metadata.nativeStep } : {}),
+      ...(metadata.contextTrimming
+        ? { contextTrimming: metadata.contextTrimming }
+        : {}),
       ...(metadata.messagesDigest
         ? { messagesDigest: metadata.messagesDigest }
         : {}),

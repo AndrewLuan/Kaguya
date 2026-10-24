@@ -200,7 +200,7 @@ export const memorySourceSchema = z
     text: z.string(),
     occurredAt: z.string(),
     collectedAt: z.string(),
-    sourceType: z.enum(["inbound", "delivered"]),
+    sourceType: z.enum(["inbound", "delivered", "action-result"]),
     participants: z.array(memorySourcePersonSchema),
     replyTo: z
       .object({

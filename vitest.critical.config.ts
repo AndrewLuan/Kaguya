@@ -19,6 +19,8 @@ const criticalTests = [
   "packages/database/src/schema.test.ts",
   "packages/database/src/observation-store.test.ts",
   "packages/runtime/src/action.test.ts",
+  "packages/runtime/src/native-tool-loop.test.ts",
+  "packages/llm/src/client.test.ts",
   "packages/runtime/src/environment.test.ts",
   "packages/platform-adapters/src/napcat.test.ts",
   "packages/database/src/native-memory.test.ts",
