@@ -335,42 +335,46 @@ async function fixture(
 }
 
 describe("Web private chat through the production information DAG", () => {
-  it("keeps continuation delivery records scoped to the current expression", async () => {
-    const f = await fixture({
-      respond: (_prompt, index) => ({
-        action: "message",
-        text: `范围测试第${index}条`,
-        continuation: index % 2 ? "再说一条" : null,
-      }),
-    });
-    await f.exchange(randomUUID(), "会话甲", "scope-a", [
-      "会话甲",
-      "范围测试第1条",
-      "范围测试第2条",
-    ]);
-    await f.exchange(randomUUID(), "会话乙", "scope-b", [
-      "会话乙",
-      "范围测试第3条",
-      "范围测试第4条",
-    ]);
-    const steps = await f.database.information.find({
-      kinds: ["agent.heavy.step.requested"],
-      registrationOrder: true,
-      order: "asc",
-      limit: 10,
-    });
-    expect(steps).toHaveLength(2);
-    const continuation = (
-      steps[1]!.payload.prompt as {
-        variables: { name: string; content: string }[];
-      }
-    ).variables.find((v) => v.name === "speech_continuation")!;
-    expect(
-      JSON.parse(continuation.content).delivered.map(
-        (item: { message: { text: string } }) => item.message.text,
-      ),
-    ).toEqual(["范围测试第3条"]);
-  });
+  it(
+    "keeps continuation delivery records scoped to the current expression",
+    async () => {
+      const f = await fixture({
+        respond: (_prompt, index) => ({
+          action: "message",
+          text: `范围测试第${index}条`,
+          continuation: index % 2 ? "再说一条" : null,
+        }),
+      });
+      await f.exchange(randomUUID(), "会话甲", "scope-a", [
+        "会话甲",
+        "范围测试第1条",
+        "范围测试第2条",
+      ]);
+      await f.exchange(randomUUID(), "会话乙", "scope-b", [
+        "会话乙",
+        "范围测试第3条",
+        "范围测试第4条",
+      ]);
+      const steps = await f.database.information.find({
+        kinds: ["agent.heavy.step.requested"],
+        registrationOrder: true,
+        order: "asc",
+        limit: 10,
+      });
+      expect(steps).toHaveLength(2);
+      const continuation = (
+        steps[1]!.payload.prompt as {
+          variables: { name: string; content: string }[];
+        }
+      ).variables.find((v) => v.name === "speech_continuation")!;
+      expect(
+        JSON.parse(continuation.content).delivered.map(
+          (item: { message: { text: string } }) => item.message.text,
+        ),
+      ).toEqual(["范围测试第3条"]);
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
   it(
     "keeps input arriving during the final part unread for the next turn",
     async () => {
@@ -542,54 +546,63 @@ describe("Web private chat through the production information DAG", () => {
         ).toEqual([0, 1]);
       }
     },
+    MULTI_STAGE_TIMEOUT,
   );
 
-  it("restores a pending typing deadline without generating or sending the first part twice", async () => {
-    const f = await fixture({
-      pacingMs: 1200,
-      respond: (_prompt, index) => ({
-        action: "message",
-        text: `恢复第${index}段`,
-        continuation: index === 1 ? "继续恢复" : null,
-      }),
-    });
-    const conversation = randomUUID();
-    await f.send(conversation, "重启测试", "restart-speech");
-    await f.waitFor(
-      "web persistence",
-      async () =>
-        expect(
-          await f.database.information.find({
-            kinds: ["core.schedule.one-shot.requested"],
-            payloadContains: { input: { purpose: "heavy-speech" } },
-            limit: 10,
-          }),
-        ).toHaveLength(1),
-      durableWait,
-    );
-    expect(
-      (await f.read(conversation)).messages.filter(
-        (m) => m.role === "assistant",
-      ),
-    ).toHaveLength(0);
-    await f.send(conversation, "等待时也能接收这条插话", "typing-interjection");
-    await f.restart();
-    await f.waitFor(
-      "web persistence",
-      async () =>
-        expect(
-          (await f.read(conversation)).messages.map((m) => m.text),
-        ).toEqual([
-          "重启测试",
-          "等待时也能接收这条插话",
-          "恢复第1段",
-          "恢复第2段",
-        ]),
-      durableWait,
-    );
-    expect(f.composerPrompts).toHaveLength(2);
-    expect(f.composerPrompts[1]).toContain("等待时也能接收这条插话");
-  });
+  it(
+    "restores a pending typing deadline without generating or sending the first part twice",
+    async () => {
+      const f = await fixture({
+        pacingMs: 1200,
+        respond: (_prompt, index) => ({
+          action: "message",
+          text: `恢复第${index}段`,
+          continuation: index === 1 ? "继续恢复" : null,
+        }),
+      });
+      const conversation = randomUUID();
+      await f.send(conversation, "重启测试", "restart-speech");
+      await f.waitFor(
+        "web persistence",
+        async () =>
+          expect(
+            await f.database.information.find({
+              kinds: ["core.schedule.one-shot.requested"],
+              payloadContains: { input: { purpose: "heavy-speech" } },
+              limit: 10,
+            }),
+          ).toHaveLength(1),
+        durableWait,
+      );
+      expect(
+        (await f.read(conversation)).messages.filter(
+          (m) => m.role === "assistant",
+        ),
+      ).toHaveLength(0);
+      await f.send(
+        conversation,
+        "等待时也能接收这条插话",
+        "typing-interjection",
+      );
+      await f.restart();
+      await f.waitFor(
+        "web persistence",
+        async () =>
+          expect(
+            (await f.read(conversation)).messages.map((m) => m.text),
+          ).toEqual([
+            "重启测试",
+            "等待时也能接收这条插话",
+            "恢复第1段",
+            "恢复第2段",
+          ]),
+        historyWait,
+      );
+      expect(f.composerPrompts).toHaveLength(2);
+      expect(f.composerPrompts[1]).toContain("等待时也能接收这条插话");
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
 
   it.each(["failed", "unknown"])(
     "stops continuation after a %s delivery and does not resend on restart",
@@ -771,7 +784,7 @@ describe("Web private chat through the production information DAG", () => {
                   (m) => m.role === "assistant",
                 ),
               ).toHaveLength(2),
-            durableWait,
+            historyWait,
           );
           expect(f.composerPrompts).toHaveLength(2);
           expect(
@@ -892,7 +905,7 @@ describe("Web private chat through the production information DAG", () => {
             "web persistence",
             async () =>
               expect((await f.read(conversation)).messages).toHaveLength(2),
-            durableWait,
+            historyWait,
           );
           release();
           await f.waitFor(
@@ -924,7 +937,7 @@ describe("Web private chat through the production information DAG", () => {
                 }),
               ).toHaveLength(1);
             },
-            durableWait,
+            historyWait,
           );
           expect(
             await f.database.information.find({
