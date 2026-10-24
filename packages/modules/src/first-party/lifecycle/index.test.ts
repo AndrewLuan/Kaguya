@@ -1,3 +1,11 @@
+/**
+ * 功能概述：通过真实 Core、ModuleHost、Scheduler 与 PGlite 验证 Lifecycle 状态、调度和观察恢复。
+ * 主要职责：fixture 提供合成时钟、入站与手动 due；settle 等待持久队列并报告处理错误。
+ * restart 关闭原 core/runner 后重建宿主和绑定能力，保留数据库、订阅 ID、时钟与 ID 序列。
+ * 代码库关系：直接运行 createLifecycleModule，覆盖离线期间多人消息及无新入站的启动恢复。
+ * 输入输出与副作用：每例独立数据库，8 秒/20 毫秒条件等待；结束关闭 host/core/数据库，不请求外部服务。
+ */
+import { observationCapability } from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import {
@@ -57,9 +65,28 @@ const taskCompleted = defineInformationKind({
 async function fixture() {
   const db = await createTestingDatabase();
   await db.prepareSchema();
-  const catalog = defineInformationModuleCatalog(
-    createLifecycleModule({ timeZone: "Asia/Shanghai" }),
-  );
+  const failures: unknown[] = [];
+  const definition = createLifecycleModule({ timeZone: "Asia/Shanghai" });
+  const catalog = defineInformationModuleCatalog({
+    ...definition,
+    create: async (options, ctx) => {
+      const instance = await definition.create(options, ctx);
+      return {
+        ...instance,
+        subscriptions: instance.subscriptions.map((subscription) => ({
+          ...subscription,
+          handle: async (atom, context) => {
+            try {
+              await subscription.handle(atom, context);
+            } catch (error) {
+              failures.push(error);
+              throw error;
+            }
+          },
+        })),
+      };
+    },
+  });
   const registry = new InformationKindRegistry();
   for (const kind of [
     ...catalogInformationKinds(catalog),
@@ -73,13 +100,15 @@ async function fixture() {
   let n = 0;
   let time = Date.UTC(2026, 9, 22);
   const now = () => new Date(time);
-  const core = new InformationCore({
-    registry,
-    store: db.information,
-    now,
-    nextInformationId: () => `lifecycle-${String(++n).padStart(6, "0")}`,
-  });
-  const scheduler = new OneShotScheduleClient(core);
+  const makeCore = () =>
+    new InformationCore({
+      registry,
+      store: db.information,
+      now,
+      nextInformationId: () => `lifecycle-${String(++n).padStart(6, "0")}`,
+    });
+  let core = makeCore();
+  let scheduler = new OneShotScheduleClient(core);
   const start = async (instanceId: string) => {
     await core.register(lifecycleStartedInformationKind, {
       occurredAt: now().toISOString(),
@@ -88,15 +117,18 @@ async function fixture() {
       references: [],
     });
   };
-  const host = new ModuleHost({
-    core,
-    catalog,
-    now,
-    capabilities: [
-      { capability: oneShotScheduleCapability, value: scheduler },
-      { capability: lifecycleStartupCapability, value: { start } },
-    ],
-  });
+  const makeHost = () =>
+    new ModuleHost({
+      core,
+      catalog,
+      now,
+      capabilities: [
+        { capability: observationCapability, value: db.observations },
+        { capability: oneShotScheduleCapability, value: scheduler },
+        { capability: lifecycleStartupCapability, value: { start } },
+      ],
+    });
+  let host = makeHost();
   await core.start();
   clean.push(async () => {
     await host.stop();
@@ -114,10 +146,11 @@ async function fixture() {
     vi.waitFor(
       async () => {
         const health = await db.information.reliable.health();
+        if (failures.length) throw failures[0];
         expect(health.pending).toBe(0);
         expect(health.exhausted).toBe(0);
       },
-      { timeout: 5000 },
+      { timeout: 8000, interval: 20 },
     );
   const all = (kind: string) =>
     db.information.find({
@@ -160,8 +193,8 @@ async function fixture() {
     payload: {},
     references: [],
   });
-  const inbound = async (direct: boolean) => {
-    await core.register(inboundTextInformationKind, {
+  const inbound = async (direct: boolean, senderId = "user", wait = true) => {
+    const atom = await core.register(inboundTextInformationKind, {
       occurredAt: now().toISOString(),
       source: "adapter:test",
       payload: {
@@ -170,7 +203,7 @@ async function fixture() {
           platform: "qq",
           adapterId: "qq.main",
           destination: { kind: "group", groupId: "g" },
-          senderId: "user",
+          senderId,
           selfId: "bot",
           platformMessageId: `m${n}`,
           ...(direct ? { mentions: [{ kind: "user", id: "bot" }] } : {}),
@@ -180,14 +213,37 @@ async function fixture() {
         { relation: "core:context", informationId: context.informationId },
       ],
     });
-    await settle();
+    if (wait) await settle();
+    return atom;
   };
   await settle();
   return {
     db,
-    scheduler,
-    core,
-    host,
+    restart: async () => {
+      await host.stop();
+      await core.close();
+      core = makeCore();
+      scheduler = new OneShotScheduleClient(core);
+      await core.start();
+      host = makeHost();
+      await host.start([
+        {
+          instanceId: "lifecycle.default",
+          definitionId: "agent.lifecycle",
+          settings: lifecycleSettingsSchema.parse({}),
+        },
+      ]);
+      await settle();
+    },
+    get scheduler() {
+      return scheduler;
+    },
+    get core() {
+      return core;
+    },
+    get host() {
+      return host;
+    },
     now,
     state,
     timers,
@@ -322,4 +378,33 @@ it("consumes a persisted legacy-instance recheck and schedules its successor und
     definitionId: "agent.lifecycle",
     instanceId: "lifecycle.default",
   });
+});
+
+it("recovers every sender and message in the same scene after downtime without another input", async () => {
+  const f = await fixture();
+  await f.host.stop();
+  const first = await f.inbound(false, "alice", false);
+  const second = await f.inbound(false, "bob", false);
+  const third = await f.inbound(true, "carol", false);
+  expect(
+    new Set(
+      [first, second, third].map((a) => a.payload.source.platformMessageId),
+    ).size,
+  ).toBe(3);
+  await f.restart();
+  const candidates = await f.all("agent.heartbeat.candidate");
+  expect(candidates).toHaveLength(1);
+  expect(candidates[0]!.payload.unreadCount).toBe(3);
+  expect(candidates[0]!.payload.unreadThroughInformationId).toBe(
+    third.informationId,
+  );
+  expect(candidates[0]!.payload.unreadAfterInformationId).toBeUndefined();
+  const wakes = await f.all("agent.heartbeat.observation.wake");
+  expect(
+    wakes[0]!.references
+      .filter((r) => r.relation === "core:uses-context")
+      .map((r) => r.informationId),
+  ).toEqual([first.informationId, second.informationId, third.informationId]);
+  await f.restart();
+  expect(await f.all("agent.heartbeat.candidate")).toHaveLength(1);
 });

@@ -7,6 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  jsonObjectSchema,
   freezeInformationAtom,
   informationIdSchema,
   sceneIdentity,
@@ -140,6 +141,318 @@ for (const postgres of [false, true]) {
         return id;
       }
       describe("persistent observations", () => {
+        it("keeps successful later ranges behind a failed gap and reuses operation identities after restart", async () => {
+          const a = await append(),
+            b = await append();
+          await db.observations.discover(input);
+          const first = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "first",
+            limit: 1,
+          }))!;
+          const second = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "second",
+            limit: 1,
+          }))!;
+          expect(first.sourceInformationIds).toEqual([a]);
+          expect(first.hasMore).toBe(true);
+          await db.observations.fail(first.observationId, "controlled-failure");
+          await db.observations.finish(
+            second.observationId,
+            await result(second),
+          );
+          expect((await db.observations.progress(input))?.throughPosition).toBe(
+            "0",
+          );
+          expect(
+            (await db.observations.pending(input)).map((p) => p.observationId),
+          ).toEqual([first.observationId]);
+          const c = await append(address, "2026-01-01T00:00:00.000Z");
+          await reconnect();
+          expect(
+            (
+              await db.observations.freezeNext({
+                ...input,
+                operationKey: "first",
+              })
+            )?.sourceInformationIds,
+          ).toEqual([a]);
+          await db.observations.finish(
+            first.observationId,
+            await result(first),
+          );
+          const progress = (await db.observations.progress(input))!;
+          expect(progress.throughInformationId).toBe(b);
+          expect(BigInt(progress.discoveredThroughPosition)).toBeGreaterThan(
+            BigInt(progress.throughPosition),
+          );
+          const third = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "third",
+          }))!;
+          expect(third.sourceInformationIds).toEqual([c]);
+          expect(
+            (await db.observations.discover({ ...input, consumerId: "memory" }))
+              .throughPosition,
+          ).toBe("0");
+        });
+        it("acknowledges each complete page independently and persists continuation over restart", async () => {
+          const ids = [];
+          for (let i = 0; i < 101; i++) ids.push(await append());
+          const consumed: string[] = [];
+          for (let i = 0; i < 4; i++) {
+            const page = (await db.observations.freezeNext({
+              ...input,
+              operationKey: `page:${i}`,
+              limit: 32,
+            }))!;
+            expect(page.complete).toBe(true);
+            expect(page.hasMore).toBe(i < 3);
+            consumed.push(...page.sourceInformationIds);
+            await db.observations.finish(
+              page.observationId,
+              await result(page),
+            );
+            expect(
+              (await db.observations.progress(input))?.throughInformationId,
+            ).toBe(page.sourceInformationIds.at(-1));
+            await reconnect();
+          }
+          expect(consumed).toEqual(ids);
+          expect(new Set(consumed).size).toBe(101);
+          expect(
+            await db.observations.freezeNext({
+              ...input,
+              operationKey: "empty",
+            }),
+          ).toBeUndefined();
+        });
+        it("pins Memory content and claim identity, preserves an incomplete gap and replaces it explicitly", async () => {
+          const a = await append(),
+            b = await append();
+          const run = await append();
+          // 持久 turn 的真实 inputs、claim 和来源与 frame 一起作为证明；不相信调用方 manifest。
+          const frame = async (
+            revision: number,
+            sourceIds: string[],
+            evidenceIds = sourceIds,
+          ) => {
+            const id = informationIdSchema.parse(randomUUID());
+            const turnId = informationIdSchema.parse(randomUUID());
+            const atoms = await db.information.find({
+              informationIds: sourceIds,
+              limit: 1000,
+            });
+            const inputs = sourceIds.map((informationId) => {
+              const atom = atoms.find(
+                (a) => a.informationId === informationId,
+              )!;
+              return {
+                informationId,
+                text: atom.payload.text,
+                source: atom.payload.source,
+              };
+            });
+            const content = {
+              background: { evidence: evidenceIds.map((id) => ({ id })) },
+              memory: {
+                fixed: [
+                  {
+                    id: "person",
+                    content: `revision ${revision}`,
+                    metadata: { revision },
+                  },
+                ],
+              },
+            };
+            await db.information.append(
+              freezeInformationAtom({
+                informationId: turnId,
+                kind: resultKind,
+                source: "test:turn",
+                occurredAt: "2026-09-25T00:00:01.000Z",
+                payload: jsonObjectSchema.parse({
+                  source: address,
+                  claimInformationId: run,
+                  inputs,
+                  observedThroughInformationId: sourceIds.at(-1)!,
+                }),
+                references: [],
+              }),
+              [],
+            );
+            await db.information.append(
+              freezeInformationAtom({
+                informationId: id,
+                kind: resultKind,
+                source: "test:frame",
+                occurredAt: "2026-09-25T00:00:01.000Z",
+                payload: { turnInformationId: turnId, frame: content },
+                references: [
+                  { relation: "core:uses-context", informationId: turnId },
+                ],
+              }),
+              [
+                {
+                  relation: "core:uses-context",
+                  multiple: true,
+                  required: true,
+                },
+              ],
+            );
+            return {
+              version: 1 as const,
+              runInformationId: run,
+              frozenInformationId: id,
+              sourceInformationIds: sourceIds,
+              knowledgeCutoff: {
+                informationId: id,
+                memoryRevisions: [{ id: "person", revision }],
+              },
+              content,
+            };
+          };
+          const original = await frame(1, [b]);
+          const expanded = { ...original, sourceInformationIds: [a, b] };
+          await expect(
+            db.observations.freezeNext({
+              ...input,
+              operationKey: "forged-sources",
+              throughInformationId: b,
+              manifest: expanded,
+            }),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          const wrongRevision = {
+            ...original,
+            knowledgeCutoff: {
+              ...original.knowledgeCutoff,
+              memoryRevisions: [{ id: "person", revision: 99 }],
+            },
+          };
+          await expect(
+            db.observations.freezeNext({
+              ...input,
+              operationKey: "forged-memory",
+              throughInformationId: b,
+              manifest: wrongRevision,
+            }),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          const gap = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "gap",
+            throughInformationId: b,
+            manifest: original,
+          }))!;
+          expect(gap.sourceInformationIds).toEqual([a]);
+          expect(gap.complete).toBe(false);
+          const page = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "current",
+            throughInformationId: b,
+            manifest: original,
+          }))!;
+          expect(page.sourceInformationIds).toEqual([b]);
+          const proof = await result(page, [
+            b,
+            run,
+            original.frozenInformationId,
+          ]);
+          await db.observations.finish(page.observationId, proof);
+          await expect(
+            db.observations.finish(gap.observationId, await result(gap)),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          expect((await db.observations.progress(input))?.throughPosition).toBe(
+            "0",
+          );
+          const revised = await frame(2, [a, b]);
+          await reconnect();
+          expect(
+            (
+              await db.observations.freezeNext({
+                ...input,
+                operationKey: "current",
+                manifest: revised,
+              })
+            )?.manifest,
+          ).toEqual(original);
+          await expect(
+            db.observations.replace(
+              gap.observationId,
+              "forged-sources",
+              expanded,
+            ),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          await expect(
+            db.observations.replace(gap.observationId, "forged-memory", {
+              ...revised,
+              knowledgeCutoff: {
+                ...revised.knowledgeCutoff,
+                memoryRevisions: [{ id: "person", revision: 99 }],
+              },
+            }),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          const missingBody = await frame(2, [a, b], [b]);
+          await expect(
+            db.observations.replace(
+              gap.observationId,
+              "missing-body",
+              missingBody,
+            ),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          const replacement = await db.observations.replace(
+            gap.observationId,
+            "read-gap",
+            revised,
+          );
+          expect(replacement.sourceInformationIds).toEqual([a]);
+          expect(replacement.complete).toBe(true);
+          await expect(
+            db.observations.finish(gap.observationId, await result(gap)),
+          ).rejects.toBeInstanceOf(ObservationConflictError);
+          await db.observations.finish(
+            replacement.observationId,
+            await result(replacement, [a, run, revised.frozenInformationId]),
+          );
+          expect(
+            (await db.observations.progress(input))?.throughInformationId,
+          ).toBe(b);
+          expect(
+            (await db.observations.read(gap.observationId))
+              ?.replacementObservationId,
+          ).toBe(replacement.observationId);
+          await db.prepareSchema();
+          expect(
+            (await db.observations.read(page.observationId))?.manifest,
+          ).toEqual(original);
+        });
+        it("persists defer without confirming input and survives duplicate worker operations", async () => {
+          const a = await append();
+          const pages = await Promise.all(
+            Array.from({ length: 6 }, () =>
+              db.observations.freezeNext({ ...input, operationKey: "same" }),
+            ),
+          );
+          const page = pages[0]!;
+          expect(new Set(pages.map((p) => p!.observationId)).size).toBe(1);
+          const schedule = await result(page);
+          await db.observations.defer(
+            page.observationId,
+            "2026-10-24T08:00:00.000Z",
+            schedule,
+          );
+          await reconnect();
+          expect((await db.observations.pending(input))[0]?.deferredUntil).toBe(
+            "2026-10-24T08:00:00.000Z",
+          );
+          expect((await db.observations.progress(input))?.throughPosition).toBe(
+            "0",
+          );
+          await db.observations.finish(page.observationId, await result(page));
+          expect(
+            (await db.observations.progress(input))?.throughInformationId,
+          ).toBe(a);
+        });
         it("freezes across ticks, preserves late evidence and restores failed input after reconstruction", async () => {
           const a = await append(),
             b = await append();
@@ -421,9 +734,8 @@ for (const postgres of [false, true]) {
           expect(await db.observations.freezeNext(input)).toBeUndefined();
           expect((await db.information.get(a))?.informationId).toBe(a);
         });
-        it.skipIf(!postgres)(
-          "does not freeze past an earlier source transaction that has not committed",
-          async () => {
+        if (postgres)
+          it("does not freeze past an earlier source transaction that has not committed", async () => {
             let inserted = false;
             const release = Promise.withResolvers<void>();
             let freezing = false;
@@ -505,8 +817,100 @@ for (const postgres of [false, true]) {
               release.resolve();
               await Promise.allSettled([writeOutcome, freezeOutcome]);
             }
-          },
-        );
+          });
+        if (postgres)
+          it("serializes supersede against a completion already holding the progress lock", async () => {
+            await append();
+            const original = (await db.observations.freezeNext({
+              ...input,
+              operationKey: "original",
+            }))!;
+            const replacement = randomUUID();
+            // Stage a competing replacement row to exercise the public supersede port independently.
+            await db.sql.query(
+              `INSERT INTO information_observations(observation_id,stream_id,after_position,through_position,source_ids,context_ids,has_more,operation_key)
+            SELECT $2,stream_id,after_position,through_position,source_ids,context_ids,has_more,'staged-replacement' FROM information_observations WHERE observation_id=$1`,
+              [original.observationId, replacement],
+            );
+            const proof = await result(original);
+            let release!: () => void;
+            const barrier = new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            let read = false;
+            const wrapped: SqlDatabase = {
+              query: db.sql.query.bind(db.sql),
+              exec: db.sql.exec.bind(db.sql),
+              close: async () => {},
+              transaction: (run) =>
+                db.sql.transaction((tx) =>
+                  run({
+                    exec: tx.exec.bind(tx),
+                    query: async <Row extends Record<string, unknown>>(
+                      sql: string,
+                      values?: readonly unknown[],
+                    ) => {
+                      const value = await tx.query<Row>(sql, values);
+                      if (sql.startsWith("SELECT o.observation_id") && !read) {
+                        read = true;
+                        await barrier;
+                      }
+                      return value;
+                    },
+                  }),
+                ),
+            };
+            const finish = new KaguyaDatabase(wrapped).observations.finish(
+              original.observationId,
+              proof,
+            );
+            let supersede: Promise<unknown> | undefined;
+            let settled = false;
+            try {
+              await vi.waitFor(() => expect(read).toBe(true), {
+                timeout: 8000,
+                interval: 20,
+              });
+              supersede = db.observations
+                .supersede(original.observationId, replacement)
+                .then(
+                  (value) => {
+                    settled = true;
+                    return value;
+                  },
+                  (error) => {
+                    settled = true;
+                    throw error;
+                  },
+                );
+              // Observe the actual SQL wait, or an incorrect early completion, before releasing the winner.
+              void supersede.catch(() => {});
+              await vi.waitFor(
+                async () => {
+                  const waiting = await db.sql.query(
+                    `SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%information_observation_progress%FOR UPDATE%'`,
+                  );
+                  expect(settled || waiting.rows.length > 0).toBe(true);
+                },
+                { timeout: 8000, interval: 20 },
+              );
+            } finally {
+              release();
+              await Promise.allSettled([finish, supersede]);
+            }
+            const outcomes = await Promise.allSettled([finish, supersede!]);
+            expect(outcomes.map((o) => o.status)).toEqual([
+              "fulfilled",
+              "rejected",
+            ]);
+            expect(
+              (await db.observations.read(original.observationId))
+                ?.replacementObservationId,
+            ).toBeNull();
+            expect(
+              (await db.observations.progress(input))?.throughPosition,
+            ).toBe(original.throughPosition);
+          });
         it("serializes competing freezes and confirmations across connection-pool workers", async () => {
           const a = await append(),
             b = await append(),

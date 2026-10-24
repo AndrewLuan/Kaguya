@@ -1,7 +1,7 @@
 /**
  * 功能概述：以真实 Runtime/ModuleHost 和持久队列验证 observationCapability 的声明式接入与启动恢复。
  * ready 经测试自有 bootstrap 能力登记扫描请求，durable handler 冻结一页、registerOnce 结果并确认进度。
- * 代码库关系：只使用 SDK capability 与现有 Core 原语；不自动迁移 Heartflow 或 Memory，也不调用模型和平台。
+ * 代码库关系：只使用 SDK capability 与现有 Core 原语；使用自有消费者独立进度，也不调用模型和平台。
  * 输入输出与副作用：测试故意停在结果提交与进度确认之间，再关闭重建 Runtime；PostgreSQL 额外关闭重连 pool。
  * 真实数据库与队列统一使用 8 秒有界状态轮询，整个用例 15 秒；finally 顺序关闭宿主与隔离数据库。
  */

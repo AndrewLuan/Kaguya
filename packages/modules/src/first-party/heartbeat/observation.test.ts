@@ -3,7 +3,9 @@
  * 主要职责：fixture 注入时钟，fire 交付持久 due；断言 candidate 数与冻结来源，不调用真实模型或平台。
  * 代码库关系：直接运行 heartbeatModule 与数据库开放槽；补足单元替身无法验证的 Selector/事务边界。
  * 输入输出与副作用：每例隔离 PGlite，关闭宿主与 Core；重放 handler 和同时间戳输入验证幂等性。
+ * 持久队列等待统一使用 8 秒/20 毫秒有界轮询；fixture 注入 observationCapability 验证真实独立进度。
  */
+import { observationCapability } from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import {
@@ -85,6 +87,7 @@ async function fixture(
     core,
     catalog,
     capabilities: [
+      { capability: observationCapability, value: db.observations },
       {
         capability: oneShotScheduleCapability,
         value: new OneShotScheduleClient(core),
@@ -124,11 +127,14 @@ async function fixture(
     references: [],
   });
   const settle = () =>
-    vi.waitFor(async () => {
-      const h = await db.information.reliable.health();
-      expect(h.pending).toBe(0);
-      expect(h.exhausted).toBe(0);
-    });
+    vi.waitFor(
+      async () => {
+        const h = await db.information.reliable.health();
+        expect(h.pending).toBe(0);
+        expect(h.exhausted).toBe(0);
+      },
+      { timeout: 8000, interval: 20 },
+    );
   const source = {
     platform: "qq",
     adapterId: "qq.main",
@@ -459,15 +465,20 @@ it("marks a direct notification as an immediate wake for the open scope", async 
 it("defaults Arousal to awake and observes the first passive opportunity", async () => {
   const f = await fixture(true);
   await f.inbound();
-  await vi.waitFor(async () => {
-    const decisions = await f.atoms("agent.attention.arousal.completed");
-    expect(decisions.map((atom) => atom.payload.outcome)).toEqual(["observe"]);
-    expect(decisions[0]!.payload).toMatchObject({
-      arousalState: "awake",
-      wakeSignal: false,
-      reasonCodes: ["arousal-awake"],
-    });
-  });
+  await vi.waitFor(
+    async () => {
+      const decisions = await f.atoms("agent.attention.arousal.completed");
+      expect(decisions.map((atom) => atom.payload.outcome)).toEqual([
+        "observe",
+      ]);
+      expect(decisions[0]!.payload).toMatchObject({
+        arousalState: "awake",
+        wakeSignal: false,
+        reasonCodes: ["arousal-awake"],
+      });
+    },
+    { timeout: 8000, interval: 20 },
+  );
   expect(await f.atoms("agent.heartbeat.scheduled")).toHaveLength(0);
   expect(await f.atoms("agent.attention.arousal.state.recorded")).toHaveLength(
     1,
@@ -482,41 +493,50 @@ it("defers during night sleep and lets the periodic deadline recheck accumulated
   });
   await f.setArousalState("asleep");
   await f.inbound();
-  await vi.waitFor(async () => {
-    const decisions = await f.atoms("agent.attention.arousal.completed");
-    expect(decisions.map((atom) => atom.payload.outcome)).toEqual(["defer"]);
-    expect(decisions[0]!.payload).toMatchObject({
-      arousalState: "asleep",
-      wakeSignal: false,
-      reasonCodes: ["arousal-asleep"],
-    });
-  });
+  await vi.waitFor(
+    async () => {
+      const decisions = await f.atoms("agent.attention.arousal.completed");
+      expect(decisions.map((atom) => atom.payload.outcome)).toEqual(["defer"]);
+      expect(decisions[0]!.payload).toMatchObject({
+        arousalState: "asleep",
+        wakeSignal: false,
+        reasonCodes: ["arousal-asleep"],
+      });
+    },
+    { timeout: 8000, interval: 20 },
+  );
   const schedules = await f.atoms("agent.heartbeat.scheduled");
   expect(schedules).toHaveLength(0);
   await f.inbound();
-  await vi.waitFor(async () => {
-    const decisions = await f.atoms("agent.attention.arousal.completed");
-    expect(decisions.map((atom) => atom.payload.outcome)).toEqual([
-      "defer",
-      "defer",
-    ]);
-    expect(decisions[1]!.payload.unreadCount).toBe(2);
-  });
+  await vi.waitFor(
+    async () => {
+      const decisions = await f.atoms("agent.attention.arousal.completed");
+      expect(decisions.map((atom) => atom.payload.outcome)).toEqual([
+        "defer",
+        "defer",
+      ]);
+      expect(decisions[1]!.payload.unreadCount).toBe(2);
+    },
+    { timeout: 8000, interval: 20 },
+  );
   await f.fire(attentionArousalModule.manifest.definitionId, "periodic-wake");
-  await vi.waitFor(async () => {
-    const decisions = await f.atoms("agent.attention.arousal.completed");
-    expect(decisions.map((atom) => atom.payload.outcome)).toEqual([
-      "defer",
-      "defer",
-      "observe",
-    ]);
-    expect(decisions[2]!.payload.signals).toContain("recheck");
-    expect(decisions[2]!.payload.unreadCount).toBe(2);
-    expect(decisions[2]!.payload).toMatchObject({
-      arousalState: "awake",
-      wakeSignal: true,
-    });
-  });
+  await vi.waitFor(
+    async () => {
+      const decisions = await f.atoms("agent.attention.arousal.completed");
+      expect(decisions.map((atom) => atom.payload.outcome)).toEqual([
+        "defer",
+        "defer",
+        "observe",
+      ]);
+      expect(decisions[2]!.payload.signals).toContain("recheck");
+      expect(decisions[2]!.payload.unreadCount).toBe(2);
+      expect(decisions[2]!.payload).toMatchObject({
+        arousalState: "awake",
+        wakeSignal: true,
+      });
+    },
+    { timeout: 8000, interval: 20 },
+  );
 });
 it("recognizes private, replies and broadcast mentions without treating ordinary group messages as urgent", () => {
   expect(isImmediateObservation({ destination: { kind: "private" } })).toBe(

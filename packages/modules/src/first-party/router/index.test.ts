@@ -5,7 +5,9 @@
  * waitFor/settle 按 8 秒持久化预算等待事实或 durable 队列收敛，否定断言不依赖固定休眠。
  * 代码库关系：配合 planner.test.ts 的纯编译测试及 Server 的真实模型任务协议测试；不访问外部模型。
  * 输入输出与副作用：每项测试使用独立数据库并在结束时关闭 Host/Core/数据库，保留精确输入水位与动作断言。
+ * 模型替身入口断言观察成功及持久 claim/run 已存在、行动意图尚未创建；观察能力使用真实数据库实现。
  */
+import { observationCapability } from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import {
@@ -97,19 +99,25 @@ async function fixture(
     action?: any;
     muted?: boolean;
     now?: string;
+    beforeExecute?: (
+      database: Awaited<ReturnType<typeof createTestingDatabase>>,
+    ) => Promise<void>;
   } = {},
 ) {
   const database = await createTestingDatabase();
   await database.prepareSchema();
-  const execute = vi.fn(async (request: any) => ({
-    status: "completed" as const,
-    output: options.action ?? {
-      action: "message",
-      reason: "respond",
-    },
-    requestedInformationId: "request",
-    terminalInformationId: request.sourceInformationId,
-  }));
+  const execute = vi.fn(async (request: any) => {
+    await options.beforeExecute?.(database);
+    return {
+      status: "completed" as const,
+      output: options.action ?? {
+        action: "message",
+        reason: "respond",
+      },
+      requestedInformationId: "request",
+      terminalInformationId: request.sourceInformationId,
+    };
+  });
   const promptTemplates = loadFirstPartyPromptTemplates();
   const moduleOptions = {
     rawContextCapability,
@@ -162,6 +170,7 @@ async function fixture(
     catalog,
     now,
     capabilities: [
+      { capability: observationCapability, value: database.observations },
       { capability: rawContextCapability, value: database.rawEvents },
       {
         capability: modelTaskCapability,
@@ -516,6 +525,54 @@ async function waitFor(database: any, kind: string) {
     return atom;
   }, PERSISTENCE_WAIT);
 }
+
+it("persists the observation and run identity before model execution can create an intent", async () => {
+  let checked = false;
+  const f = await fixture({
+    action: { action: "silent", reason: "no-response-needed" },
+    beforeExecute: async (database) => {
+      const atoms = await all(database);
+      const completed = atoms.find(
+        (a: any) => a.kind === "agent.observation.completed.v1",
+      );
+      expect(completed).toBeDefined();
+      const page = await database.observations.read(
+        String(completed.payload.observationId),
+      );
+      expect(page?.status).toBe("completed");
+      expect(page?.complete).toBe(true);
+      expect(page?.manifest?.runInformationId).toBe(
+        completed.payload.runInformationId,
+      );
+      const frozen = atoms.find(
+        (a: any) => a.informationId === page?.manifest?.frozenInformationId,
+      );
+      const turn = atoms.find(
+        (a: any) => a.informationId === frozen?.payload.turnInformationId,
+      );
+      expect(turn?.payload.claimInformationId).toBe(
+        page?.manifest?.runInformationId,
+      );
+      expect(
+        atoms.some(
+          (a: any) => a.informationId === page?.manifest?.runInformationId,
+        ),
+      ).toBe(true);
+      expect(
+        atoms.filter(
+          (a: any) => a.kind === messageIntentRequestedInformationKind.kind,
+        ),
+      ).toHaveLength(0);
+      checked = true;
+    },
+  });
+  const opportunity = await appendOpportunity(f.core, {
+    texts: ["first input"],
+  });
+  await decide(f.core, opportunity.candidate, "observe");
+  await settle(f.database);
+  expect(checked).toBe(true);
+});
 
 it("freezes before attention and defer does not call Light or advance progress", async () => {
   const { core, database, execute } = await fixture();

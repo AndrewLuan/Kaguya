@@ -1,7 +1,3 @@
-import {
-  lifecycleStartupCapability,
-  lifecycleStartedInformationKind,
-} from "@kaguya/modules";
 /**
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
@@ -24,7 +20,13 @@ import {
  * 输入输出与副作用：每个用例创建隔离的内存 PGlite 数据库，Runtime 只写 information
  * ledger；所有创建 PGlite 的用例共享 15 秒跨平台超时，测试结束显式关闭注入数据库，
  * 并检查持久化 payload 不包含 raw/provider secret。
+ * 观察 DAG 明确包含 completed/progress 两种事实，保留完整因果链和上下文引用断言。
  */
+import {
+  lifecycleStartupCapability,
+  lifecycleStartedInformationKind,
+} from "@kaguya/modules";
+
 /**
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
@@ -978,6 +980,8 @@ describe("KaguyaRuntime", () => {
           "core.delivery.delivered",
           "core.delivery.started",
           "agent.situation.frozen",
+          "agent.observation.completed.v1",
+          "agent.observation.progress.v1",
         ]),
       );
       expect(result.deliveries).toEqual([]);
