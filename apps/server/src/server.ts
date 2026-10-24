@@ -1,5 +1,5 @@
-import { migrateLifecycleConfig } from "@kaguya/config";
 /**
+ * MCP 宿主由本文件按 Runtime 生命周期打开和回收；首次装配与配置重建共用冻结工具/provider 接口。
  * Memory 图管理通过动态 database.memoryGraph 门面接入 HTTP，数据库重挂载后使用当前实例。
  * 模板管理与配置应用共享写锁，只写本地覆盖，用户需重启加载新模板。
  * 模块配置管理复用 configuration.exclusive，与显式应用共锁；保存不会切换运行实例。
@@ -46,6 +46,14 @@ import { migrateLifecycleConfig } from "@kaguya/config";
  * Inspection 仅在 Runtime 可用时注入，不把 settings、凭据或数据库对象放入 HTTP 响应。
  * Web adapter 将回复交付给持久账本；WebChatHistory 只投影已送达消息，热应用后读取当前数据库。
  */
+import {
+  openServerMcp,
+  withServerMcp,
+  registerMcpRoutes,
+  withMcpKindRegistry,
+} from "./mcp-host.js";
+import { type McpHost } from "@kaguya/mcp";
+import { migrateLifecycleConfig } from "@kaguya/config";
 import { ModuleTemplateManagement } from "./module-template-management.js";
 import { IdentityPersonaManagement } from "./identity-persona-management.js";
 import { ModuleSettingsManagement } from "./module-settings-management.js";
@@ -255,12 +263,14 @@ export async function startKaguyaServer(
         (item) => item.definitionId === "plugin.qq-expression" && item.enabled,
       ),
     );
-    pluginSnapshot = await loadModulePlugins({
-      rootDir: bootstrap.configRoot,
-      tree: bootTree,
-      catalog,
-      configs: moduleConfigs,
-    });
+    pluginSnapshot = withMcpKindRegistry(
+      await loadModulePlugins({
+        rootDir: bootstrap.configRoot,
+        tree: bootTree,
+        catalog,
+        configs: moduleConfigs,
+      }),
+    );
     catalog = pluginSnapshot.catalog;
     moduleConfigs = pluginSnapshot.configs;
     createMessageComposition(undefined, {
@@ -321,6 +331,19 @@ export async function startKaguyaServer(
   ];
   let closePromise: Promise<void> | undefined;
   let unregisterShutdown: (() => void) | undefined;
+  let mcp: McpHost | undefined;
+  const mcpOwners = new Set<McpHost>();
+  const releaseMcp = async (host: McpHost | undefined) => {
+    if (host) {
+      await host.close();
+      mcpOwners.delete(host);
+    }
+  };
+  const releaseAllMcp = async () => {
+    const results = await Promise.allSettled([...mcpOwners].map(releaseMcp));
+    if (results.some((result) => result.status === "rejected"))
+      throw new Error("MCP cleanup incomplete");
+  };
   let runtime: KaguyaRuntime | undefined;
   let failedRuntime: KaguyaRuntime | undefined;
   let database: KaguyaDatabase | undefined;
@@ -350,7 +373,18 @@ export async function startKaguyaServer(
         failures.push(error);
       }
       try {
-        await assembly.dispose();
+        await assembly.unmount("runtime");
+        await assembly.unmountModules();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await releaseAllMcp();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        if (!mcpOwners.size) await assembly.dispose();
       } catch (error) {
         failures.push(error);
       }
@@ -361,13 +395,18 @@ export async function startKaguyaServer(
           ? undefined
           : (runtime ?? failedRuntime)?.close(),
         mounted.has("adapter") ? undefined : adapterHost.stop(),
-        mounted.has("database") ? undefined : database?.close(),
+        mounted.has("database") || mcpOwners.size
+          ? undefined
+          : database?.close(),
         mounted.has("logging") ? undefined : closeLogger(rootLogger),
       ]);
       collectFailures(leftovers, failures);
       if (failures.length)
         throw new AggregateError(failures, "Kaguya server shutdown failed");
-    })();
+    })().catch((error) => {
+      closePromise = undefined;
+      throw error;
+    });
     return closePromise;
   };
 
@@ -454,6 +493,8 @@ export async function startKaguyaServer(
       !degradationReasons.includes("database_unavailable")
     ) {
       try {
+        mcp = await openServerMcp(bootstrap.configRoot, database);
+        mcpOwners.add(mcp);
         runtime = new KaguyaRuntime({
           kindRegistry: pluginSnapshot.kindRegistry,
           moduleLifecycle: assembly.moduleLifecycle,
@@ -461,17 +502,20 @@ export async function startKaguyaServer(
           targetDirectory: adapterHost,
           database,
           logger: rootLogger,
-          ...createMessageComposition(resolveModelSelection, {
-            ...(config.nativeMemoryTools ? { nativeMemoryTools: true } : {}),
-            pluginModelTasks: pluginSnapshot.modelTasks,
-            ...createMemoryCompositionOptions(
-              memoryConfigFromModules(moduleConfigs),
-            ),
-            moduleConfigs,
-            catalog,
-            agentIdentity: selectedProfile.identity,
-            ai: selectedProfile.ai,
-          }),
+          ...withServerMcp(
+            mcp,
+            createMessageComposition(resolveModelSelection, {
+              ...(config.nativeMemoryTools ? { nativeMemoryTools: true } : {}),
+              pluginModelTasks: pluginSnapshot.modelTasks,
+              ...createMemoryCompositionOptions(
+                memoryConfigFromModules(moduleConfigs),
+              ),
+              moduleConfigs,
+              catalog,
+              agentIdentity: selectedProfile.identity,
+              ai: selectedProfile.ai,
+            }),
+          ),
         });
         adapterHost.registerTransports(runtime);
         await startInformationRuntime(runtime);
@@ -496,7 +540,12 @@ export async function startKaguyaServer(
           databaseFailure ? "database_unavailable" : "runtime_start_failed",
         );
         try {
-          await runtime?.close();
+          const cleanup = await Promise.allSettled([
+            runtime?.close(),
+            releaseMcp(mcp),
+          ]);
+          if (cleanup.some((result) => result.status === "rejected"))
+            throw new Error("Runtime cleanup incomplete");
         } catch {
           failedRuntime = runtime;
           serverLogger.warn(
@@ -600,19 +649,21 @@ export async function startKaguyaServer(
         };
       },
       validate: async (snapshot) => {
-        const nextPlugins = await loadModulePlugins({
-          rootDir: bootstrap.configRoot,
-          tree: snapshot.pluginTree ?? bootTree,
-          configs: snapshot.moduleConfigs,
-          catalog: createMessageCatalog(
-            snapshot.profile.identity,
-            undefined,
-            snapshot.moduleConfigs.some(
-              (item) =>
-                item.definitionId === "plugin.qq-expression" && item.enabled,
+        const nextPlugins = withMcpKindRegistry(
+          await loadModulePlugins({
+            rootDir: bootstrap.configRoot,
+            tree: snapshot.pluginTree ?? bootTree,
+            configs: snapshot.moduleConfigs,
+            catalog: createMessageCatalog(
+              snapshot.profile.identity,
+              undefined,
+              snapshot.moduleConfigs.some(
+                (item) =>
+                  item.definitionId === "plugin.qq-expression" && item.enabled,
+              ),
             ),
-          ),
-        });
+          }),
+        );
         pluginSnapshots.set(pluginSnapshotKey(snapshot), nextPlugins);
         if (database)
           await prepareConfigurationDatabase(
@@ -654,6 +705,12 @@ export async function startKaguyaServer(
           mounted.delete("runtime");
         }
         try {
+          await releaseAllMcp();
+          mcp = undefined;
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
           await assembly!.unmount("adapter");
         } catch (error) {
           failures.push(error);
@@ -680,6 +737,7 @@ export async function startKaguyaServer(
         };
         const nextHost = createServerAdapterHost(nextConfig, rootLogger);
         nextHost.pauseIngress();
+        let nextMcp: McpHost | undefined;
         let nextRuntime: KaguyaRuntime | undefined;
         let nextHostMounted = false;
         let nextRuntimeMounted = false;
@@ -715,6 +773,8 @@ export async function startKaguyaServer(
           );
           mounted.add("adapter");
           nextHostMounted = true;
+          nextMcp = await openServerMcp(bootstrap.configRoot, database);
+          mcpOwners.add(nextMcp);
           nextRuntime = new KaguyaRuntime({
             kindRegistry: nextPlugins.kindRegistry,
             moduleLifecycle: assembly!.moduleLifecycle,
@@ -724,21 +784,24 @@ export async function startKaguyaServer(
             targetDirectory: nextHost,
             database,
             logger: rootLogger,
-            ...createMessageComposition(
-              createRuntimeModelSelectionResolver(snapshot.profile),
-              {
-                ...createMemoryCompositionOptions(
-                  memoryConfigFromModules(snapshot.moduleConfigs),
-                ),
-                moduleConfigs: nextPlugins.configs,
-                catalog: nextPlugins.catalog,
-                ...(nextConfig.nativeMemoryTools
-                  ? { nativeMemoryTools: true }
-                  : {}),
-                pluginModelTasks: nextPlugins.modelTasks,
-                agentIdentity: snapshot.profile.identity,
-                ai: snapshot.profile.ai,
-              },
+            ...withServerMcp(
+              nextMcp,
+              createMessageComposition(
+                createRuntimeModelSelectionResolver(snapshot.profile),
+                {
+                  ...createMemoryCompositionOptions(
+                    memoryConfigFromModules(snapshot.moduleConfigs),
+                  ),
+                  moduleConfigs: nextPlugins.configs,
+                  catalog: nextPlugins.catalog,
+                  ...(nextConfig.nativeMemoryTools
+                    ? { nativeMemoryTools: true }
+                    : {}),
+                  pluginModelTasks: nextPlugins.modelTasks,
+                  agentIdentity: snapshot.profile.identity,
+                  ai: snapshot.profile.ai,
+                },
+              ),
             ),
           });
           nextHost.registerTransports(nextRuntime);
@@ -769,6 +832,7 @@ export async function startKaguyaServer(
             profile: snapshot.profile,
             moduleConfigs: snapshot.moduleConfigs,
           });
+          mcp = nextMcp;
           runtime = nextRuntime;
           adapterHost = nextHost;
           selectedProfile = snapshot.profile;
@@ -789,6 +853,7 @@ export async function startKaguyaServer(
               : nextRuntime?.close(),
             nextHostMounted ? assembly!.unmount("adapter") : nextHost.stop(),
           ]);
+          results.push(...(await Promise.allSettled([releaseMcp(nextMcp)])));
           if (nextRuntimeMounted) mounted.delete("runtime");
           if (nextHostMounted) mounted.delete("adapter");
           if (results.some((result) => result.status === "rejected")) {
@@ -897,6 +962,7 @@ export async function startKaguyaServer(
         logger: httpLogger,
       }),
     );
+    registerMcpRoutes(app!, () => mcp, gatewayAuth);
     await assembly.mount(
       "http",
       ["configuration", "logging"],
