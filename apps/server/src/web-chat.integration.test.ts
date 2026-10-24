@@ -8,6 +8,12 @@
  * 内存 PGlite，失败路径也按 HTTP、Runtime、数据库顺序关闭。覆盖会话隔离、后续上下文、
  * 游标增量读取、Runtime/reader 重建恢复，以及已生成但未送达的助手消息不得显示。
  */
+import {
+  closeTestResources,
+  createPersistenceWait,
+  expectPersistenceSettled,
+  withModelGateCleanup,
+} from "./test-support/persistence.js";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,10 +40,16 @@ const adapterId = "web.ui.main";
 const durableWait = { timeout: 8_000, interval: 20 };
 // HTTP 历史独立限流为每分钟 120 次；三轮最长等待总计不超过 96 次轮询。
 const historyWait = { timeout: durableWait.timeout, interval: 250 };
+// 多阶段用例包含初始化、生成/投递、重启或 gate 清理；单次等待仍为 8 秒。
+const MULTI_STAGE_TIMEOUT = 30_000;
+// receipt 重放/插话包含 3 次等待和 1 次清理（4×8 秒），另留初始化和 HTTP 余量。
+const GATED_CONTINUATION_TIMEOUT = 45_000;
+// failure → 重放 ack → 收敛共 3×8 秒，另含初次启动和重启。
+const REPLAY_RESTART_TIMEOUT = 40_000;
 const cleanups: (() => Promise<void>)[] = [];
 
 afterEach(async () => {
-  for (const close of cleanups.splice(0).reverse()) await close();
+  await closeTestResources(cleanups);
 }, 15_000);
 
 type ChatHistory = Awaited<
@@ -78,6 +90,7 @@ async function fixture(
     qq?: boolean;
     expressions?: boolean;
     pacingMs?: number;
+    diagnostics?: () => Record<string, unknown>;
   } = {},
 ) {
   const database = await createTestingDatabase();
@@ -104,6 +117,12 @@ async function fixture(
   });
 
   const composerPrompts: string[] = [];
+  const waitFor = createPersistenceWait(database, () => ({
+    composerCalls: composerPrompts.length,
+    ...options.diagnostics?.(),
+  }));
+  const settle = (phase = "durable replay settled") =>
+    waitFor(phase, () => expectPersistenceSettled(database));
   const fetch = vi.fn<typeof globalThis.fetch>(async (_url, init) => {
     const request = JSON.parse(String(init?.body)) as {
       model: string;
@@ -300,12 +319,15 @@ async function fixture(
     app,
     database,
     composerPrompts,
+    waitFor,
+    settle,
     runtime: () => runtime!,
     read,
     send,
     exchange,
-    restart: async () => {
+    restart: async (beforeStart?: () => Promise<void>) => {
       await runtime!.close();
+      await beforeStart?.();
       await startRuntime();
       reader = createWebChatHistory(database.information);
     },
@@ -349,47 +371,59 @@ describe("Web private chat through the production information DAG", () => {
       ),
     ).toEqual(["范围测试第3条"]);
   });
-  it("keeps input arriving during the final part unread for the next turn", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const f = await fixture({
-      respond: async (_prompt, index) => {
-        if (index === 2) await gate;
-        return {
-          action: "message",
-          text: `末段测试第${index}条`,
-          continuation: index === 1 ? "补完这一点" : null,
-        };
-      },
-    });
-    const conversation = randomUUID();
-    await f.send(conversation, "说完这一点", "final-start");
-    await vi.waitFor(
-      () => expect(f.composerPrompts).toHaveLength(2),
-      durableWait,
-    );
-    await f.send(conversation, "现在问一个新问题", "final-interjection");
-    release();
-    await vi.waitFor(
-      async () =>
-        expect(
-          await f.database.information.find({
-            kinds: ["agent.router.turn.completed"],
-            limit: 10,
-          }),
-        ).toHaveLength(2),
-      durableWait,
-    );
-    expect(f.composerPrompts).toHaveLength(3);
-    expect(f.composerPrompts[2]).toContain("现在问一个新问题");
-    expect(
-      (await f.read(conversation)).messages
-        .filter((m) => m.role === "assistant")
-        .map((m) => m.text),
-    ).toEqual(["末段测试第1条", "末段测试第2条", "末段测试第3条"]);
-  });
+  it(
+    "keeps input arriving during the final part unread for the next turn",
+    async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const f = await fixture({
+        respond: async (_prompt, index) => {
+          if (index === 2) await gate;
+          return {
+            action: "message",
+            text: `末段测试第${index}条`,
+            continuation: index === 1 ? "补完这一点" : null,
+          };
+        },
+      });
+      await withModelGateCleanup(
+        async () => {
+          const conversation = randomUUID();
+          await f.send(conversation, "说完这一点", "final-start");
+          await f.waitFor(
+            "web persistence",
+            () => expect(f.composerPrompts).toHaveLength(2),
+            durableWait,
+          );
+          await f.send(conversation, "现在问一个新问题", "final-interjection");
+          release();
+          await f.waitFor(
+            "web persistence",
+            async () =>
+              expect(
+                await f.database.information.find({
+                  kinds: ["agent.router.turn.completed"],
+                  limit: 10,
+                }),
+              ).toHaveLength(2),
+            durableWait,
+          );
+          expect(f.composerPrompts).toHaveLength(3);
+          expect(f.composerPrompts[2]).toContain("现在问一个新问题");
+          expect(
+            (await f.read(conversation)).messages
+              .filter((m) => m.role === "assistant")
+              .map((m) => m.text),
+          ).toEqual(["末段测试第1条", "末段测试第2条", "末段测试第3条"]);
+        },
+        release,
+        () => f.settle("released model gate drained"),
+      );
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
 
   it("retains delivered content but fails the turn when continuation generation fails", async () => {
     const f = await fixture({
@@ -404,7 +438,8 @@ describe("Web private chat through the production information DAG", () => {
     });
     const conversation = randomUUID();
     await f.send(conversation, "测试模型失败", "model-failure");
-    await vi.waitFor(
+    await f.waitFor(
+      "web persistence",
       async () =>
         expect(
           await f.database.information.find({
@@ -472,11 +507,13 @@ describe("Web private chat through the production information DAG", () => {
             : { kind, userId: "person" },
         raw: {},
       });
-      await vi.waitFor(
+      await f.waitFor(
+        "web persistence",
         () => expect(sent).toEqual(["QQ 第1段", "QQ 第2段"]),
         durableWait,
       );
-      await vi.waitFor(
+      await f.waitFor(
+        "web persistence",
         async () =>
           expect(
             await f.database.information.find({
@@ -518,7 +555,8 @@ describe("Web private chat through the production information DAG", () => {
     });
     const conversation = randomUUID();
     await f.send(conversation, "重启测试", "restart-speech");
-    await vi.waitFor(
+    await f.waitFor(
+      "web persistence",
       async () =>
         expect(
           await f.database.information.find({
@@ -536,7 +574,8 @@ describe("Web private chat through the production information DAG", () => {
     ).toHaveLength(0);
     await f.send(conversation, "等待时也能接收这条插话", "typing-interjection");
     await f.restart();
-    await vi.waitFor(
+    await f.waitFor(
+      "web persistence",
       async () =>
         expect(
           (await f.read(conversation)).messages.map((m) => m.text),
@@ -557,6 +596,7 @@ describe("Web private chat through the production information DAG", () => {
     async (mode) => {
       let attempts = 0;
       const f = await fixture({
+        diagnostics: () => ({ sendAttempts: attempts }),
         transport: {
           sendMessage: async (target) => {
             attempts++;
@@ -587,14 +627,20 @@ describe("Web private chat through the production information DAG", () => {
       });
       const conversation = randomUUID();
       await f.send(conversation, "失败测试", "failure-speech");
-      await vi.waitFor(
-        async () =>
-          expect(
-            await f.database.information.find({
-              kinds: ["agent.router.turn.failed"],
-              limit: 10,
-            }),
-          ).toHaveLength(1),
+      await f.waitFor(
+        "second delivery failure committed and receipt acknowledged",
+        async () => {
+          const failed = await f.database.information.find({
+            kinds: ["agent.router.turn.failed"],
+            limit: 10,
+          });
+          expect(failed).toHaveLength(1);
+          const receipt = await f.database.sql.query<{ state: string }>(
+            "SELECT state FROM information_deliveries WHERE information_id=$1 AND subscription_id LIKE '%:agent.router.delivery.core.delivery.failed'",
+            [failed[0]!.payload.deliveryTerminalInformationId],
+          );
+          expect(receipt.rows).toEqual([{ state: "acked" }]);
+        },
         durableWait,
       );
       expect(attempts).toBe(2);
@@ -604,71 +650,143 @@ describe("Web private chat through the production information DAG", () => {
           .filter((m) => m.role === "assistant")
           .map((m) => m.text),
       ).toEqual(["失败测试第1段"]);
-      await f.restart();
+      const failures = await f.database.information.find({
+        kinds: ["agent.router.turn.failed", "core.delivery.failed"],
+        limit: 10,
+      });
+      expect(failures).toHaveLength(2);
+      expect(
+        failures.find((a) => a.kind === "core.delivery.failed")!.payload
+          .outcome,
+      ).toBe(mode === "unknown" ? "unknown" : undefined);
+      const failureId = failures.find(
+        (a) => a.kind === "core.delivery.failed",
+      )!.informationId;
+      let replay!: { subscription_id: string; attempts: number };
+      await f.restart(async () => {
+        const rows = await f.database.sql.query<{
+          subscription_id: string;
+          attempts: number;
+          state: string;
+        }>(
+          "SELECT subscription_id,attempts,state FROM information_deliveries WHERE information_id=$1 AND subscription_id LIKE '%:agent.router.delivery.core.delivery.failed'",
+          [failureId],
+        );
+        expect(rows.rows).toHaveLength(1);
+        expect(rows.rows[0]!.state).toBe("acked");
+        replay = rows.rows[0]!;
+        await f.database.sql.query(
+          "UPDATE information_deliveries SET state='pending',token=NULL,lease_until=NULL,available_at=clock_timestamp() WHERE subscription_id=$1 AND information_id=$2",
+          [replay.subscription_id, failureId],
+        );
+      });
+      await f.waitFor(
+        "failed receipt replayed and acknowledged after restart",
+        async () => {
+          const rows = await f.database.sql.query<{
+            attempts: number;
+            state: string;
+          }>(
+            "SELECT attempts,state FROM information_deliveries WHERE subscription_id=$1 AND information_id=$2",
+            [replay.subscription_id, failureId],
+          );
+          expect(rows.rows[0]).toEqual({
+            attempts: replay.attempts + 1,
+            state: "acked",
+          });
+        },
+      );
+      await f.settle("failed delivery replay settled after restart");
+      expect(
+        await f.database.information.find({
+          kinds: ["agent.router.turn.failed", "core.delivery.failed"],
+          limit: 10,
+        }),
+      ).toEqual(failures);
       expect(attempts).toBe(2);
       expect(f.composerPrompts).toHaveLength(2);
     },
+    REPLAY_RESTART_TIMEOUT,
   );
 
-  it("coalesces a replayed receipt while the next generation is in progress", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const f = await fixture({
-      respond: async (_prompt, index) => {
-        if (index === 2) await gate;
-        return {
-          action: "message",
-          text: `重复测试第${index}段`,
-          continuation: index === 1 ? "继续" : null,
-        };
-      },
-    });
-    const conversation = randomUUID();
-    await f.send(conversation, "重复测试", "duplicate-speech");
-    await vi.waitFor(
-      () => expect(f.composerPrompts).toHaveLength(2),
-      durableWait,
-    );
-    const receipt = (
-      await f.database.information.find({
-        kinds: ["core.delivery.delivered"],
-        limit: 1,
-      })
-    )[0]!;
-    await f.database.sql.query(
-      "UPDATE information_deliveries SET state = 'pending', available_at = clock_timestamp() WHERE subscription_id = $1 AND information_id = $2",
-      ["heavy.default:kaguya.heavy.delivered", receipt.informationId],
-    );
-    await vi.waitFor(async () => {
-      const row = await f.database.sql.query<{
-        state: string;
-        attempts: number;
-      }>(
-        "SELECT state, attempts FROM information_deliveries WHERE subscription_id = $1 AND information_id = $2",
-        ["heavy.default:kaguya.heavy.delivered", receipt.informationId],
+  it(
+    "coalesces a replayed receipt while the next generation is in progress",
+    async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const f = await fixture({
+        respond: async (_prompt, index) => {
+          if (index === 2) await gate;
+          return {
+            action: "message",
+            text: `重复测试第${index}段`,
+            continuation: index === 1 ? "继续" : null,
+          };
+        },
+      });
+      await withModelGateCleanup(
+        async () => {
+          const conversation = randomUUID();
+          await f.send(conversation, "重复测试", "duplicate-speech");
+          await f.waitFor(
+            "web persistence",
+            () => expect(f.composerPrompts).toHaveLength(2),
+            durableWait,
+          );
+          const receipt = (
+            await f.database.information.find({
+              kinds: ["core.delivery.delivered"],
+              limit: 1,
+            })
+          )[0]!;
+          await f.database.sql.query(
+            "UPDATE information_deliveries SET state = 'pending', available_at = clock_timestamp() WHERE subscription_id = $1 AND information_id = $2",
+            ["heavy.default:kaguya.heavy.delivered", receipt.informationId],
+          );
+          await f.waitFor(
+            "web persistence",
+            async () => {
+              const row = await f.database.sql.query<{
+                state: string;
+                attempts: number;
+              }>(
+                "SELECT state, attempts FROM information_deliveries WHERE subscription_id = $1 AND information_id = $2",
+                ["heavy.default:kaguya.heavy.delivered", receipt.informationId],
+              );
+              expect(row.rows[0]).toMatchObject({
+                state: "acked",
+                attempts: 2,
+              });
+            },
+            durableWait,
+          );
+          release();
+          await f.waitFor(
+            "web persistence",
+            async () =>
+              expect(
+                (await f.read(conversation)).messages.filter(
+                  (m) => m.role === "assistant",
+                ),
+              ).toHaveLength(2),
+            durableWait,
+          );
+          expect(f.composerPrompts).toHaveLength(2);
+          expect(
+            await f.database.information.find({
+              kinds: ["agent.heavy.step.requested"],
+              limit: 10,
+            }),
+          ).toHaveLength(1);
+        },
+        release,
+        () => f.settle("released model gate drained"),
       );
-      expect(row.rows[0]).toMatchObject({ state: "acked", attempts: 2 });
-    }, durableWait);
-    release();
-    await vi.waitFor(
-      async () =>
-        expect(
-          (await f.read(conversation)).messages.filter(
-            (m) => m.role === "assistant",
-          ),
-        ).toHaveLength(2),
-      durableWait,
-    );
-    expect(f.composerPrompts).toHaveLength(2);
-    expect(
-      await f.database.information.find({
-        kinds: ["agent.heavy.step.requested"],
-        limit: 10,
-      }),
-    ).toHaveLength(1);
-  });
+    },
+    GATED_CONTINUATION_TIMEOUT,
+  );
   it("delivers each part before generating the next and closes only the final part", async () => {
     const calls: string[] = [];
     const f = await fixture({
@@ -760,50 +878,66 @@ describe("Web private chat through the production information DAG", () => {
               };
         },
       });
-      const conversation = randomUUID();
-      await f.send(conversation, "说说这个", "speech-start");
-      await vi.waitFor(
-        () => expect(f.composerPrompts).toHaveLength(1),
-        durableWait,
+      await withModelGateCleanup(
+        async () => {
+          const conversation = randomUUID();
+          await f.send(conversation, "说说这个", "speech-start");
+          await f.waitFor(
+            "web persistence",
+            () => expect(f.composerPrompts).toHaveLength(1),
+            durableWait,
+          );
+          await f.send(conversation, `${mode}的新消息`, "speech-interjection");
+          await f.waitFor(
+            "web persistence",
+            async () =>
+              expect((await f.read(conversation)).messages).toHaveLength(2),
+            durableWait,
+          );
+          release();
+          await f.waitFor(
+            "web persistence",
+            async () => {
+              expect(
+                await f.database.information.find({
+                  kinds: ["agent.router.turn.completed"],
+                  limit: 10,
+                }),
+              ).toHaveLength(1);
+              const history = await f.read(conversation);
+              expect(
+                history.messages
+                  .filter((m) => m.role === "assistant")
+                  .map((m) => m.text),
+              ).toEqual(
+                mode === "停止"
+                  ? ["先说这一段"]
+                  : [
+                      "先说这一段",
+                      mode === "更正" ? "按更正接着说" : "继续把话说完",
+                    ],
+              );
+              expect(
+                await f.database.information.find({
+                  kinds: ["agent.heavy.step.observed"],
+                  limit: 10,
+                }),
+              ).toHaveLength(1);
+            },
+            durableWait,
+          );
+          expect(
+            await f.database.information.find({
+              kinds: ["agent.router.turn.silent"],
+              limit: 10,
+            }),
+          ).toHaveLength(0);
+        },
+        release,
+        () => f.settle("released model gate drained"),
       );
-      await f.send(conversation, `${mode}的新消息`, "speech-interjection");
-      await vi.waitFor(
-        async () =>
-          expect((await f.read(conversation)).messages).toHaveLength(2),
-        durableWait,
-      );
-      release();
-      await vi.waitFor(async () => {
-        expect(
-          await f.database.information.find({
-            kinds: ["agent.router.turn.completed"],
-            limit: 10,
-          }),
-        ).toHaveLength(1);
-        const history = await f.read(conversation);
-        expect(
-          history.messages
-            .filter((m) => m.role === "assistant")
-            .map((m) => m.text),
-        ).toEqual(
-          mode === "停止"
-            ? ["先说这一段"]
-            : ["先说这一段", mode === "更正" ? "按更正接着说" : "继续把话说完"],
-        );
-        expect(
-          await f.database.information.find({
-            kinds: ["agent.heavy.step.observed"],
-            limit: 10,
-          }),
-        ).toHaveLength(1);
-      }, durableWait);
-      expect(
-        await f.database.information.find({
-          kinds: ["agent.router.turn.silent"],
-          limit: 10,
-        }),
-      ).toHaveLength(0);
     },
+    GATED_CONTINUATION_TIMEOUT,
   );
   it("returns replies over HTTP, isolates conversations and restores durable history after restart", async () => {
     const f = await fixture();
@@ -873,45 +1007,72 @@ describe("Web private chat through the production information DAG", () => {
     }
 
     await f.restart();
-    await vi.waitFor(async () => {
-      expect((await f.database.information.reliable.health()).pending).toBe(0);
-    }, durableWait);
+    await f.waitFor(
+      "web persistence",
+      async () => {
+        expect((await f.database.information.reliable.health()).pending).toBe(
+          0,
+        );
+      },
+      durableWait,
+    );
     expect(await f.read(conversationA)).toEqual(continued);
     expect(await f.read(conversationB)).toEqual(other);
     expect(f.composerPrompts).toHaveLength(3);
   }, 50_000); // 三轮持久化及一次重启收敛各有 8 秒预算，余量用于 PGlite/HTTP 初始化。
 
-  it("does not expose generated assistant text when delivery failed", async () => {
-    const f = await fixture({ registerTransport: false });
-    const conversationId = randomUUID();
-    await f.send(
-      conversationId,
-      "这条消息没有可用的出站通道",
-      "web-undelivered",
-    );
-    await vi.waitFor(async () => {
-      const atoms = await f.database.information.find({
-        occurredAfter: "2020-01-01T00:00:00.000Z",
-        order: "asc",
-        limit: 1000,
-      });
-      expect(
-        atoms.filter((atom) => atom.kind === "core.message.assistant.text"),
-      ).toHaveLength(1);
-      expect(
-        atoms.filter((atom) => atom.kind === "core.delivery.failed"),
-      ).toHaveLength(1);
-      expect(
-        atoms.filter((atom) => atom.kind === "core.delivery.delivered"),
-      ).toHaveLength(0);
-      expect((await f.database.information.reliable.health()).pending).toBe(0);
-    }, durableWait);
-    expect((await f.read(conversationId)).messages).toEqual([
-      expect.objectContaining({
-        role: "user",
-        text: "这条消息没有可用的出站通道",
-        requestId: "web-undelivered",
-      }),
-    ]);
-  });
+  it(
+    "does not expose generated assistant text when delivery failed",
+    async () => {
+      const f = await fixture({ registerTransport: false });
+      const conversationId = randomUUID();
+      await f.send(
+        conversationId,
+        "这条消息没有可用的出站通道",
+        "web-undelivered",
+      );
+      await f.waitFor(
+        "assistant generation persisted before delivery",
+        async () => {
+          expect(
+            await f.database.information.find({
+              kinds: ["core.message.assistant.text"],
+              limit: 10,
+            }),
+          ).toHaveLength(1);
+        },
+      );
+      await f.waitFor(
+        "failed delivery committed and history remains hidden",
+        async () => {
+          const atoms = await f.database.information.find({
+            occurredAfter: "2020-01-01T00:00:00.000Z",
+            order: "asc",
+            limit: 1000,
+          });
+          expect(
+            atoms.filter((atom) => atom.kind === "core.message.assistant.text"),
+          ).toHaveLength(1);
+          expect(
+            atoms.filter((atom) => atom.kind === "core.delivery.failed"),
+          ).toHaveLength(1);
+          expect(
+            atoms.filter((atom) => atom.kind === "core.delivery.delivered"),
+          ).toHaveLength(0);
+          expect((await f.database.information.reliable.health()).pending).toBe(
+            0,
+          );
+        },
+        durableWait,
+      );
+      expect((await f.read(conversationId)).messages).toEqual([
+        expect.objectContaining({
+          role: "user",
+          text: "这条消息没有可用的出站通道",
+          requestId: "web-undelivered",
+        }),
+      ]);
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
 });
