@@ -6,8 +6,108 @@
 import { describe, expect, it, vi } from "vitest";
 import { LinuxToolsHost, linuxShellSchema } from "./linux-tools.js";
 import { LinuxEnvironmentClient } from "./environment.js";
+import {
+  linuxBrowserActSchema,
+  linuxBrowserVerifySchema,
+} from "./linux-browser.js";
 
 describe("Linux native shell registry", () => {
+  it("registers browser tools only for explicit browser scopes and rejects arbitrary scripts", async () => {
+    const host = new LinuxToolsHost(
+      {
+        version: 1,
+        revision: "browser-one",
+        bindings: [
+          {
+            scope: "shell-only",
+            environmentId: "shell",
+            workflowId: "shell-flow",
+          },
+          {
+            scope: "browser-scope",
+            environmentId: "browser",
+            workflowId: "browser-flow",
+            browser: true,
+          },
+        ],
+      },
+      new LinuxEnvironmentClient(async () => {
+        throw new Error("unexpected-rpc");
+      }),
+    );
+    try {
+      const snapshot = host.snapshot();
+      expect(snapshot.nativeTools.registrations.map((tool) => tool.id)).toEqual(
+        ["shell.exec", "browser.observe", "browser.act", "browser.verify"],
+      );
+      expect(snapshot.nativeTools.tasks[0]?.toolIds).toEqual([
+        "shell.exec",
+        "browser.observe",
+        "browser.act",
+        "browser.verify",
+      ]);
+      const browser = snapshot.nativeTools.registrations.find(
+        (tool) => tool.id === "browser.act",
+      )!;
+      await expect(
+        browser.bind({
+          scope: "shell-only",
+          arguments: {},
+          runInformationId: "run",
+          stepInformationId: "step",
+        }),
+      ).rejects.toThrow("browser-scope-denied");
+      expect(
+        await browser.authorize({
+          intent: {
+            scope: "shell-only",
+            environment: { environmentId: "shell", workflowId: "shell-flow" },
+            target: { scope: "shell-only", revision: "browser-one" },
+            providerId: "linux.environment",
+            executor: "linux",
+          } as any,
+          mode: "execute",
+        }),
+      ).toBe(false);
+      const observation = {
+        id: "a".repeat(64),
+        environmentId: "browser",
+        workflowId: "browser-flow",
+        generation: 0,
+      };
+      expect(
+        linuxBrowserActSchema.safeParse({
+          observation,
+          action: "click",
+          nodeId: "n1",
+        }).success,
+      ).toBe(true);
+      expect(
+        linuxBrowserActSchema.safeParse({
+          observation,
+          action: "evaluate",
+          script: "submit()",
+        }).success,
+      ).toBe(false);
+      expect(
+        linuxBrowserActSchema.safeParse({
+          observation,
+          action: "click",
+          nodeId: "n1",
+          script: "submit()",
+        }).success,
+      ).toBe(false);
+      expect(
+        linuxBrowserVerifySchema.safeParse({
+          observation,
+          mode: "page",
+          expectation: { kind: "url", equals: "https://example.com/" },
+        }).success,
+      ).toBe(false);
+    } finally {
+      await host.close();
+    }
+  });
   it("maintains idle short leases; failed renew requires explicit recovery; lost release ACK can be retried", async () => {
     vi.useFakeTimers();
     let generation = 0,

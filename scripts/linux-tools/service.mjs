@@ -1,5 +1,5 @@
 /**
- * 功能概述：可信桌面容器的协议入口，只处理 health 和自动化隔离，不执行任意 shell。
+ * 功能概述：可信桌面容器的协议入口，分派已就绪组件并控制自动化隔离，不执行任意 shell。
  * 主要职责：ToolService 串行控制 generation/mode；每个 component.isolate 必须停止并
  * 排空自己的输入通道后返回 true，才允许 handoff ACK。startService 提供私有 Unix socket。
  * 代码库关系：宿主 PodmanBackend 先清空独立 shell job，再调用此服务；W8 在 components
@@ -9,12 +9,15 @@
 import { createServer } from "node:net";
 import { chmod, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 const canonical = (value) => JSON.stringify(value);
 export class ToolService {
   constructor({
     environmentId = process.env.KAGUYA_ENVIRONMENT_ID,
     generation = Number(process.env.KAGUYA_ENVIRONMENT_GENERATION),
     home = process.env.HOME,
+    controlSocket = process.env.KAGUYA_CONTROL_SOCKET ??
+      (home ? join(home, "kaguya-tools.sock") : undefined),
     components = [],
   } = {}) {
     if (!environmentId || !Number.isSafeInteger(generation) || generation < 0)
@@ -22,13 +25,32 @@ export class ToolService {
     this.environmentId = environmentId;
     this.generation = generation;
     this.home = home;
+    this.controlSocket = controlSocket;
+    this.instanceId = randomUUID();
     this.components = components;
     this.mode = "automation";
     this.controls = new Map();
     this.pending = Promise.resolve();
     this.closed = false;
   }
-  async ready() {}
+  async ready() {
+    try {
+      for (const component of this.components) await component.ready?.(this);
+    } catch (primary) {
+      const cleanup = await Promise.allSettled(
+        this.components.map((component) => component.close?.()),
+      );
+      throw new AggregateError(
+        [
+          primary,
+          ...cleanup
+            .filter((r) => r.status === "rejected")
+            .map((r) => r.reason),
+        ],
+        "component-startup-failed",
+      );
+    }
+  }
   async handle(req) {
     if (req.helperProtocolVersion !== 1)
       throw new Error("helper-protocol-mismatch");
@@ -37,8 +59,18 @@ export class ToolService {
         helperProtocolVersion: 1,
         ready: !this.closed,
         generation: this.generation,
-        capabilities: [],
+        capabilities: this.components.flatMap(
+          (component) => component.capabilities ?? [],
+        ),
       };
+    if (req.kind === "operation") {
+      const component = this.components.find((candidate) =>
+        candidate.capabilities?.includes(req.toolName),
+      );
+      if (!component || this.closed || this.mode !== "automation")
+        throw new Error("tool-not-supported");
+      return component.execute(req);
+    }
     if (req.kind !== "control") throw new Error("tool-not-supported");
     const result = this.pending.then(() => this.control(req));
     this.pending = result.catch(() => {});
@@ -82,6 +114,12 @@ export class ToolService {
     }
     const response = {
       helperProtocolVersion: 1,
+      controlOperationId: req.controlOperationId,
+      expectedGeneration: req.expectedGeneration,
+      serviceInstanceId: this.instanceId,
+      executors: this.components.map(
+        (component) => component.identity?.() ?? { kind: "component" },
+      ),
       automationIsolated: true,
       generation: this.generation,
       mode: this.mode,
@@ -105,12 +143,14 @@ export class ToolService {
         throw new Error("automation-isolation-unconfirmed");
     }
     this.closed = true;
+    for (const component of this.components) await component.close?.();
   }
 }
 export async function startService(options = {}) {
   const service = new ToolService(options);
   await service.ready();
-  const path = join(service.home, "kaguya-tools.sock");
+  const path = service.controlSocket;
+  if (!path?.startsWith("/")) throw new Error("invalid-control-socket");
   const server = createServer({ allowHalfOpen: true }, (socket) => {
     let data = Buffer.alloc(0);
     socket.setTimeout(10000, () => socket.destroy());
@@ -150,7 +190,9 @@ export async function startService(options = {}) {
     (closing ??= (async () => {
       await service.close();
       await new Promise((resolve) => server.close(resolve));
-      await unlink(path);
+      await unlink(path).catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+      });
     })());
   process.once("SIGTERM", () => {
     void close();

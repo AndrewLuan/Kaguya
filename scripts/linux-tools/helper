@@ -11,7 +11,7 @@ for await (const chunk of process.stdin) {
   chunks.push(chunk);
 }
 const request = Buffer.concat(chunks);
-const address = `${process.env.HOME}/kaguya-tools.sock`;
+const address = process.env.KAGUYA_CONTROL_SOCKET ?? `${process.env.HOME}/kaguya-tools.sock`;
 const health = JSON.parse(request).kind === 'health';
 const deadline = Date.now() + 14000;
 let waiting = false;

@@ -30,7 +30,7 @@ STATE = Path("/var/lib/kaguya-tools")
 CODE = Path("/usr/local/lib/kaguya-tools")
 CONFIG = Path("/etc/kaguya-tools")
 STORAGE = Path("/var/lib/kaguya-tools-storage")
-PACKAGES = ["podman", "uidmap", "passt", "crun", "fuse-overlayfs", "python3",
+PACKAGES = ["podman", "golang-github-containers-common", "uidmap", "passt", "crun", "fuse-overlayfs", "python3",
             "dbus-user-session", "libpam-systemd", "ca-certificates", "acl", "nftables", "e2fsprogs", "util-linux"]
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 
@@ -216,7 +216,7 @@ WantedBy=multi-user.target
 def install_packages(source):
     manifest = json.loads((source / "packages.lock.json").read_text())
     pins = manifest["executionPackages"]
-    if set(pins) != {"podman", "uidmap", "passt", "crun", "fuse-overlayfs"} or manifest["source"] != "https://mirrors.ustc.edu.cn/ubuntu":
+    if set(pins) != {"podman", "golang-github-containers-common", "uidmap", "passt", "crun", "fuse-overlayfs"} or manifest["source"] != "https://mirrors.ustc.edu.cn/ubuntu":
         raise RuntimeError("invalid-package-manifest")
     # 本次进程使用独立源和签名索引，避免同版本包被其他配置源抢选；不修改系统 APT 源。
     with tempfile.TemporaryDirectory(prefix="kaguya-tools-apt-") as directory:
@@ -310,7 +310,7 @@ def apply(user):
         raise RuntimeError("administrator-required")
     source = Path(__file__).resolve().parent
     # 先检查完整交付物，避免仅安装半套 broker 后开放入口。
-    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "packages.lock.json"):
+    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json", "packages.lock.json"):
         if not (source / name).is_file() or (source / name).is_symlink():
             raise RuntimeError("missing-reviewed-broker-payload")
     try:
@@ -350,7 +350,7 @@ def apply(user):
     os.chmod(STATE, 0o700)
     os.chown(STATE, account.pw_uid, account.pw_gid)
     mounts = provision_storage(account, trusted)
-    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json"):
+    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json"):
         write_root(CODE / name, (source / name).read_text())
     config = {"installation": "kaguya-linux-environments-v1", "trustedUid": trusted.pw_uid, "serviceUid": account.pw_uid,
               "state": str(STORAGE / "state/broker"), "socket": "/run/kaguya-tools/broker.sock",
@@ -419,7 +419,7 @@ WantedBy=default.target
     receipt = {"serviceUid": account.pw_uid, "trustedUid": trusted.pw_uid,
                "packages": actual_versions,
                "sourceHashes": {n: hashlib.sha256((source / n).read_bytes()).hexdigest()
-                                for n in ("bootstrap.py", "server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "packages.lock.json")}}
+                                for n in ("bootstrap.py", "server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json", "packages.lock.json")}}
     write_root(CONFIG / "installation.json", json.dumps(receipt, indent=2) + "\n")
     print(json.dumps({"installed": True, "serviceUid": account.pw_uid,
                       "trustedUid": trusted.pw_uid, "tasksStarted": 0}))

@@ -25,3 +25,15 @@ Server 从敏感配置目录的 `linux-tools.json` 显式启用；文件不存�
 镜像使用固定 Node 24.18.0 amd64 基础 digest，在构建阶段复制代码，没有运行时下载。CI `Linux tools image` 构建 OCI archive，分别记录 archive SHA-256 与 image manifest digest，上传构建产物，并使用 W6 的生产容器参数执行 rootless ready、写文件、退出及代次恢复验证。CI 临时 runner 与生产 Ubuntu 的 bootstrap、账户、防火墙和存储安装分别验收。镜像导入复用 W6 `image.import`；新增宿主监督模块须纳入最终统一 bootstrap bundle，旧 staging 暂缓执行。
 
 `node --test scripts/linux-tools/check-shell.mjs` 验证可信组件的隔离屏障；Python 专项验证持久身份和真实文件边界。真实容器及独立截止行为由 `check-container.py` 在 Linux runner 验证。当前 shell 镜像不提供 browser/GUI 工具；对应 health 不声明这些能力。Chromium 和实际 sandbox 另行交付。
+
+## Chromium DOM 工具
+
+可信 Chromium 镜像固定 Playwright 1.64.1 所带 Chromium 156.0.8078.4。Playwright 包用于定位浏览器，运行中的 owner 使用私有 `remote-debugging-pipe`；调试地址不开放到 TCP。宿主用 `sandboxPolicy: "chromium-v1"` 创建环境，broker 匹配已审查的 runtime/default-profile hash 并选择对应 seccomp。运行时不下载依赖。Server 对所需 binding 显式添加 `"browser": true` 后，才注册 `browser.observe`、`browser.act`、`browser.verify`。
+
+`observe` 返回当前页面的 DOM 节点、视口、内容 hash 和短期观察引用，可附 JPEG 截图。观察由可信组件保存，绑定 scope、lease、fencing、workflow、generation 和 document；改写返回字段不能改变授权。`act` 只接受一次 navigate、click、fill 或 select；输入后引用即消耗。click 使用 DOM activation，fill/select 使用原生 setter 和合成 input/change 事件。这些 DOM 语义不等同 trusted pointer/键盘；视觉输入由 W8 交付。工具不接受脚本、CDP 方法、宿主路径或任意 profile。
+
+输入函数在独立 world 的同一 renderer 任务里核对完整 HTML、表单属性、视口、URL 和截止时间。准备阶段及每次 pipe 写入另验固定 permit。handoff 先封门、清空旧观察，再等待 connection/session/id 表中的真实 CDP 回执；断连、丢失回执和目标异常保持 unknown/draining，不用 detach 或客户端超时制造成功 ACK。页面、owner PID、未保存输入和 profile 在正常 handoff/resume 中保留；恢复自动化后必须重新观察。已接受输入启动的异步网站业务可能随后完成，使用新 operation 下的 verify 核对，不重复点击。
+
+`verify` 明确引用原 operationId/attemptId；broker 核对原 browser.act 属于同一 scope/environment/workspace。页面核对读取当前 DOM；下载核对读取私有持久文件的 hash 与范围，不重放输入。下载保留原 URL、报告的 MIME、文件名、时间和原操作关联窗口；该关联窗口不单独证明网站因果。完整文件在 `/private` 保留，附件仍遵循 16 MiB 总额，可按 offset/maxBytes 分段导出。未知下载不会被当作原操作已完成。
+
+`check-browser.mjs` 使用独立本机站点与 fsync 提交计数验证真实 DOM、下载及页面保留。CI 同镜像默认/候选策略 A/B 读取 Chromium 自身 sandbox 状态，并记录实际 OCI 的非 root、空 capabilities、NNP、只读 rootfs。Ubuntu 24.04 / Podman 4.9.3 的结果与生产 Ubuntu 26.04 / Podman 5.7.0 的现场验收分别记录。

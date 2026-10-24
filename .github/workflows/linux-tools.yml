@@ -23,6 +23,7 @@ jobs:
       - name: Real subprocess helper contracts
         run: |
           node --test scripts/linux-tools/check-shell.mjs
+          node --test scripts/linux-tools/check-browser-input.mjs
           python3 -B scripts/linux-tools/check_files.py
       - name: Prepare pinned OCI builder
         run: |

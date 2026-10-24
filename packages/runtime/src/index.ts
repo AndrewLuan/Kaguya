@@ -36,3 +36,9 @@ export {
 } from "./linux-tools.js";
 
 export { createNativeMemoryTools } from "./native-memory-tools.js";
+export {
+  linuxBrowserObservationSchema,
+  linuxBrowserObserveSchema,
+  linuxBrowserActSchema,
+  linuxBrowserVerifySchema,
+} from "./linux-browser.js";

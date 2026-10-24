@@ -4,7 +4,7 @@
 
 ## 安装前审查
 
-一起审查 `bootstrap.py`、`server.py`、`broker.py`、`shell_jobs.py`、`job_runner.py`、`packages.lock.json`，记录六个文件的 SHA-256。将这六个文件保存在同一个目录。`bootstrap.py check --trusted-user andrew` 只读预检，不需要 root；`apply` 会修改下述 W6 专属系统资源。安装不会拉镜像、创建容器任务，也不会修改或重启 Kaguya、PostgreSQL、QQ/NapCat。
+一起审查 `bootstrap.py`、`server.py`、`broker.py`、`shell_jobs.py`、`job_runner.py`、`packages.lock.json`、`chromium-seccomp.json`、`chromium-seccomp-podman5.json`，记录八个文件的 SHA-256。将它们保存在同一个目录。`bootstrap.py check --trusted-user andrew` 只读预检，不需要 root；`apply` 会修改下述 W6 专属系统资源。安装不会拉镜像、创建容器任务，也不会修改或重启 Kaguya、PostgreSQL、QQ/NapCat。
 
 ```bash
 sha256sum bootstrap.py server.py broker.py shell_jobs.py job_runner.py packages.lock.json
@@ -12,7 +12,7 @@ python3 -I bootstrap.py check --trusted-user andrew
 sudo /usr/bin/python3 -I bootstrap.py apply --trusted-user andrew
 ```
 
-安装进程使用独立的 USTC Ubuntu 源和 Ubuntu archive keyring 校验的索引，不改系统源。`packages.lock.json` 精确锁定 Podman、uidmap、passt、crun、fuse-overlayfs；系统依赖使用兼容范围，保留已安装版本并拒绝执行栈降级。安装前后均确认 dpkg 状态为 `install ok installed`，回执记录实际版本及源文件 hash。脚本安装 `podman uidmap passt crun fuse-overlayfs python3 dbus-user-session libpam-systemd ca-certificates acl nftables e2fsprogs util-linux`。不增加外部包仓库，不全局关闭 AppArmor，不使用 rootful 回退。安装阶段以 `kaguya-tools` 实际执行 `podman info`、`podman unshare`；失败停止安装并保留诊断，后续修复对应权限或配置。
+安装进程使用独立的 USTC Ubuntu 源和 Ubuntu archive keyring 校验的索引，不改系统源。`packages.lock.json` 精确锁定 Podman、containers-common、uidmap、passt、crun、fuse-overlayfs；系统依赖使用兼容范围，保留已安装版本并拒绝执行栈降级。安装前后均确认 dpkg 状态为 `install ok installed`，回执记录实际版本及源文件 hash。脚本安装 `podman golang-github-containers-common uidmap passt crun fuse-overlayfs python3 dbus-user-session libpam-systemd ca-certificates acl nftables e2fsprogs util-linux`。不增加外部包仓库，不全局关闭 AppArmor，不使用 rootful 回退。安装阶段以 `kaguya-tools` 实际执行 `podman info`、`podman unshare`；失败停止安装并保留诊断，后续修复对应权限或配置。
 
 **账户与持久数据** — 创建锁定、无登录 shell 的 `kaguya-tools`，HOME 为 `/var/lib/kaguya-tools`。从现有 `/etc/subuid`、`/etc/subgid` 的未占用范围分配至少 65536 个 ID，并检查重叠。现存冲突账户或不同 trusted UID 会被拒绝。
 
@@ -38,7 +38,14 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 `environment.create` 固定 scope、workspace、resource 集合、镜像 digest 与 network policy。workspace/resource 不允许被另一环境重复注册。可信桌面容器与独立 shell job 是同一环境的不同成员；job 使用不可变名称和原代次。工作卷按 workspace 保留。没有任何可由请求指定的宿主 bind mount；shell 只取得命名工作卷，不取得 broker 程序、unit、journal、凭证或宿主仓库。可信桌面额外取得环境私有 `/private` 卷，browser profile/下载控制记录不得放入共享 workspace。
 
-Chromium 桌面由宿主创建时显式设置 `sandboxPolicy="chromium-v1"`。它使用同目录固定的 `chromium-seccomp.json`，SHA-256 为 `8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f`，broker 启动前校验文件。profile 来自 [containers/common v0.57.4](https://github.com/containers/common/blob/v0.57.4/pkg/seccomp/seccomp.json)（原文件 SHA-256 `cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c`）；语义差异仅为移除 chroot 的 capability 条件 allow/deny，替换为无条件 allow，让 Chromium 在其内层 user namespace 完成 sandbox chroot。外层仍为非 root、cap-drop ALL、no-new-privileges、只读 rootfs。shell job 保持默认 seccomp。CI 同时记录 runner 默认 profile 的 hash/原始 chroot 规则和实际 OCI 策略；生产系统另行验收。
+Chromium 桌面由宿主创建时显式设置 `sandboxPolicy="chromium-v1"`。broker 同时匹配实际 Podman 版本与系统默认 seccomp 文件 SHA-256，再校验所选固定 profile 的 hash；未知组合拒绝启动。每份候选相对自己的发行包基线，仅把 chroot 的 capability 条件 allow/deny 替换为无条件 allow，供 Chromium 在内层 user namespace 完成 sandbox chroot。外层仍为非 root、cap-drop ALL、no-new-privileges、只读 rootfs。shell job 保持默认 seccomp。
+
+| 运行环境 | 默认 profile SHA-256 | 固定候选文件与 SHA-256 |
+| --- | --- | --- |
+| CI Podman 4.9.3 / common v0.57.4 | `cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c` | `chromium-seccomp.json` / `8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f` |
+| Ubuntu 26.04 Podman 5.7.0 / containers-common 0.66.0+ds2-3 | `886ae167646b7e5db381ecf7c31e6de720a8e8da15cf3202fe1f67f424af2b75` | `chromium-seccomp-podman5.json` / `4b6639b4c07a385384148acfbb74d950c69137075e10675092a3d689d93ce1c3` |
+
+CI 基线来自 [common v0.57.4](https://github.com/containers/common/blob/v0.57.4/pkg/seccomp/seccomp.json)。生产候选基线来自 [USTC Ubuntu 发行包](https://mirrors.ustc.edu.cn/ubuntu/pool/universe/g/golang-github-containers-common/golang-github-containers-common_0.66.0+ds2-3_all.deb)，包 SHA-256 为 `88ca25147d181b88b062e9344255ee9c2f800e3dc7e3d9c952909d93d07caaf8`，与 resolute/universe amd64 Packages 索引一致。bootstrap 固定该依赖并把两份候选安装为 root 拥有的只读文件。CI 记录实际默认 profile 与最终 OCI 策略；生产候选的实际系统验收另行记录。
 
 `lease.acquire` 返回公开 `ActionEnvironment` 与一次性秘密 token。公开引用可以进入 W3 intent；token 只保存在受信宿主内存，通过 `ActionExecution.leaseCredential` 传到实际入口。broker 仅持久化 token hash。lease 必须覆盖完整 observe → act → verify；浏览器和 GUI 共用同一环境 lease。过期不自动转授，需要显式恢复隔离旧执行者。已派发 permit 的截止时间固定为操作 deadline 与当次 lease 到期时间的较早者；后续 renew 不会延长旧 permit。helper 必须在每次实际输入前核验 permit，并在到期时停止旧自动化输入。broker 的 collect 超时会停止 shell 成员、排空 GUI/browser 自动化输入并保留 unknown；桌面进程继续运行。
 

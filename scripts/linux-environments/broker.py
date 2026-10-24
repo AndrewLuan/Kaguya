@@ -25,6 +25,25 @@ import threading
 import time
 import uuid
 
+CHROMIUM_POLICIES = {
+    # runtime 版本与发行包默认 profile 必须同时匹配；未知组合不能回退到旧策略。
+    ("4.9.3", "cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c"):
+        ("chromium-seccomp.json", "8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f"),
+    ("5.7.0", "886ae167646b7e5db381ecf7c31e6de720a8e8da15cf3202fe1f67f424af2b75"):
+        ("chromium-seccomp-podman5.json", "4b6639b4c07a385384148acfbb74d950c69137075e10675092a3d689d93ce1c3"),
+}
+
+
+def chromium_profile(version, default_sha256):
+    selected = CHROMIUM_POLICIES.get((version, default_sha256))
+    if selected is None:
+        raise BrokerError("chromium-runtime-policy-unreviewed")
+    name, sha256 = selected
+    profile = Path(__file__).resolve().with_name(name)
+    if profile.is_symlink() or hashlib.sha256(profile.read_bytes()).hexdigest() != sha256:
+        raise BrokerError("chromium-seccomp-integrity")
+    return profile
+
 
 class BrokerError(Exception):
     pass
@@ -447,7 +466,7 @@ class Broker:
             key, old, body = self._operation(req)
             if old:
                 return old.get("outcome", outcome())
-            if req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify":
+            if (req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify") or req["toolName"] == "browser.verify":
                 original = req["arguments"].get("original")
                 if not isinstance(original, dict):
                     raise BrokerError("original-operation-required")
@@ -456,6 +475,8 @@ class Broker:
                 if previous is None:
                     raise BrokerError("original-operation-not-found")
                 source = previous["body"]
+                if req["toolName"] == "browser.verify" and source["toolName"] != "browser.act":
+                    raise BrokerError("original-operation-mismatch")
                 if (source["scope"] != req["scope"] or source["attemptId"] != attempt or
                         source["environment"]["environmentId"] != env_id or
                         source["environment"]["workspaceId"] != env["workspaceId"]):
@@ -700,10 +721,8 @@ class PodmanBackend:
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
         member_args = []
         if env.get("sandboxPolicy") == "chromium-v1":
-            profile = Path(__file__).resolve().with_name("chromium-seccomp.json")
-            if profile.is_symlink() or hashlib.sha256(profile.read_bytes()).hexdigest() != "8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f":
-                raise BrokerError("chromium-seccomp-integrity")
-            member_args += ["--security-opt=seccomp=" + str(profile)]
+            profile = self.chromium_profile()
+            member_args += ["--security-opt=seccomp=" + str(profile), "--env=KAGUYA_BROWSER_ENABLED=1"]
         if self.shell is not None:
             member_args += ["--cgroup-parent=" + self.shell.configure_environment(env),
                            "--label=kaguya.role=desktop", "--volume",
@@ -730,6 +749,14 @@ class PodmanBackend:
         if (ready.get("helperProtocolVersion") != 1 or ready.get("ready") is not True or
                 ready.get("generation") != env["generation"]):
             raise BrokerError("helper-not-ready")
+
+    def chromium_profile(self):
+        info = json.loads(self.command("info", "--format=json"))
+        security = info["host"]["security"]
+        default = Path(security["seccompProfilePath"])
+        if not security["rootless"] or not security["seccompEnabled"] or default.is_symlink():
+            raise BrokerError("chromium-runtime-policy-unreviewed")
+        return chromium_profile(info["version"]["Version"], hashlib.sha256(default.read_bytes()).hexdigest())
 
     def handoff(self, env, generation, mode):
         if self.shell is not None:

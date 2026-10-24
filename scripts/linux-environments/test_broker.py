@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from broker import Broker, BrokerError, PodmanBackend
+from broker import Broker, BrokerError, PodmanBackend, chromium_profile, CHROMIUM_POLICIES
 
 
 class FakeBackend:
@@ -233,7 +233,7 @@ class BrokerTest(unittest.TestCase):
         def command(*args, **_kwargs):
             calls.append(args)
             return b'[{"State":{"Running":true}}]' if args[0] == "inspect" else b""
-        with patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0}):
+        with patch.object(backend, "chromium_profile", return_value=Path(__file__).with_name("chromium-seccomp.json")), patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0}):
             backend.create({**self.env, "container": "controlled", "network": "none", "sandboxPolicy": "chromium-v1"})
         args = calls[0]
         profile_arg = next(a for a in args if a.startswith("--security-opt=seccomp="))
@@ -248,6 +248,14 @@ class BrokerTest(unittest.TestCase):
             self.assertIn(option, args)
         with self.assertRaisesRegex(BrokerError, "sandbox-policy-not-allowed"):
             self.broker.create({"environmentId": "bad", "image": "example.org/tools@sha256:" + "1" * 64, "sandboxPolicy": "unconfined"})
+
+    def test_chromium_runtime_and_distribution_profile_are_both_required(self):
+        for (version, sha), (name, _) in CHROMIUM_POLICIES.items():
+            self.assertEqual(chromium_profile(version, sha).name, name)
+            with self.assertRaisesRegex(BrokerError, "runtime-policy-unreviewed"):
+                chromium_profile(version, "0" * 64)
+        with self.assertRaisesRegex(BrokerError, "runtime-policy-unreviewed"):
+            chromium_profile("5.7.0", next(sha for version, sha in CHROMIUM_POLICIES if version == "4.9.3"))
 
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()

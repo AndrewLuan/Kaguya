@@ -1,5 +1,5 @@
 /**
- * 功能概述：把显式宿主配置的 Linux shell 工具接入 W4 原生目录和 W3/W6 执行边界。
+ * 功能概述：把显式宿主配置的 Linux shell/Chromium 工具接入 W4 原生目录和 W3/W6 执行边界。
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
  * snapshot 提供 shell.exec 的有界 schema、scope/target 授权与 broker provider，不另建工具循环。
  * close 释放所持 lease，W6 负责物理隔离；失败保留 owner 以便再次清理，禁止盲目 recover。
@@ -11,6 +11,11 @@ import {
   type ActionEnvironment,
 } from "./environment.js";
 import type { NativeToolLoopOptions } from "./native-tool-loop.js";
+import {
+  linuxBrowserObserveSchema,
+  linuxBrowserActSchema,
+  linuxBrowserVerifySchema,
+} from "./linux-browser.js";
 
 const text = z.string().min(1).max(4096);
 const jobId = z.string().regex(/^[a-f0-9]{64}$/);
@@ -56,7 +61,12 @@ export const linuxToolsConfigurationSchema = z
     bindings: z
       .array(
         z
-          .object({ scope: text, environmentId: text, workflowId: text })
+          .object({
+            scope: text,
+            environmentId: text,
+            workflowId: text,
+            browser: z.boolean().optional(),
+          })
           .strict(),
       )
       .max(2),
@@ -158,47 +168,88 @@ export class LinuxToolsHost {
   }
   snapshot() {
     const provider = this.client.provider();
+    const declarations = [
+      {
+        id: "shell.exec",
+        inputSchema: linuxShellSchema,
+        readonly: false,
+        description:
+          "在独立 Linux workspace 启动持久 shell job，查询/停止 job，或核对/导出文件。start 的 accepted 不代表命令已退出；query 不续 job 许可，超期自动停止全树。",
+      },
+      {
+        id: "browser.observe",
+        inputSchema: linuxBrowserObserveSchema,
+        readonly: true,
+        description:
+          "观察当前隔离 Chromium 页面，取得有期限的 DOM 节点和观察引用，可附当前视口截图。每次输入前重新观察。",
+      },
+      {
+        id: "browser.act",
+        inputSchema: linuxBrowserActSchema,
+        readonly: false,
+        description:
+          "使用当前观察执行一次导航或 DOM 输入。旧观察、旧 lease 或旧 generation 不可复用；返回输入回执后仍须 verify 检查目标状态，未知结果不得重复点击。",
+      },
+      {
+        id: "browser.verify",
+        inputSchema: linuxBrowserVerifySchema,
+        readonly: true,
+        description:
+          "在新操作中引用原 operationId/attemptId，读取真实页面状态或核对并导出持久下载；不会重放原输入。",
+      },
+    ].filter(
+      (tool) =>
+        tool.id === "shell.exec" ||
+        this.configuration.bindings.some((b) => b.browser === true),
+    );
     const tools: NativeToolLoopOptions = {
       registrations: this.configuration.bindings.length
-        ? [
-            {
-              id: "shell.exec",
-              version: "1",
-              description:
-                "在独立 Linux workspace 启动持久 shell job，查询/停止 job，或核对/导出文件。start 的 accepted 不代表命令已退出；query 不续 job 许可，超期自动停止全树。",
-              providerId: provider.id,
-              providerVersion: provider.version,
-              executor: "linux",
-              readonly: false,
-              independent: false,
-              policyVersion: this.configuration.revision,
-              inputSchema: linuxShellSchema,
-              bind: async ({ scope }) => ({
+        ? declarations.map((tool) => ({
+            id: tool.id,
+            version: "1",
+            description: tool.description,
+            providerId: provider.id,
+            providerVersion: provider.version,
+            executor: "linux",
+            readonly: tool.readonly,
+            independent: false,
+            policyVersion: this.configuration.revision,
+            inputSchema: tool.inputSchema,
+            bind: async ({ scope }) => {
+              if (
+                tool.id !== "shell.exec" &&
+                !this.configuration.bindings.some(
+                  (b) => b.scope === scope && b.browser === true,
+                )
+              )
+                throw new Error("linux-browser-scope-denied");
+              return {
                 target: { scope, revision: this.configuration.revision },
                 environment: await this.bind(scope),
-              }),
-              authorize: async ({ intent }) =>
-                !this.closed &&
-                !this.unavailable.has(intent.scope) &&
-                this.configuration.bindings.some(
-                  (b) =>
-                    b.scope === intent.scope &&
-                    b.environmentId === intent.environment?.environmentId &&
-                    b.workflowId === intent.environment.workflowId,
-                ) &&
-                intent.target.scope === intent.scope &&
-                intent.target.revision === this.configuration.revision &&
-                intent.providerId === provider.id &&
-                intent.executor === "linux",
+              };
             },
-          ]
+            authorize: async ({ intent }) =>
+              !this.closed &&
+              !this.unavailable.has(intent.scope) &&
+              this.configuration.bindings.some(
+                (b) =>
+                  b.scope === intent.scope &&
+                  (tool.id === "shell.exec" || b.browser === true) &&
+                  b.environmentId === intent.environment?.environmentId &&
+                  b.workflowId === intent.environment.workflowId,
+              ) &&
+              intent.target.scope === intent.scope &&
+              intent.target.revision === this.configuration.revision &&
+              intent.providerId === provider.id &&
+              intent.executor === "linux",
+          }))
         : [],
       tasks: this.configuration.bindings.length
         ? [
             {
               definitionId: "agent.heavy",
               taskId: "agent.heavy.respond",
-              toolIds: ["shell.exec"],
+              toolIds: declarations.map((tool) => tool.id),
             },
           ]
         : [],

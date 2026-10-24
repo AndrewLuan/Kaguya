@@ -5,6 +5,7 @@
   "source": "https://mirrors.ustc.edu.cn/ubuntu",
   "executionPackages": {
     "podman": "5.7.0+ds2-3build1",
+    "golang-github-containers-common": "0.66.0+ds2-3",
     "uidmap": "1:4.17.4-2ubuntu3",
     "passt": "0.0~git20260120.386b5f5-1",
     "crun": "1.21-1ubuntu3",

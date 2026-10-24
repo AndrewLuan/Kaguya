@@ -67,7 +67,17 @@ with tempfile.TemporaryDirectory() as root:
         assert oci['root']['readonly'] is True and oci['linux']['seccomp']['defaultAction'] == 'SCMP_ACT_ERRNO'
         print(json.dumps({'desktopPolicy': oci['linux'], 'desktopProcess': oci['process']}), flush=True)
         result = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60, diagnostics=True)
-        print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'sandboxPolicy': internal['sandboxPolicy'], 'seccompSha256': '8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f', 'browser': json.loads(result)}), flush=True)
+        selected_profile = backend.chromium_profile()
+        print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'sandboxPolicy': internal['sandboxPolicy'], 'seccompProfile': selected_profile.name, 'seccompSha256': hashlib.sha256(selected_profile.read_bytes()).hexdigest(), 'browser': json.loads(result)}), flush=True)
+        provider = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/check-browser.mjs', timeout=120, diagnostics=True)
+        print(provider.decode(), flush=True)
+    except BaseException:
+        for internal in broker.environments.values():
+            try:
+                print(command('logs', internal['container']).decode(errors='replace'), file=sys.stderr)
+            except Exception as diagnostics:
+                print(repr(diagnostics), file=sys.stderr)
+        raise
     finally:
         primary = sys.exc_info()[1]
         failures = []
