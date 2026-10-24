@@ -1006,6 +1006,10 @@ export class PostgresNativeMemoryStore
             "memory_invalidation_requires_manual",
             400,
           );
+        const derivedProofOwners = new Map<
+          string,
+          { ownerId: string; sourceIds: string[] }[]
+        >();
         for (const effect of p.invalidations ?? []) {
           if (
             effect.kind === "source-withdrawal" &&
@@ -1112,6 +1116,10 @@ export class PostgresNativeMemoryStore
                   ownerId,
                   sourceIds: [...ids].sort(),
                 }));
+              derivedProofOwners.set(
+                output!.id,
+                output!.metadata.experience!.proofOwners,
+              );
             }
           } else if (
             op.inputIds.length !== 1 ||
@@ -1182,6 +1190,68 @@ export class PostgresNativeMemoryStore
             previous.data.metadata.locked
           )
             throw new NativeMemoryError("memory_node_locked");
+          const priorExperience = previous?.success
+            ? previous.data.metadata.experience
+            : undefined;
+          const experience = node.metadata.experience ?? priorExperience;
+          if (experience) {
+            // 证明归属由存储层持有；客户端省略、清空或伪造均不能改写。
+            // 暂时移除的来源保留原映射，读取只对当前 sourceIds 交集生效，重新加入时恢复约束。
+            const owners = new Map<string, Set<string>>();
+            for (const proof of derivedProofOwners.get(node.id) ??
+              priorExperience?.proofOwners ??
+              []) {
+              if (!owners.has(proof.ownerId))
+                owners.set(proof.ownerId, new Set());
+              for (const id of proof.sourceIds)
+                owners.get(proof.ownerId)!.add(id);
+            }
+            const addedSources = node.metadata.sourceIds.filter(
+              (id) =>
+                !previous?.success ||
+                !previous.data.metadata.sourceIds.includes(id),
+            );
+            if (addedSources.length) {
+              const canonical = await tx.query<{ payload: unknown }>(
+                "SELECT payload FROM information_atoms WHERE information_id=ANY($1::text[]) AND kind='memory.native.source.v1'",
+                [addedSources.map(canonicalMemorySourceId)],
+              );
+              for (const row of canonical.rows) {
+                const source = memorySourceSchema.parse(
+                  (row.payload as { memorySource: unknown }).memorySource,
+                );
+                if (!owners.has(source.ownerId))
+                  owners.set(source.ownerId, new Set());
+                owners.get(source.ownerId)!.add(source.id);
+              }
+              if (
+                priorExperience &&
+                addedSources.some(
+                  (id) => ![...owners.values()].some((ids) => ids.has(id)),
+                )
+              )
+                throw new NativeMemoryError(
+                  "memory_experience_source_proof_missing",
+                  400,
+                );
+            }
+            const { proofOwners: _clientProof, ...state } = experience;
+            node.metadata.experience = {
+              ...state,
+              ...(owners.size ||
+              priorExperience?.proofOwners ||
+              derivedProofOwners.has(node.id)
+                ? {
+                    proofOwners: [...owners]
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([ownerId, ids]) => ({
+                        ownerId,
+                        sourceIds: [...ids].sort(),
+                      })),
+                  }
+                : {}),
+            };
+          }
           if (
             node.metadata.scope === "shared" &&
             !["person", "self", "expression"].includes(node.metadata.kind)

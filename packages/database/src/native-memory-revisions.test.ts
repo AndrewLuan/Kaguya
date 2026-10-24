@@ -710,6 +710,250 @@ it.skipIf(!url)(
 );
 
 describe.each(backends)("native inherited evidence ($name)", ({ create }) => {
+  async function splitFixture() {
+    const db = await setup(create);
+    for (const s of ["S1", "S2", "S3"]) await source(db, s);
+    const experience = (n: number, sources: string[]): NativeMemoryNode => ({
+      ...node(n, 1, sources),
+      metadata: {
+        ...node(n, 1, sources).metadata,
+        kind: "experience",
+        experience: {
+          state: "open",
+          policyVersion: "manual.v1",
+          predecessors: [],
+        },
+      },
+    });
+    const root = experience(1, ["S1", "S2"]);
+    const dependency = node(2, 2, ["S1"]);
+    dependency.metadata.ownerId = "person:dependency";
+    await put(db, "inputs", [root, dependency], {
+      edges: [
+        {
+          sourceId: root.id,
+          targetId: dependency.id,
+          relation: "derived-from",
+        },
+      ],
+    });
+    const x = experience(3, ["S1"]),
+      y = experience(4, ["S2"]);
+    x.metadata.experience!.predecessors = [root.id];
+    y.metadata.experience!.predecessors = [root.id];
+    await put(
+      db,
+      "split",
+      [
+        {
+          ...root,
+          metadata: { ...root.metadata, revision: 2, status: "archived" },
+        },
+        x,
+        y,
+      ],
+      {
+        experienceOperation: {
+          kind: "split",
+          inputIds: [root.id],
+          outputIds: [x.id, y.id],
+        },
+      },
+    );
+    return { db, x, y };
+  }
+  it.each(["seal", "reopen", "correct", "plain"] as const)(
+    "keeps server proof ownership through %s when callers omit, clear or forge it",
+    async (kind) => {
+      const { db, x, y } = await splitFixture();
+      const before = await db.memoryGraph.native.cutoff(input);
+      for (const [i, clientProof] of [
+        undefined,
+        [],
+        [{ ownerId: "person:forged", sourceIds: ["S1"] }],
+      ].entries()) {
+        const revised: NativeMemoryNode = {
+          ...x,
+          metadata: {
+            ...x.metadata,
+            revision: i + 2,
+            experience: {
+              ...x.metadata.experience!,
+              state: kind === "seal" ? "sealed" : "open",
+              ...(clientProof === undefined
+                ? {}
+                : { proofOwners: clientProof }),
+            },
+          },
+        };
+        const op =
+          kind === "plain"
+            ? {}
+            : {
+                experienceOperation: {
+                  kind,
+                  inputIds: [x.id],
+                  outputIds: [x.id],
+                },
+              };
+        const published = await put(db, `edit-${i}`, [revised], op);
+        expect(published[0]!.metadata.experience!.proofOwners).toContainEqual({
+          ownerId: "person:dependency",
+          sourceIds: ["S1"],
+        });
+        expect(
+          published[0]!.metadata.experience!.proofOwners!.some(
+            (p) => p.ownerId === "person:forged",
+          ),
+        ).toBe(false);
+        expect(await put(db, `edit-${i}`, [revised], op)).toEqual(published);
+      }
+      const edited = await db.memoryGraph.native.cutoff(input);
+      await put(db, "identity-split", [], {
+        invalidations: [
+          {
+            kind: "identity-split",
+            targetId: "person:dependency",
+            reason: "拆分证据身份",
+          },
+        ],
+      });
+      const invalidated = await db.memoryGraph.native.cutoff(input);
+      expect(
+        (await db.memoryGraph.native.current(input, [x.id, y.id])).map(
+          (n) => n.id,
+        ),
+      ).toEqual([y.id]);
+      await put(db, "later", [node(8)]);
+      expect(
+        (
+          await db.memoryGraph.native.current(
+            { ...input, cutoff: invalidated },
+            [x.id, y.id],
+          )
+        ).map((n) => n.id),
+      ).toEqual([y.id]);
+      expect(
+        (
+          await db.memoryGraph.native.current({ ...input, cutoff: edited }, [
+            x.id,
+          ])
+        )[0]!.metadata.revision,
+      ).toBe(4);
+      expect(
+        (
+          await db.memoryGraph.native.current({ ...input, cutoff: before }, [
+            x.id,
+          ])
+        )[0]!.metadata.revision,
+      ).toBe(1);
+    },
+  );
+  it("deactivates removed evidence, restores its proof on re-add, and derives new owners from canonical sources", async () => {
+    const { db, x, y } = await splitFixture();
+    const edit = (revision: number, sourceIds: string[]) =>
+      put(
+        db,
+        `correct-${revision}`,
+        [
+          {
+            ...x,
+            metadata: {
+              ...x.metadata,
+              revision,
+              sourceIds,
+              experience: {
+                ...x.metadata.experience!,
+                proofOwners: [{ ownerId: "person:forged", sourceIds }],
+              },
+            },
+          },
+        ],
+        {
+          experienceOperation: {
+            kind: "correct",
+            inputIds: [x.id],
+            outputIds: [x.id],
+          },
+        },
+      );
+    await expect(edit(2, ["S3"])).rejects.toThrow(
+      "memory_experience_source_proof_missing",
+    );
+    expect(await db.memoryGraph.native.history(x.id)).toHaveLength(1);
+    await db.memoryGraph.native.ingest({
+      id: "S3",
+      scope,
+      ownerId: "person:new-source",
+      text: "原文",
+      occurredAt: "2020-01-01T00:00:00Z",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sourceType: "inbound",
+      participants: [],
+      replyTo: null,
+    });
+    const removed = await edit(2, ["S3"]);
+    expect(removed[0]!.metadata.experience!.proofOwners).toEqual([
+      { ownerId: "person:a", sourceIds: ["S1"] },
+      { ownerId: "person:dependency", sourceIds: ["S1"] },
+      { ownerId: "person:new-source", sourceIds: ["S3"] },
+    ]);
+    await put(db, "identity-split", [], {
+      invalidations: [
+        {
+          kind: "identity-split",
+          targetId: "person:dependency",
+          reason: "移除来源不影响当前正文",
+        },
+      ],
+    });
+    const removedUpper = await db.memoryGraph.native.cutoff(input);
+    expect(
+      (await db.memoryGraph.native.current(input, [x.id, y.id]))
+        .map((n) => n.id)
+        .sort(),
+    ).toEqual([x.id, y.id]);
+    await edit(3, ["S1", "S3"]);
+    const readdedUpper = await db.memoryGraph.native.cutoff(input);
+    expect(
+      (await db.memoryGraph.native.current(input, [x.id, y.id])).map(
+        (n) => n.id,
+      ),
+    ).toEqual([y.id]);
+    await put(db, "later", [node(8)]);
+    expect(
+      (
+        await db.memoryGraph.native.current(
+          { ...input, cutoff: readdedUpper },
+          [x.id, y.id],
+        )
+      ).map((n) => n.id),
+    ).toEqual([y.id]);
+    expect(
+      (
+        await db.memoryGraph.native.current(
+          { ...input, cutoff: removedUpper },
+          [x.id, y.id],
+        )
+      ).map((n) => n.id),
+    ).toEqual([x.id, y.id]);
+    // 真正换成独立来源后，新来源的正规归属仍控制后续身份失效。
+    await edit(4, ["S3"]);
+    await put(db, "invalidate-new-source", [], {
+      invalidations: [
+        {
+          kind: "identity-split",
+          targetId: "person:new-source",
+          reason: "新证据身份拆分",
+        },
+      ],
+    });
+    expect(
+      (await db.memoryGraph.native.current(input, [x.id, y.id])).map(
+        (n) => n.id,
+      ),
+    ).toEqual([y.id]);
+  });
   it("preserves transitive merge evidence and excludes inherited archive status", async () => {
     const db = await setup(create);
     for (const s of ["S1", "S2", "S3"]) await source(db, s);
