@@ -397,8 +397,18 @@ class ShellJobs:
         self.system("/usr/bin/systemctl", "--user", "reset-failed", record["unit"], expiry + ".service", check=False)
 
     def container_info(self, record):
-        exists = self.backend.command("ps", "--all", "--filter", "name=^" + record["container"] + "$", "--format={{.ID}}").strip()
-        return json.loads(self.backend.command("inspect", record["container"]))[0] if exists else None
+        cidfile = self.root / record["jobId"] / "container.cid"
+        if cidfile.exists():
+            identity = cidfile.read_text().strip()
+            if not re.fullmatch("[a-f0-9]{64}", identity):
+                raise BrokerError("container-identity-unconfirmed")
+            selector = "id=" + identity
+        else:
+            # cidfile 尚未发布时仅用于证明没有创建对象；若发现同名对象，retire 拒绝缺 CID。
+            identity = record["container"]
+            selector = "name=^" + identity + "$"
+        exists = self.backend.command("ps", "--all", "--filter", selector, "--format={{.ID}}").strip()
+        return json.loads(self.backend.command("inspect", identity))[0] if exists else None
 
     def stopped(self, record):
         return self.unit_empty(record) and self.container_info(record) is None
@@ -440,9 +450,7 @@ class ShellJobs:
         return view
 
     def isolate(self, env, reason="environment-fenced"):
-        known = set()
         for path, record in self.records(env):
-            known.add(record["container"])
             self.stop(path, record, reason)
         members = json.loads(self.backend.command("ps", "--all", "--filter",
                              "label=kaguya.environment=" + env["environmentId"],

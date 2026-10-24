@@ -161,6 +161,26 @@ class ShellJobsTest(unittest.TestCase):
         self.jobs.retire(path, record)
         self.assertEqual(commands, [("rm", "--force", cid)])
 
+    def test_runtime_lookup_tracks_private_cid_when_name_lookup_is_empty(self):
+        path, record, _ = self.prepare(self.request())
+        cid = "c" * 64
+        (path / "container.cid").write_text(cid)
+        info = {"Id": cid, "State": {"Running": False, "Pid": 0}}
+        calls = []
+        def command(*args):
+            calls.append(args)
+            if args[0] == "ps":
+                return cid.encode() if "id=" + cid in args else b""
+            self.assertEqual(args, ("inspect", cid))
+            return json.dumps([info])
+        self.jobs.backend.command = command
+        self.jobs.unit_empty = lambda _: True
+        self.assertEqual(self.jobs.container_info(record), info)
+        self.assertFalse(self.jobs.stopped(record))
+        self.assertTrue(all("name=" not in str(args) for args in calls))
+        self.jobs.backend.command = lambda *args: b""
+        self.assertTrue(self.jobs.stopped(record))
+
     def test_unknown_member_cannot_acknowledge_isolation_from_labels_only(self):
         self.jobs.backend.command = lambda *args: json.dumps([{"Names": ["kaguya-job-" + "a" * 64]}])
         with self.assertRaisesRegex(BrokerError, "unknown-shell-member-isolation-unconfirmed"):
