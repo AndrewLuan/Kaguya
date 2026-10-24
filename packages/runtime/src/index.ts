@@ -1,6 +1,6 @@
 /**
  * 功能概述：汇总 Runtime 的最终信息原子 API，导出 kind 与
- * `KaguyaRuntime` ingress 与宿主 MessageTargetService/查询契约；model-task 导出通用 capability token、请求/结果契约与 ModelTaskClient。
+ * `KaguyaRuntime` ingress 与宿主 MessageTargetService/查询契约；model-task 导出通用 capability token、请求/结果契约与 ModelTaskClient；environment 导出 Linux broker 客户端。
  * 主要职责：稳定 re-export，不创建数据库、Core、模块或 transport；事件 dispatch、
  * workflow 和旧 service locator 已从公共面删除。
  * 代码库关系：apps/server 与 demo 从包入口消费 Runtime；Runtime 实现并消费
@@ -19,3 +19,9 @@ export { executionExhaustedInformationKind } from "@kaguya/engine";
 export * from "./message-targets.js";
 
 export { ActionExecutor, type ActionExecutorOptions } from "./action.js";
+export {
+  LinuxEnvironmentClient,
+  createUnixBrokerTransport,
+  type BrokerTransport,
+  type ActionEnvironment,
+} from "./environment.js";
