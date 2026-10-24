@@ -338,7 +338,7 @@ class ShellJobs:
         self.stop(path, record, "start-unconfirmed")
         raise BrokerError("job-start-unconfirmed")
 
-    def stopped(self, record):
+    def unit_empty(self, record):
         props = self.properties(record["unit"])
         if props.get("ActiveState") not in ("inactive", "failed"):
             return False
@@ -350,6 +350,25 @@ class ShellJobs:
             events = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.events"
             if events.exists() and "populated 1" in events.read_text():
                 return False
+        return True
+
+    def retire(self, path, record):
+        if not self.unit_empty(record):
+            raise BrokerError("job-cgroup-still-populated")
+        # conmon 被整组终止后，旧 Podman 可留下 stopped + 非零缓存 PID。
+        # 先取得 kernel 空组证据，再删除该 job 的 runtime 记录；命名卷/manifest/输出均保留。
+        existing = self.backend.command("ps", "--all", "--sync", "--filter", "name=^" + record["container"] + "$", "--format={{.ID}}").strip()
+        if existing:
+            info = json.loads(self.backend.command("inspect", record["container"]))[0]
+            write_json(path / "retired.json", {"containerId": info["Id"], "observedState": info["State"],
+                                               "unitCgroupEmpty": True, "checkedAt": now_iso()})
+            self.backend.command("rm", "--force", record["container"])
+        if not self.stopped(record):
+            raise BrokerError("job-isolation-unconfirmed")
+
+    def stopped(self, record):
+        if not self.unit_empty(record):
+            return False
         exists = self.backend.command("ps", "--all", "--filter", "name=^" + record["container"] + "$", "--format={{.ID}}").strip()
         if exists:
             state = json.loads(self.backend.command("inspect", record["container"]))[0]["State"]
@@ -361,13 +380,12 @@ class ShellJobs:
         # 新旧代次都按不可变 job 成员身份停止；不通过用户输入构造 unit 或容器名。
         write_json(path / "stop.json", {"reason": reason})
         self.system("/usr/bin/systemctl", "--user", "stop", record["unit"], check=False)
-        # runtime 状态可能尚未被 conmon 回收，显式 kill/wait 后仍以 cgroup 和 inspect 为准。
-        self.backend.stop_container(record["container"])
         end = time.monotonic() + 10
-        while not self.stopped(record):
+        while not self.unit_empty(record):
             if time.monotonic() >= end:
                 raise BrokerError("job-isolation-unconfirmed")
             time.sleep(0.02)
+        self.retire(path, record)
         self.system("/usr/bin/systemctl", "--user", "stop",
                     record["unit"].removesuffix(".service") + "-expiry.timer", check=False)
         if not (path / "receipt.json").exists():
@@ -387,7 +405,8 @@ class ShellJobs:
         if (path / "receipt.json").exists():
             view.update(read_json(path / "receipt.json"))
         elif (path / "running.json").exists():
-            if self.stopped(record):
+            if self.unit_empty(record):
+                self.retire(path, record)
                 reason = "permit-expired" if time.time() >= record["expires"] else "supervisor-lost"
                 self.finalize(path, record, "stopped" if reason == "permit-expired" else "unknown", reason)
                 view.update(read_json(path / "receipt.json"))

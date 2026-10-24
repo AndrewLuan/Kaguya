@@ -20,6 +20,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linux-environments"))
 from broker import PodmanBackend, BrokerError, digest  # noqa: E402
+from supervisor_checks import check_gate, check_deadlines, check_broker_crash  # noqa: E402
 
 
 def until(read, predicate, seconds=15):
@@ -102,6 +103,9 @@ f.writeFileSync('isolation.json',JSON.stringify({pid:f.readlinkSync('/proc/self/
             record = json.loads((backend.shell.root / long["jobId"] / "manifest.json").read_text())
             stopped = operation("stop", jobId=long["jobId"])["result"]
             assert stopped["state"] == "stopped" and backend.shell.stopped(record), stopped
+            check_gate(backend, env, operation, root)
+            check_deadlines(backend, env, operation)
+            check_broker_crash(backend, env["image"], root)
             ack = backend.handoff(env, 1, "human")
             assert ack["automationIsolated"] and json.loads(command("inspect", env["container"]))[0]["State"]["Pid"] == desktop["State"]["Pid"]
             print(json.dumps({"verified": verified, "sandbox": sandbox, "job": state, "stop": stopped, "handoff": ack}), flush=True)
