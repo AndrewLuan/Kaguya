@@ -204,7 +204,14 @@ class Broker:
             failures.append("journal")
         # 日志 ENOSPC/EIO 不得跳过实际隔离。
         try:
-            self.backend.isolate(env)
+            result = self.backend.isolate(env)
+            if isinstance(result, dict) and "generation" in result:
+                actual = result["generation"]
+                allowed = {env["generation"], env.get("pendingControl", {}).get("generation", env["generation"])}
+                if type(actual) is not int or actual not in allowed:
+                    raise BrokerError("isolation-generation-unconfirmed")
+                env = {**env, "generation": actual}
+                env.pop("pendingControl", None)
             isolated = True
         except Exception:
             failures.append("isolation")
@@ -349,12 +356,17 @@ class Broker:
             if env["generation"] != req["generation"]:
                 raise BrokerError("stale-environment")
             self._quarantine(env)
+            env = self.environments[env_id]
             generation = env["generation"] + 1
             new = {**env, "state": "preparing", "generation": generation, "lease": None,
                    "container": "kaguya-" + digest(env_id)[:20] + "-" + str(generation)}
+            preparing = new
             if hasattr(self.backend, "recover_existing"):
                 new["container"] = env["container"]
-            self._save_env(new)
+                # 桌面与 journal 两阶段交接：先记录旧代次和目标，ACK 后才提交新代次。
+                preparing = {**env, "state": "preparing", "lease": None,
+                             "pendingControl": {"mode": "automation", "generation": generation}}
+            self._save_env(preparing)
             try:
                 if hasattr(self.backend, "recover_existing"):
                     self.backend.recover_existing(env, new)
@@ -363,7 +375,7 @@ class Broker:
                 self._save_env({**new, "state": "ready"})
             except Exception:
                 try:
-                    self._quarantine(new)
+                    self._quarantine(preparing)
                 except Exception:
                     pass
                 raise BrokerError("takeover-create-unconfirmed") from None
@@ -724,12 +736,21 @@ class PodmanBackend:
             self.shell.isolate(env)
             exists = self.command("ps", "--filter", "name=^" + env["container"] + "$", "--format={{.ID}}")
             if exists.strip():
+                actual = env["generation"]
+                if env.get("pendingControl"):
+                    health = self.collect(self.launch(env, {"helperProtocolVersion": 1, "kind": "health"}), 15)
+                    actual = health.get("generation")
+                    if (health.get("helperProtocolVersion") != 1 or health.get("ready") is not True or
+                            type(actual) is not int or actual not in (env["generation"], env["pendingControl"]["generation"])):
+                        raise BrokerError("control-transition-unconfirmed")
                 request = {"helperProtocolVersion": 1, "kind": "control", "action": "fence",
-                           "environmentId": env["environmentId"], "expectedGeneration": env["generation"],
-                           "controlOperationId": digest([env["environmentId"], env["generation"], "fence"])}
+                           "environmentId": env["environmentId"], "expectedGeneration": actual,
+                           "controlOperationId": digest([env["environmentId"], actual, "fence"])}
                 ack = self.collect(self.launch(env, request), 15)
-                if ack.get("automationIsolated") is not True:
+                if (ack.get("helperProtocolVersion") != 1 or ack.get("automationIsolated") is not True or
+                        ack.get("generation") != actual):
                     raise BrokerError("automation-isolation-unconfirmed")
+                return {"generation": actual}
             return
         self.stop_container(env["container"])
 

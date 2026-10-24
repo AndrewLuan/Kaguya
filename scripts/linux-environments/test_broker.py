@@ -106,6 +106,65 @@ class BrokerTest(unittest.TestCase):
         return self.broker.takeover({"environmentId": "env", "scope": "scope", "generation": 0,
                                     "controlAuthorizationId": "human"})
 
+    def test_preserved_desktop_pending_generation_recovers_each_crash_window(self):
+        class Crash(BaseException):
+            pass
+        for after in (False, True):
+            with self.subTest(after_helper=after):
+                actual = [0]
+                def isolate(env):
+                    self.assertIn(actual[0], (env["generation"], env.get("pendingControl", {}).get("generation")))
+                    return {"generation": actual[0]}
+                def recover(old, new):
+                    self.assertEqual(old["generation"], actual[0])
+                    if after:
+                        actual[0] = new["generation"]
+                    raise Crash()
+                backend = FakeBackend()
+                backend.isolate, backend.recover_existing = isolate, recover
+                with tempfile.TemporaryDirectory() as root:
+                    broker = Broker(root, backend)
+                    try:
+                        broker.create({"environmentId": "transition", "scope": "scope", "workspaceId": "transition",
+                                       "resourceIds": ["screen"], "image": "example.org/tools@sha256:" + "1" * 64})
+                        with self.assertRaises(Crash):
+                            broker.takeover({"environmentId": "transition", "scope": "scope", "generation": 0,
+                                             "controlAuthorizationId": "recover"})
+                        pending = broker.environments["transition"]
+                        self.assertEqual(pending["generation"], 0)
+                        self.assertEqual(pending["pendingControl"]["generation"], 1)
+                    finally:
+                        broker.journal.close()  # 模拟崩溃，不调用正常 close 隔离。
+                    broker = Broker(root, backend)
+                    try:
+                        env = broker.environments["transition"]
+                        self.assertEqual(env["generation"], int(after))
+                        self.assertEqual(env["state"], "quarantined")
+                        self.assertNotIn("pendingControl", env)
+                        self.assertIsNone(env["lease"])
+                        def recovered(old, new):
+                            self.assertEqual(old["generation"], actual[0])
+                            actual[0] = new["generation"]
+                        backend.recover_existing = recovered
+                        final = broker.takeover({"environmentId": "transition", "scope": "scope", "generation": int(after),
+                                                 "controlAuthorizationId": "next"})
+                        self.assertEqual(final["generation"], int(after) + 1)
+                    finally:
+                        broker.close()
+
+    def test_same_process_takeover_reloads_generation_after_pending_ack_loss(self):
+        actual = [1]
+        self.backend.isolate = lambda env: {"generation": actual[0]}
+        old = self.broker.environments["env"]
+        self.broker._save_env({**old, "state": "draining", "lease": None,
+                               "pendingControl": {"mode": "human", "generation": 1}})
+        def recover(old, new):
+            self.assertEqual(old["generation"], 1)
+            self.assertEqual(new["generation"], 2)
+            actual[0] = 2
+        self.backend.recover_existing = recover
+        self.assertEqual(self.takeover()["generation"], 2)
+
     def test_expired_owner_release_is_idempotent_after_ack_loss_and_cannot_stop_new_generation(self):
         req = self.request()
         self.now += 61

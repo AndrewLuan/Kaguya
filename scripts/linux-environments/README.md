@@ -44,7 +44,7 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 `operation.cancel` 携带原 operation 和当前 `controlEnvironment`、当前 token、W3 已验证的 `controlAuthorizationId`。未见 operation 也持久保存 tombstone，阻止迟到 dispatch。已执行的取消会隔离当前环境自动化；停止进程不能证明之前没有效果，因此保留 unknown 或已取得的真实成功回执。
 
-`environment.recover` 先停止旧 shell 成员并确认整个 cgroup 为空，再排空可信组件输入通道、建立新代次；仍在运行的桌面保留原进程。宿主重启导致桌面退出时，重新创建桌面并使用保留的 workspace/private 卷，不重放旧 job。人工接管使用 `environment.handoff`：先关闭 broker 自动化入口，再等待内部服务确认隔离旧输入通道，然后推进 generation 并进入 human；桌面与未保存内容保持原进程。`environment.resume` 同样经过内部确认推进 generation，随后必须重新 acquire 和 observe。确认失败保持 draining，不开放新 owner。接管与恢复都携带当前 generation 和宿主签发的 controlAuthorizationId。
+`environment.recover` 先停止旧 shell 成员并确认整个 cgroup 为空，再排空可信组件输入通道、建立新代次；仍在运行的桌面保留原进程。宿主重启导致桌面退出时，重新创建桌面并使用保留的 workspace/private 卷，不重放旧 job。人工接管使用 `environment.handoff`：先关闭 broker 自动化入口，再等待内部服务确认隔离旧输入通道，然后推进 generation 并进入 human；桌面与未保存内容保持原进程。`environment.resume` 同样经过内部确认推进 generation，随后必须重新 acquire 和 observe。代次交接先持久记录旧代次和目标，收到可信组件 ACK 后才提交新代次；重启仅接受这两个代次，先隔离实际代次并保留桌面，再等待显式恢复。确认失败保持 draining，不开放新 owner。接管与恢复都携带当前 generation 和宿主签发的 controlAuthorizationId。
 
 `operation.reconcile` 以新 lease 读取原 journal，原 attempt/generation 不变，绝不调用 helper，也不等于核对了外部状态。W7/W8 若需要核实文件、job 或站点回执，应以新 lease 发起独立 verify operation，绑定原 operation/attempt，再由 W3 核对证据；不得重跑原动作。
 

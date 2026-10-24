@@ -111,7 +111,7 @@ int OSSL_provider_init(void *h,const Dispatch *in,const Dispatch **out,void **ct
 
 
 def check_startup_window(backend, env):
-    req = request(env, argv=["/bin/sh", "-c", "echo bad > early-release"], cwd=".", env={})
+    req = request(env, ttl=12, argv=["/bin/sh", "-c", "echo bad > early-release"], cwd=".", env={})
     path, record, _ = backend.shell.prepare(env, req, backend.shell.check(env, req))
     command = backend.shell.unit_command(path, record)
     command[-2:] = [str(Path(__file__).with_name("broker_probe.py")), "--startup-window", str(path)]
@@ -126,12 +126,15 @@ def check_startup_window(backend, env):
     assert (path / "armed.json").exists() and (path / "container.cid").exists()
     assert not (path / "running.json").exists() and not exists(backend, env, "early-release")
     cid = (path / "container.cid").read_text().strip()
-    backend.shell.stop(path, record, "ci-startup-window")
+    armed = read_json(path / "armed.json")
+    # 不发 stop/kill；原独立 timer 必须终止尚未发布 running.json 的整个 unit。
+    wait_until(lambda: payload_empty(armed["unitGroup"]), bool, max(1, record["expires"] - time.time()) + 5)
+    backend.shell.retire(path, record)
     assert backend.shell.stopped(record)
     assert read_json(path / "retired.json")["containerId"] == cid
     assert not exists(backend, env, "early-release")
     print(json.dumps({"startupWindow": {"runningRecordAbsent": True, "effects": 0,
-                                        "fullCidRetired": cid, "unitCgroupEmpty": True}}), flush=True)
+                                        "fullCidRetired": cid, "unitCgroupEmpty": True, "independentDeadline": record["permitExpiresAt"]}}), flush=True)
 
 
 def check_deadlines(backend, env, operation):
@@ -224,6 +227,55 @@ def check_broker_crash(parent_backend, image, root):
         assert base64.b64decode(backend.shell.workspace_read(env, "once", time.time() + 10, length=100)["dataBase64"]) == b"1"
         print(json.dumps({"brokerCrash": {"groups": running, "deadline": record["permitExpiresAt"], "recoveredGeneration": recovered["generation"],
                                            "originalOutcome": "unknown", "effectCount": 1, "desktopPidPreserved": True}}), flush=True)
+        class TransitionCrash(BaseException):
+            pass
+        windows = []
+        for after in (False, True):
+            before = broker.environments[key]["generation"]
+            recover = backend.recover_existing
+            def interrupted(old, new):
+                if after:
+                    recover(old, new)
+                raise TransitionCrash()
+            backend.recover_existing = interrupted
+            try:
+                try:
+                    broker.takeover({"environmentId": key, "scope": "ci", "generation": before, "controlAuthorizationId": "transition"})
+                    raise AssertionError("transition fault not reached")
+                except TransitionCrash:
+                    pass
+                assert broker.environments[key]["generation"] == before
+                assert broker.environments[key]["pendingControl"]["generation"] == before + 1
+            finally:
+                backend.recover_existing = recover
+                broker.journal.close()
+                broker.closed = True
+            broker = Broker(state, backend)
+            recovered = broker.environments[key]
+            assert recovered["generation"] == before + int(after) and recovered["state"] == "quarantined"
+            assert recovered["lease"] is None and "pendingControl" not in recovered
+            assert json.loads(backend.command("inspect", env["container"]))[0]["State"]["Pid"] == desktop_pid
+            ready = broker.takeover({"environmentId": key, "scope": "ci", "generation": recovered["generation"], "controlAuthorizationId": "explicit-recovery"})
+            windows.append({"afterHelper": after, "recoveredGeneration": recovered["generation"], "readyGeneration": ready["generation"]})
+        generation = broker.environments[key]["generation"]
+        handoff = backend.handoff
+        def lost_ack(*args):
+            handoff(*args)
+            raise BrokerError("ci-lost-control-ack")
+        backend.handoff = lost_ack
+        try:
+            try:
+                broker.handoff({"environmentId": key, "scope": "ci", "generation": generation, "controlAuthorizationId": "lost-ack"})
+                raise AssertionError("control ACK was not withheld")
+            except BrokerError as error:
+                assert str(error) == "ci-lost-control-ack", str(error)
+        finally:
+            backend.handoff = handoff
+        taken = broker.takeover({"environmentId": key, "scope": "ci", "generation": generation, "controlAuthorizationId": "takeover-pending"})
+        assert taken["generation"] == generation + 2
+        assert json.loads(backend.command("inspect", env["container"]))[0]["State"]["Pid"] == desktop_pid
+        print(json.dumps({"controlTransitionRecovery": {"windows": windows, "sameProcessLostAckGeneration": taken["generation"],
+                                                        "desktopPidPreserved": True}}), flush=True)
     finally:
         actions = [lambda: stop_process(child), *[stream.close for stream in (child.stdin, child.stdout, child.stderr)]]
         if broker:
