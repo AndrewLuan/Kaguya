@@ -6,6 +6,7 @@
  * helper 由 Python broker 调用。环境管理只提供宿主 API，不自动注册模型工具。
  * 输入输出与副作用：token 仅留宿主内存及 socket 请求；控制调用用新 lease 核对原 attempt。
  * 传输中断不是取消证明；返回已有成功证据时保留 succeeded，不改写成 cancelled。
+ * release 仅在确认响应后移除秘密绑定；响应丢失可用同身份读取 broker 幂等释放回执。
  */
 import { createConnection } from "node:net";
 import { z } from "@kaguya/schema";
@@ -173,15 +174,13 @@ export class LinuxEnvironmentClient {
 
   async release(environmentId: string, scope: string) {
     const binding = this.#binding(environmentId, scope);
-    try {
-      return await this.#transport("lease.release", {
-        environment: binding.environment,
-        token: binding.token,
-        scope,
-      });
-    } finally {
-      this.#bindings.delete(environmentId);
-    }
+    const result = await this.#transport("lease.release", {
+      environment: binding.environment,
+      token: binding.token,
+      scope,
+    });
+    this.#bindings.delete(environmentId);
+    return result;
   }
 
   async recover(input: {

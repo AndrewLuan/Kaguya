@@ -28,5 +28,11 @@ export {
 } from "./environment.js";
 
 export * from "./native-tool-loop.js";
+export {
+  LinuxToolsHost,
+  linuxShellSchema,
+  linuxToolsConfigurationSchema,
+  type LinuxToolsConfiguration,
+} from "./linux-tools.js";
 
 export { createNativeMemoryTools } from "./native-memory-tools.js";

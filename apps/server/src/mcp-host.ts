@@ -3,7 +3,7 @@
  * openServerMcp 缺省关闭；mcpRuntimeOptions 复用 W4 注册/W3 provider，不创建第二个执行循环。
  * registerMcpRoutes 每个请求验证 Gateway management token；prompt 展开仅由明确用户 POST 创建选择。
  * 连接目标和凭据引用来自敏感 mcp.json，HTTP 请求只能给出已配置连接、scope、资源 URI 或 prompt 参数。
- * 返回值保留不可信来源；异常只返回稳定代码，停用和清理由 server.ts 按 Runtime→MCP 顺序负责。
+ * 返回值保留不可信来源；Linux shell 从独立敏感配置显式启用，合并 providers 并共用关闭顺序。
  */
 import { isDeepStrictEqual } from "node:util";
 import { createRuntimeKindRegistry } from "@kaguya/runtime";
@@ -31,6 +31,11 @@ import type {
   RuntimeCapabilityContext,
 } from "@kaguya/runtime";
 import type { GatewayAuthenticator } from "./gateway-auth.js";
+import { openLinuxTools, mergeLinuxTools } from "./linux-tools-host.js";
+import type { LinuxToolsHost } from "@kaguya/runtime";
+import type { ActionProvider } from "@kaguya/sdk";
+import type { ModuleCapabilityImplementation } from "@kaguya/sdk";
+const linuxHosts = new Map<McpHost, LinuxToolsHost>();
 
 export function createMcpLateResultRecorder(database: KaguyaDatabase) {
   return async (envelope: McpEnvelope, informationId: string) => {
@@ -94,7 +99,7 @@ export async function openServerMcp(root: string, database: KaguyaDatabase) {
     [mcpLateResultInformationKind.kind],
     [mcpLateResultInformationKind],
   );
-  return McpHost.open(
+  const host = await McpHost.open(
     await loadMcpConfiguration(root),
     (reference) => process.env[reference],
     {
@@ -102,6 +107,21 @@ export async function openServerMcp(root: string, database: KaguyaDatabase) {
       recordLateResult: createMcpLateResultRecorder(database),
     },
   );
+  try {
+    const linux = await openLinuxTools(root);
+    if (linux) linuxHosts.set(host, linux);
+    return host;
+  } catch (error) {
+    await host.close();
+    throw error;
+  }
+}
+export async function closeServerMcp(host: McpHost) {
+  const linux = linuxHosts.get(host);
+  const results = await Promise.allSettled([host.close(), linux?.close()]);
+  if (results.some((r) => r.status === "rejected"))
+    throw new Error("server-tools-cleanup-unconfirmed");
+  linuxHosts.delete(host);
 }
 export function mcpRuntimeOptions(
   host: McpHost,
@@ -139,12 +159,19 @@ export function withServerMcp<
   T extends {
     nativeTools?: NativeToolLoopOptions;
     capabilities?: RuntimeCapabilities;
+    actionProviders?: readonly ActionProvider[];
   },
 >(host: McpHost, composition: T) {
-  return {
+  return mergeLinuxTools(linuxHosts.get(host), {
     ...composition,
     ...mcpRuntimeOptions(host, composition.nativeTools),
-    capabilities: (context: RuntimeCapabilityContext) => [
+    actionProviders: [
+      ...(composition.actionProviders ?? []),
+      ...host.snapshot().actionProviders,
+    ],
+    capabilities: (
+      context: RuntimeCapabilityContext,
+    ): ModuleCapabilityImplementation[] => [
       ...(typeof composition.capabilities === "function"
         ? composition.capabilities(context)
         : (composition.capabilities ?? [])),
@@ -164,7 +191,7 @@ export function withServerMcp<
         },
       },
     ],
-  };
+  });
 }
 const requestSchema = z
   .object({

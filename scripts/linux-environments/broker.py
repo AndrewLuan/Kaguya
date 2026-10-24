@@ -222,7 +222,7 @@ class Broker:
         return env
 
     def public(self, env):
-        return {k: v for k, v in env.items() if k not in ("lease", "container")}
+        return {k: v for k, v in env.items() if k not in ("lease", "container", "releaseReceipt")}
 
     def create(self, req):
         env_id = identifier(req["environmentId"])
@@ -317,9 +317,22 @@ class Broker:
             return self.reference(env)
 
     def release(self, req):
-        # 释放也隔离旧进程；保留后台进程的释放会让下个 workflow 接收迟到输入。
+        # 同一身份只允许幂等停止自己的旧代次；过期租约可以收尾，不能取得新执行权。
         with self._lock(req["environment"]["environmentId"]):
-            env = self._validate(req["environment"], req["token"], req["scope"])
+            env = self._env(req["environment"]["environmentId"], req["scope"])
+            ref = {k: v for k, v in req["environment"].items() if k != "expiresAt"}
+            proof = {"reference": ref, "tokenHash": digest(req["token"])}
+            previous = env.get("releaseReceipt")
+            if previous == proof and env["generation"] == ref["generation"] and env["state"] == "quarantined" and env["lease"] is None:
+                return self.public(env)
+            lease = env["lease"]
+            if lease is None or env["generation"] != ref["generation"]:
+                raise BrokerError("release-identity-mismatch")
+            expected = {k: v for k, v in self.reference(env).items() if k != "expiresAt"}
+            if ref != expected or not hmac.compare_digest(lease["tokenHash"], proof["tokenHash"]):
+                raise BrokerError("release-identity-mismatch")
+            self._save_env({**env, "releaseReceipt": proof})
+            env = self.environments[env["environmentId"]]
             self._quarantine(env)
             return self.public(self.environments[env["environmentId"]])
 
