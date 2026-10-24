@@ -121,6 +121,22 @@ def check_browser(broker, key, command):
         binding = broker.acquire({'environmentId': key, 'scope': 'ci', 'workflowId': 'verified-flow', 'ttlSeconds': 120})
         reconciled = broker.reconcile({**lost, 'token': binding['token'], 'controlEnvironment': binding['environment'], 'controlAuthorizationId': uuid.uuid4().hex})
         assert reconciled['status'] == 'unknown'
+        launch = backend.launch
+        repeated_dispatches = []
+        def record_repeated_dispatch(env, body):
+            repeated_dispatches.append(body.get('operationId'))
+            return launch(env, body)
+        backend.launch = record_repeated_dispatch
+        try:
+            try:
+                broker.execute({**lost, 'environment': binding['environment'], 'token': binding['token']})
+            except BrokerError as error:
+                assert str(error) == 'operation-conflict'
+            else:
+                raise AssertionError('unknown operation was accepted for replay under a new generation')
+            assert repeated_dispatches == []
+        finally:
+            backend.launch = launch
         current = until(observe, lambda state: any(item['tag'] == 'output' and item['text'] == '2' for item in state['nodes']))
         count = next(item for item in current['nodes'] if item['tag'] == 'output' and item['text'] == '2')
         _, actual = execute('browser.verify', {'mode': 'page', 'original': {'operationId': lost['operationId'], 'attemptId': lost['attemptId']}, 'observation': current['observation'], 'expectation': {'kind': 'text', 'nodeId': count['id'], 'equals': '2'}})
