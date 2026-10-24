@@ -325,6 +325,9 @@ class Broker:
             previous = env.get("releaseReceipt")
             if previous == proof and env["generation"] == ref["generation"] and env["state"] == "quarantined" and env["lease"] is None:
                 return self.public(env)
+            if previous == proof and env["generation"] == ref["generation"] and env["state"] in ("draining", "isolation_failed") and env["lease"] is None:
+                self._quarantine(env)
+                return self.public(self.environments[env["environmentId"]])
             lease = env["lease"]
             if lease is None or env["generation"] != ref["generation"]:
                 raise BrokerError("release-identity-mismatch")
@@ -661,7 +664,7 @@ class PodmanBackend:
                      "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=2", "--memory=4g",
                      "--memory-swap=4g", "--pids-limit=512", "--shm-size=512m", "--init",
                      "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
-                     "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700",
+                     "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
                      "--volume", volume + ":/workspace:rw", "--env=HOME=/home/tool",
                      "--env=KAGUYA_HELPER_PROTOCOL_VERSION=1", "--env=KAGUYA_ENVIRONMENT_ID=" + env["environmentId"],
                      "--env=KAGUYA_ENVIRONMENT_GENERATION=" + str(env["generation"]),

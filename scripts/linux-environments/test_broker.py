@@ -125,6 +125,15 @@ class BrokerTest(unittest.TestCase):
             self.broker.release(req)
         self.assertEqual(self.broker.execute(self.request("new-operation", fresh))["status"], "succeeded")
 
+    def test_failed_physical_release_retains_proof_and_can_finish_isolation(self):
+        self.backend.fail_stop = True
+        try:
+            with self.assertRaises(BrokerError):
+                self.broker.release(self.request())
+        finally:
+            self.backend.fail_stop = False
+        self.assertEqual(self.broker.release(self.request())["state"], "quarantined")
+
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()
         result = self.broker.cancel(self.control(req))

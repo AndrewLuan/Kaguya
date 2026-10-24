@@ -113,15 +113,21 @@ export class LinuxToolsHost {
   ) {
     const config = this.configuration.bindings.find((b) => b.scope === scope);
     if (!config || this.closed) throw new Error("linux-tools-scope-denied");
-    await this.locks.get(scope)?.catch(() => undefined);
-    await this.client.recover({
-      environmentId: config.environmentId,
-      scope,
-      generation,
-      controlAuthorizationId,
-    });
-    this.leases.delete(scope);
-    this.unavailable.delete(scope);
+    this.unavailable.add(scope);
+    const work = (this.locks.get(scope) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        await this.client.recover({
+          environmentId: config.environmentId,
+          scope,
+          generation,
+          controlAuthorizationId,
+        });
+        this.leases.delete(scope);
+        this.unavailable.delete(scope);
+      });
+    this.locks.set(scope, work);
+    await work;
   }
   async bind(scope: string): Promise<ActionEnvironment> {
     const config = this.configuration.bindings.find((b) => b.scope === scope);
@@ -131,7 +137,8 @@ export class LinuxToolsHost {
     const work = previous
       .catch(() => undefined)
       .then(async () => {
-        if (this.closed) throw new Error("linux-tools-closed");
+        if (this.closed || this.unavailable.has(scope))
+          throw new Error("linux-tools-closed");
         let reference = this.leases.get(scope);
         reference = reference
           ? await this.client.renew(

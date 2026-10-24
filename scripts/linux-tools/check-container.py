@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +39,10 @@ def main():
         return result.stdout
     backend.command = diagnostic_command
     info = json.loads(backend.command("info", "--format=json"))
+    print(json.dumps({"runtimeEvidence": {"podman": info["version"], "ociRuntime": info["host"].get("ociRuntime"),
+                                           "kernel": platform.release(), "rootless": info["host"]["security"]["rootless"],
+                                           "apparmorRestrictUserns": Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").read_text().strip()
+                                           if Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").exists() else None}}), flush=True)
     assert info["host"]["security"]["rootless"] is True and info["host"]["cgroupVersion"] == "v2"
     backend.command("load", "--input", str(Path(args.archive).resolve()), timeout=300)
     inspected = json.loads(backend.command("image", "inspect", "localhost/kaguya-shell:ci"))[0]
@@ -60,6 +65,10 @@ def main():
     try:
         containers.append(dict(env))
         backend.create(env)
+        home_info = backend.command("exec", env["container"], "/usr/bin/stat", "-c", "%u:%g:%a", "/home/tool").decode().strip()
+        assert home_info == "1000:1000:700", home_info
+        diagnostics = backend.command("exec", env["container"], "/bin/cat", "/proc/self/status").decode()
+        print(json.dumps({"home": home_info, "processStatus": diagnostics}), flush=True)
         start = operation("start", argv=["/usr/local/bin/node", "-e", "setTimeout(()=>require('fs').writeFileSync('marker','actual-container'),100)"], cwd=".", env={})
         assert start["result"]["accepted"] is True
         limit = time.monotonic() + 10
