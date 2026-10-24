@@ -203,6 +203,8 @@ finally:
                                 ("/home/tool/gui-chromium-probe.json", "gui-chromium-probe.json"),
                                 ("/home/app/session/chromium.log", "gui-chromium.log"),
                                 ("/home/tool/gui-drain-held.json", "gui-drain-held.json"),
+                                ("/home/tool/gui-drain-modifier.json", "gui-drain-modifier.json"),
+                                ("/home/tool/gui-drain-button.json", "gui-drain-button.json"),
                                 ("/home/tool/gui-drain-unicode.json", "gui-drain-unicode.json"),
                                 ("/home/tool/gui-menu.png", "gui-menu.png"),
                                 ("/home/tool/gui-menu-observation.json", "gui-menu-observation.json"),

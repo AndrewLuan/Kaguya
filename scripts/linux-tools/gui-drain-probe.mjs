@@ -12,7 +12,7 @@ import { CuaStdio } from "./cua-stdio.mjs";
 const exec = promisify(execFile);
 import { x11State as keyboard } from "./gui-x11.mjs";
 
-for (const mode of ["held", "unicode"]) {
+for (const mode of ["held", "modifier", "button", "unicode"]) {
   const driver = new CuaStdio();
   let monitor;
   let monitorClosed;
@@ -51,6 +51,14 @@ for (const mode of ["held", "unicode"]) {
     const before = await keyboard({ mode: "snapshot" });
     assert.deepEqual(before.keys, []);
     assert.deepEqual(before.buttons, []);
+    const inputState =
+      mode === "button"
+        ? await driver.call("get_window_state", {
+            pid,
+            window_id: windowId,
+            max_image_dimension: 0,
+          })
+        : undefined;
     monitor = spawn(
       "/usr/bin/python3",
       [
@@ -92,22 +100,41 @@ for (const mode of ["held", "unicode"]) {
       }),
     ]);
     const request =
-      mode === "held"
+      mode === "button"
         ? driver.call(
-            "press_key",
-            { pid, window_id: windowId, key: "a", delivery_mode: "foreground" },
-            () => {},
-          )
-        : driver.call(
-            "type_text",
+            "click",
             {
               pid,
               window_id: windowId,
-              text: "中".repeat(1000),
+              x: 30,
+              y: 30,
+              capture_id: inputState.structuredContent.capture_id,
               delivery_mode: "foreground",
             },
             () => {},
-          );
+          )
+        : mode === "held" || mode === "modifier"
+          ? driver.call(
+              "press_key",
+              {
+                pid,
+                window_id: windowId,
+                key: "a",
+                modifiers: mode === "modifier" ? ["shift"] : [],
+                delivery_mode: "foreground",
+              },
+              () => {},
+            )
+          : driver.call(
+              "type_text",
+              {
+                pid,
+                window_id: windowId,
+                text: "中".repeat(1000),
+                delivery_mode: "foreground",
+              },
+              () => {},
+            );
     const settled = request.then(
       () => "returned",
       () => "interrupted",
@@ -121,15 +148,31 @@ for (const mode of ["held", "unicode"]) {
       `/home/tool/gui-drain-${mode}.json`,
       JSON.stringify({ mode, before, residual, interruption }),
     );
-    if (mode === "held")
+    if (mode === "held" || mode === "modifier")
       assert.ok(
         residual.keys.length > 0,
         "held-input-must-survive-driver-exit",
+      );
+    else if (mode === "button")
+      assert.ok(
+        residual.buttons.includes(1),
+        "held-button-must-survive-driver-exit",
       );
     else
       assert.ok(
         residual.mapping.some((row) => row.includes(0x1004e2d)),
         "temporary-mapping-must-survive-driver-exit",
+      );
+    if (mode === "held")
+      assert.ok(interruption.autoRepeat, "real-auto-repeat-required");
+    if (mode === "modifier")
+      assert.ok(
+        residual.keys.some((key) =>
+          residual.mapping[key - 8].some(
+            (symbol) => symbol === 0xffe1 || symbol === 0xffe2,
+          ),
+        ),
+        "held-shift-must-survive-driver-exit",
       );
     const reset = await keyboard({
       mode: "reset",
@@ -147,6 +190,8 @@ for (const mode of ["held", "unicode"]) {
         mode,
         applicationPid: pid,
         interruptedKeys: interruption.observed.keys,
+        interruptedButtons: interruption.observed.buttons,
+        autoRepeat: interruption.autoRepeat,
         reset,
         mappingRestored: true,
       }),
