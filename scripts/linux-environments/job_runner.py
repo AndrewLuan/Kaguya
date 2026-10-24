@@ -54,20 +54,22 @@ def run(path):
     group = props["ControlGroup"]
     if not group or group_for(os.getpid()) != group:
         raise BrokerError("supervisor-cgroup-unconfirmed")
-    entered = int(props["ActiveEnterTimestampMonotonic"]) / 1000000
-    if entered <= 0:
-        raise BrokerError("unit-activation-unconfirmed")
-    runtime = record["monotonicDeadline"] - entered
-    if runtime <= 0:
-        raise BrokerError("job-expired-before-arm")
-    jobs.system("/usr/bin/systemctl", "--user", "set-property", "--runtime", record["unit"],
-                f"RuntimeMaxSec={runtime:.6f}s")
+    # 已启动服务的 RuntimeMaxUSec 在 systemd 255 不可修改。使用机器启动时间为
+    # 固定原点的 timer，不能用 OnActiveSec 把 supervisor 启动排队耗时变成续权。
     expiry_unit = record["unit"].removesuffix(".service") + "-expiry"
     jobs.system("/usr/bin/systemd-run", "--user", "--quiet", "--unit=" + expiry_unit,
+                f"--on-boot={record['monotonicDeadline']:.6f}s",
                 "--on-calendar=@" + str(record["expires"]), "--timer-property=AccuracySec=1us",
                 "--timer-property=RandomizedDelaySec=0", "/usr/bin/systemctl", "--user", "stop", record["unit"])
-    armed = jobs.properties(record["unit"])
-    if armed.get("RuntimeMaxUSec") in (None, "infinity", "0") or remaining(record) <= 0:
+    timer_path = jobs.system("/usr/bin/busctl", "--user", "call", "org.freedesktop.systemd1",
+                            "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                            "GetUnit", "s", expiry_unit + ".timer").stdout.decode().split(" ", 1)[1]
+    timer_path = json.loads(timer_path)
+    next_elapse = jobs.system("/usr/bin/busctl", "--user", "get-property", "org.freedesktop.systemd1", timer_path,
+                             "org.freedesktop.systemd1.Timer", "NextElapseUSecMonotonic").stdout.decode()
+    armed_deadline = int(next_elapse.split()[1]) / 1000000
+    if (jobs.properties(expiry_unit + ".timer").get("ActiveState") != "active" or
+            not 0 < armed_deadline <= record["monotonicDeadline"] + 0.000002 or remaining(record) <= 0):
         raise BrokerError("deadline-not-armed")
     command = ["/usr/bin/podman", "--cgroup-manager=cgroupfs", "run", "--pull=never", "--interactive",
                "--name=" + record["container"], "--label=kaguya.environment=" + record["environmentId"],

@@ -4,10 +4,10 @@
 
 ## 安装前审查
 
-一起审查 `bootstrap.py`、`server.py`、`broker.py`、`packages.lock.json`，记录四个文件的 SHA-256。将这四个文件保存在同一个目录。`bootstrap.py check --trusted-user andrew` 只读预检，不需要 root；`apply` 会修改下述 W6 专属系统资源。安装不会拉镜像、创建容器任务，也不会修改或重启 Kaguya、PostgreSQL、QQ/NapCat。
+一起审查 `bootstrap.py`、`server.py`、`broker.py`、`shell_jobs.py`、`job_runner.py`、`packages.lock.json`，记录六个文件的 SHA-256。将这六个文件保存在同一个目录。`bootstrap.py check --trusted-user andrew` 只读预检，不需要 root；`apply` 会修改下述 W6 专属系统资源。安装不会拉镜像、创建容器任务，也不会修改或重启 Kaguya、PostgreSQL、QQ/NapCat。
 
 ```bash
-sha256sum bootstrap.py server.py broker.py packages.lock.json
+sha256sum bootstrap.py server.py broker.py shell_jobs.py job_runner.py packages.lock.json
 python3 -I bootstrap.py check --trusted-user andrew
 sudo /usr/bin/python3 -I bootstrap.py apply --trusted-user andrew
 ```
@@ -18,9 +18,9 @@ sudo /usr/bin/python3 -I bootstrap.py apply --trusted-user andrew
 
 **容量** — 首次安装预留两个实际分配的 ext4 镜像文件：容器镜像、工作卷和容器日志共用 24 GiB；broker journal 与产物共用独立 4 GiB。它们挂载在 `/var/lib/kaguya-tools-storage/containers` 和 `state`。产物再受单件 16 MiB、总量 2 GiB 限制。容器写满工作卷会得到 ENOSPC，不能继续占用宿主剩余磁盘。该限制是两个环境共用的总容量，不是每个命名卷独立 quota。格式化使用 `nodiscard`，发布前及挂载后复核实际分配块数、ext4 类型与 loop backing file。已有存储镜像不会重新格式化。安装加独占锁；硬中断留下的 `.preparing` 仅在本安装身份、root 所有权、单链接与未关联 loop 设备均确认后清理重建。首次安装要求这 28 GiB 加 4 GiB 空闲余量。
 
-**代码与连接** — root 拥有 `/usr/local/lib/kaguya-tools/{server,broker}.py`、`/etc/kaguya-tools/config.json` 和 `storage.conf`。broker 以专用 UID 运行，socket 为 `/run/kaguya-tools/broker.sock`。目录 traverse ACL 与 socket ACL 仅授予安装时指定的宿主用户；每条连接另用内核 `SO_PEERCRED` 核对 UID，不接受请求中自报 UID。socket 不能访问 Podman API。
+**代码与连接** — root 拥有 `/usr/local/lib/kaguya-tools/{server,broker,shell_jobs,job_runner}.py`、`/etc/kaguya-tools/config.json` 和 `storage.conf`。broker 以专用 UID 运行，socket 为 `/run/kaguya-tools/broker.sock`。目录 traverse ACL 与 socket ACL 仅授予安装时指定的宿主用户；每条连接另用内核 `SO_PEERCRED` 核对 UID，不接受请求中自报 UID。socket 不能访问 Podman API。
 
-**系统单元** — 安装两个存储 mount unit、`kaguya-tools-network.service`、仅针对专用 UID 的 `user@UID.service.d/kaguya-tools.conf`、`kaguya-tools-broker.service` 和 `/etc/tmpfiles.d/kaguya-tools.conf`。只给专用账户启用 linger。宿主 broker 的任务上限为 1200、内存上限为 10 GiB；每个工具容器为 2 CPU、4 GiB 内存、512 PID、512 MiB 共享内存，最多注册两个环境。
+**系统单元** — 安装两个存储 mount unit、`kaguya-tools-network.service`、仅针对专用 UID 的 `user@UID.service.d/kaguya-tools.conf`、`kaguya-tools-broker.service` 和 `/etc/tmpfiles.d/kaguya-tools.conf`。只给专用账户启用 linger。`kaguya.slice` 总上限为 1200 tasks、10 GiB；每个 environment 的父 slice 为 2 CPU、4 GiB、512 tasks，最多两个环境。桌面容器与全部 shell jobs 分别使用 1 CPU、2 GiB、256 tasks 的预算；全部 shell jobs 共用一个子 slice，不能逐个重复领取额度。每个容器的共享内存上限为 512 MiB。
 
 **网络** — 默认环境 `network=none`。显式 `public-web` 使用 pasta，宿主独立 nftables table 限制该专用 UID：只允许公共地址 TCP 80/443 和 DNS，拒绝本机地址、私网、链路本地、tailnet、IPv4 映射 IPv6 等特殊地址。仅对 systemd-resolved 的 `127.0.0.53:53` 提供本机 DNS 例外。它是 IP/端口边界，不是域名白名单；DNS 查询仍可能传出数据。安装只管理 `inet kaguya_tools`，不 flush 其他规则。W7/W8 验收还须实际检查 IPv4/IPv6、宿主地址及重定向路径。
 
@@ -36,15 +36,15 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 ## 生命周期与 W3 接口
 
-`environment.create` 固定 scope、workspace、resource 集合、镜像 digest 与 network policy。workspace/resource 不允许被另一环境重复注册。每代容器拥有独立名称，工作卷按 workspace 保留。没有任何可由请求指定的宿主 bind mount；容器只取得命名工作卷，不取得 broker 程序、unit、journal、凭证或宿主仓库。
+`environment.create` 固定 scope、workspace、resource 集合、镜像 digest 与 network policy。workspace/resource 不允许被另一环境重复注册。可信桌面容器与独立 shell job 是同一环境的不同成员；job 使用不可变名称和原代次。工作卷按 workspace 保留。没有任何可由请求指定的宿主 bind mount；shell 只取得命名工作卷，不取得 broker 程序、unit、journal、凭证或宿主仓库。可信桌面额外取得环境私有 `/private` 卷，browser profile/下载控制记录不得放入共享 workspace。
 
-`lease.acquire` 返回公开 `ActionEnvironment` 与一次性秘密 token。公开引用可以进入 W3 intent；token 只保存在受信宿主内存，通过 `ActionExecution.leaseCredential` 传到实际入口。broker 仅持久化 token hash。lease 必须覆盖完整 observe → act → verify；浏览器和 GUI 共用同一环境 lease。过期不自动转授，需要显式恢复隔离旧执行者。已派发 permit 的截止时间固定为操作 deadline 与当次 lease 到期时间的较早者；后续 renew 不会延长旧 permit。helper 必须在每次实际输入前核验 permit，并在到期时停止旧自动化输入。broker 的 collect 超时会隔离整个容器并保留 unknown。
+`lease.acquire` 返回公开 `ActionEnvironment` 与一次性秘密 token。公开引用可以进入 W3 intent；token 只保存在受信宿主内存，通过 `ActionExecution.leaseCredential` 传到实际入口。broker 仅持久化 token hash。lease 必须覆盖完整 observe → act → verify；浏览器和 GUI 共用同一环境 lease。过期不自动转授，需要显式恢复隔离旧执行者。已派发 permit 的截止时间固定为操作 deadline 与当次 lease 到期时间的较早者；后续 renew 不会延长旧 permit。helper 必须在每次实际输入前核验 permit，并在到期时停止旧自动化输入。broker 的 collect 超时会停止 shell 成员、排空 GUI/browser 自动化输入并保留 unknown；桌面进程继续运行。
 
 `operation.execute` 在实际启动入口再次检查 scope、workspace/resources、workflow、lease、generation、fencing、token 和 deadline。固定 `intentId/attemptId/operationId/digest` 与参数的内部 hash；同 operation 换参数、attempt 或 generation 会被拒绝。已派发但无结果的记录返回 unknown，不再次执行。
 
-`operation.cancel` 携带原 operation 和当前 `controlEnvironment`、当前 token、W3 已验证的 `controlAuthorizationId`。未见 operation 也持久保存 tombstone，阻止迟到 dispatch。已执行的取消会隔离当前容器；停止进程不能证明之前没有效果，因此保留 unknown 或已取得的真实成功回执。
+`operation.cancel` 携带原 operation 和当前 `controlEnvironment`、当前 token、W3 已验证的 `controlAuthorizationId`。未见 operation 也持久保存 tombstone，阻止迟到 dispatch。已执行的取消会隔离当前环境自动化；停止进程不能证明之前没有效果，因此保留 unknown 或已取得的真实成功回执。
 
-`environment.recover` 停止旧容器并确认无运行 PID，再建立新代次，保留 workspace。人工接管使用 `environment.handoff`：先关闭 broker 自动化入口，再等待内部服务确认隔离旧输入通道，然后推进 generation 并进入 human；桌面与未保存内容保持原进程。`environment.resume` 同样经过内部确认推进 generation，随后必须重新 acquire 和 observe。确认失败保持 draining，不开放新 owner。接管与恢复都携带当前 generation 和宿主签发的 controlAuthorizationId。
+`environment.recover` 先停止旧 shell 成员并确认整个 cgroup 为空，再排空可信组件输入通道、建立新代次；仍在运行的桌面保留原进程。宿主重启导致桌面退出时，重新创建桌面并使用保留的 workspace/private 卷，不重放旧 job。人工接管使用 `environment.handoff`：先关闭 broker 自动化入口，再等待内部服务确认隔离旧输入通道，然后推进 generation 并进入 human；桌面与未保存内容保持原进程。`environment.resume` 同样经过内部确认推进 generation，随后必须重新 acquire 和 observe。确认失败保持 draining，不开放新 owner。接管与恢复都携带当前 generation 和宿主签发的 controlAuthorizationId。
 
 `operation.reconcile` 以新 lease 读取原 journal，原 attempt/generation 不变，绝不调用 helper，也不等于核对了外部状态。W7/W8 若需要核实文件、job 或站点回执，应以新 lease 发起独立 verify operation，绑定原 operation/attempt，再由 W3 核对证据；不得重跑原动作。
 
@@ -52,7 +52,7 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 ## 镜像 helper 协议 1
 
-`/opt/kaguya-tools/init` 是容器固定入口，维护长驻内部服务、进程树及当前 generation；`/opt/kaguya-tools/helper` 是一次 JSON 请求/响应客户端。`podman exec` 不继承 init 运行后设置的变量；DISPLAY、DBus、浏览器与内部 socket 地址必须由镜像固定配置或受控运行文件提供。HOME `/home/tool` 是临时 tmpfs，持久 browser profile、job 回执和产物放 `/workspace`。初始身份由 `KAGUYA_HELPER_PROTOCOL_VERSION`、`KAGUYA_ENVIRONMENT_ID`、`KAGUYA_ENVIRONMENT_GENERATION` 提供。
+`/opt/kaguya-tools/init` 是容器固定入口，维护长驻内部服务、进程树及当前 generation；`/opt/kaguya-tools/helper` 是一次 JSON 请求/响应客户端。`podman exec` 不继承 init 运行后设置的变量；DISPLAY、DBus、浏览器与内部 socket 地址必须由镜像固定配置或受控运行文件提供。HOME `/home/tool` 是临时 tmpfs，持久 browser profile 放只挂给可信桌面的 `/private`；shell job 回执与输出位于宿主私有 state 分区，任意命令只共享 `/workspace`。初始身份由 `KAGUYA_HELPER_PROTOCOL_VERSION`、`KAGUYA_ENVIRONMENT_ID`、`KAGUYA_ENVIRONMENT_GENERATION` 提供。
 
 **就绪** — broker 发送 `{"helperProtocolVersion":1,"kind":"health"}`。helper 等待内部服务真正就绪后返回 `{"helperProtocolVersion":1,"ready":true,"generation":0}`，generation 必须匹配当前环境。固定健康请求预算 15 秒；仅容器 running 不算就绪。
 
@@ -62,11 +62,23 @@ W7/W8 负责 opaque observation registry，将 observation ID 绑定内容 hash/
 
 **人工接管** — 控制请求为 `kind:"control",action:"handoff"`，带 environmentId、expectedGeneration、generation、mode（human 或 automation）及稳定 controlOperationId。内部服务在保持桌面进程的前提下隔离旧自动化输入；完成后返回 `helperProtocolVersion:1,automationIsolated:true,generation,mode`。同一 controlOperationId 重发必须幂等返回同一确认，不能再次推进 generation。实际 GUI 输入隔离由 W8 镜像实现并验收。
 
-**结果与长任务** — stdout 是单个 JSON outcome，保留工具原生回执于 result。helper 返回只证明返回，不自动升级到外部效果已验证。W3 默认 provider 预算约 29 秒，socket 310 秒与 broker collect 上限 300 秒不扩大该预算。长命令由 W7 实现持久 job 的短 RPC：start 返回 accepted 与稳定 jobId，accepted 不等于 exited；查询和 stop 都是新 lease 约束下的新 operation，init 管理进程树及到期隔离。断开 socket 不是取消证明。job 的许可续期与停止规则必须由 W7 明确验证后才开放。
+**结果与长任务** — stdout 是单个 JSON outcome，保留工具原生回执于 result。helper 返回只证明返回，不自动升级到外部效果已验证。W3 默认 provider 预算约 29 秒，socket 310 秒与 broker collect 上限 300 秒不扩大该预算。长命令由 W7 实现持久 job 的短 RPC：start 返回 accepted 与稳定 jobId，accepted 不等于 exited；查询和 stop 都是新 lease 约束下的新 operation，宿主独立 systemd job unit 管理容器及到期隔离。断开 socket 不是取消证明。已发 job 不支持隐式续期；query/renew 不修改原 permit 截止。
 
 **产物** — stdout 总计最多 24 MiB。helper 必须在 base64 编码前限制附件原始总大小为 16 MiB，单件也不超过 16 MiB，最多 8 件；result 与其余 JSON 预留在 1 MiB 内。支持 PNG/JPEG/WebP、纯文本、CSV、JSON、PDF、ZIP、octet-stream 和 WebM 的明确 MIME，不能把二进制伪标为 text。超出附件预算时保留有效 outcome，将 `truncated` 设为 true；完整文件保留在 workspace，result 的 exports 记录相对路径、原始大小与 SHA-256。后续通过独立受授权 operation 读取/导出，由 W7 实现目录约束、路径与 hash 复核；broker 不直接打开调用方给出的路径。
 
 broker 为每次采集生成独立 UUID ArtifactRef，内容 hash 仅用于 blob 去重；不可变内部记录保留原 scope/action/attempt/operation/environment/generation。单次附件限额或累计 2 GiB 配额不足时，broker 保留返回 outcome 与 result 中的 workspace 引用，并设置 truncated。历史产物按原 scope 读取，失败和接管不自动删除。W7/W8 完整镜像与上述实际输入/导出能力分别交付，本 PR 的受控 helper 测试不冒充实际图形环境验收。
+
+## 独立 shell 监督与部署迁移
+
+`shell.exec` 的 start/query/stop/verify/export 由宿主 `ShellJobs` 处理。每个 job 先 fsync manifest，再由独立 systemd user service 启动 supervisor；exclusive claim 永久记录启动资格，丢回执或重启不重新执行。manifest 固定原 operation/attempt、scope、environment/generation/fencing、lease/workflow、image digest、截止和 boot ID。
+
+supervisor 在放行 argv 前设置 systemd 运行上限和日历截止 timer，并核对 conmon/payload 均在 job unit 的 cgroup 下。容器内的固定入口只等待 stdin 启动消息；不接收 permit、控制 socket、systemd bus 或私有回执。broker 崩溃不影响 job unit；supervisor 异常退出或被暂停后，systemd 仍可终止整个组。单调 timer 使用机器启动为固定原点的 OnBootSec，并通过 D-Bus 读回实际截止；排队耗时不续权。创建服务时的运行上限仅作附加保护；supervisor 同时检查墙钟与 BOOTTIME。
+
+停止 ACK 要求 unit 已停、记录的 cgroup 无进程、容器 Running=false/Pid=0。正常完成还要求 payload cgroup 为空、输出管道结束。`setsid`、double-fork 和新 PID namespace 都不能离开只读 cgroup 边界。输出最多为每 job 32 MiB，两环境合计最多预留 1 GiB；超额停止任务并保留已有输出。附件仍采用单次 16 MiB、存储总额 2 GiB 的既有限制。
+
+文件 verify 在 broker journal 中核对原 operation 存在且 scope/environment/workspace/attempt 匹配，返回 `verificationKind=current-file-state`。hash 证明核验时的文件内容；原操作引用提供身份关联，不自动证明文件由该命令造成。workspace 文件由固定宿主程序经 rootless `podman unshare` 逐级 openat/O_NOFOLLOW 读取，拒绝符号链接与非普通文件，不执行 workspace 中的代码。
+
+本变更增加两份宿主模块，必须随最终审定的 bootstrap bundle 一起安装。旧 `9fd7bae` staging 暂缓执行，不能仅导入新镜像配旧 broker。由协调 chat 汇总 W7/W8 宿主改动后制作一次性安装包；本分支不覆盖旧 staging 或执行生产安装。已安装环境升级前先停止 admission、核对所有旧 job 已结束；保留 journal/workspace/private 卷。旧 workspace `.kaguya-tools` 回执不作为新可信 manifest 导入，保留为历史文件。
 
 ## 自检与验收
 
@@ -84,6 +96,6 @@ python3 -B -m unittest discover -s scripts/linux-environments -p 'test_broker.py
 sudo /usr/bin/python3 -I bootstrap.py rollback --trusted-user andrew
 ```
 
-回退不要求安装时的空闲磁盘余量。先停止专用 broker，让它隔离容器；检查仍有运行容器时停止回退并保留网络边界。随后停用专用账户 linger、user manager 和 W6 网络单元。账户、subid、程序、两个存储镜像、mount unit、journal、工作区和产物全部保留，便于核对与恢复。回退不删除历史操作，不触碰 Kaguya 数据库；重新安装/启动后仍先隔离旧环境，再由宿主显式接管。
+回退不要求安装时的空闲磁盘余量。先停止专用 broker 并关闭自动化，停止独立 job unit/timer，再显式停止带本安装环境 label 的容器（包括桌面）；检查仍有运行容器时停止回退并保留网络边界。随后停用专用账户 linger、user manager 和 W6 网络单元。账户、subid、程序、两个存储镜像、mount unit、journal、工作区和产物全部保留，便于核对与恢复。回退不删除历史操作，不触碰 Kaguya 数据库；重新安装/启动后仍先隔离旧环境，再由宿主显式接管。
 
 若需最终卸载，应在确认产物已归档后单独安排；本脚本不删除账户、映射、挂载或存储镜像。

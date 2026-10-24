@@ -436,14 +436,24 @@ def rollback(user):
     account = pwd.getpwnam(ACCOUNT)
     if config["trustedUid"] != trusted.pw_uid or config["serviceUid"] != account.pw_uid:
         raise RuntimeError("rollback-identity-mismatch")
-    # broker stop 时隔离全部受管容器；停止失败则保留防火墙和用户 manager。
+    # broker 停止只隔离自动化并保留桌面；显式管理员回退另行停止独立 job 和桌面。
     active = run("systemctl", "is-active", f"user@{account.pw_uid}.service", check=False, capture=True)
     if active.returncode == 0 and Path("/etc/systemd/user/kaguya-tools-broker.service").exists():
         userctl(account.pw_uid, "disable", "--now", "kaguya-tools-broker.service")
+        userctl(account.pw_uid, "stop", "kaguya-job-*.service", "kaguya-job-*-expiry.timer")
     if (CONFIG / "storage.conf").exists():
-        result = run("runuser", "-u", ACCOUNT, "--", "env", f"XDG_RUNTIME_DIR=/run/user/{account.pw_uid}",
-                     "CONTAINERS_STORAGE_CONF=/etc/kaguya-tools/storage.conf",
-                     "podman", "ps", "-q", capture=True)
+        command = ("runuser", "-u", ACCOUNT, "--", "env", f"XDG_RUNTIME_DIR=/run/user/{account.pw_uid}",
+                   "CONTAINERS_STORAGE_CONF=/etc/kaguya-tools/storage.conf", "podman")
+        managed = run(*command, "ps", "--filter", "label=kaguya.environment", "--format", "{{.ID}}", capture=True)
+        for container in managed.stdout.split():
+            if not re.fullmatch(r"[a-f0-9]{12,64}", container):
+                raise RuntimeError("managed-container-identity-invalid")
+            run(*command, "kill", "--signal=KILL", container, check=False)
+            run(*command, "wait", container)
+            state = json.loads(run(*command, "inspect", container, capture=True).stdout)[0]["State"]
+            if state["Running"] or state.get("Pid", 0):
+                raise RuntimeError("rollback-container-stop-unconfirmed")
+        result = run(*command, "ps", "-q", capture=True)
         if result.stdout.strip():
             raise RuntimeError("containers-remain-network-boundary-retained")
     run("loginctl", "disable-linger", ACCOUNT)
