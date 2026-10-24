@@ -48,6 +48,7 @@
  */
 import {
   openServerMcp,
+  closeServerMcp,
   withServerMcp,
   registerMcpRoutes,
   withMcpKindRegistry,
@@ -335,7 +336,7 @@ export async function startKaguyaServer(
   const mcpOwners = new Set<McpHost>();
   const releaseMcp = async (host: McpHost | undefined) => {
     if (host) {
-      await host.close();
+      await closeServerMcp(host);
       mcpOwners.delete(host);
     }
   };

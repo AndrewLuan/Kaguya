@@ -1,0 +1,62 @@
+name: Linux tools image
+on:
+  push:
+    branches: ["codex/issue279-w7-**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-tools-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  shell:
+    name: shell image and rootless smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+      - name: Real subprocess helper contracts
+        run: |
+          node --test scripts/linux-tools/check-shell.mjs
+          python3 -B scripts/linux-tools/check_files.py
+      - name: Prepare pinned OCI builder
+        run: |
+          docker buildx create --name kaguya-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
+          docker buildx inspect --bootstrap
+      - name: Build fixed Linux amd64 OCI image
+        run: >-
+          docker buildx build --platform linux/amd64
+          --provenance=false --sbom=false
+          --file scripts/linux-tools/Dockerfile
+          --tag localhost/kaguya-shell:ci
+          --output type=oci,dest=shell-tools.oci
+          --metadata-file shell-image-metadata.json .
+      - name: Record archive and image identities
+        run: |
+          sha256sum shell-tools.oci > shell-tools.oci.sha256
+          node -e "const f=require('fs');const m=JSON.parse(f.readFileSync('shell-image-metadata.json'));f.writeFileSync('shell-image.digest',m['containerimage.digest']+'\n')"
+      - name: Rootless container using production W6 parameters
+        run: >-
+          python3 -B scripts/linux-tools/check-container.py
+          --archive shell-tools.oci --digest "$(cat shell-image.digest)"
+          > shell-container-receipt.json
+      - name: Show actual container diagnostics
+        if: always()
+        run: test ! -f shell-container-receipt.json || cat shell-container-receipt.json
+      - name: Preserve OCI archive, hashes and actual smoke receipt
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: shell-tools-${{ github.sha }}
+          path: |
+            shell-tools.oci
+            shell-tools.oci.sha256
+            shell-image.digest
+            shell-image-metadata.json
+            shell-container-receipt.json
+          retention-days: 7

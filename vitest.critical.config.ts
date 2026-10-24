@@ -25,6 +25,8 @@ const criticalTests = [
   "packages/runtime/src/native-tool-loop.test.ts",
   "packages/llm/src/client.test.ts",
   "packages/runtime/src/environment.test.ts",
+  "packages/runtime/src/linux-tools.test.ts",
+  "apps/server/src/linux-tools-host.test.ts",
   "packages/platform-adapters/src/napcat.test.ts",
   "packages/database/src/native-memory.test.ts",
   "packages/database/src/native-memory-revisions.test.ts",
