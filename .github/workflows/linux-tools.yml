@@ -155,6 +155,7 @@ jobs:
             gui-chromium.log
             gui-menu.png
             gui-menu-observation.json
+            gui-menu-state.json
           retention-days: 7
       - name: Preserve GUI image
         if: always()

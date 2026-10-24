@@ -6,10 +6,23 @@
  */
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import { CuaStdio } from "./cua-stdio.mjs";
 import { x11State } from "./gui-x11.mjs";
 const driver = new CuaStdio();
 const before = await x11State({ mode: "snapshot" });
+const exec = promisify(execFile);
+const menuState = async () =>
+  JSON.parse(
+    (
+      await exec("/usr/bin/python3", ["/opt/kaguya-tools/gui-menu-state.py"], {
+        timeout: 5000,
+        maxBuffer: 65536,
+      })
+    ).stdout,
+  );
 try {
   await driver.start();
   const input = async (name, args) => {
@@ -21,10 +34,29 @@ try {
     assert.notEqual(result.isError, true, JSON.stringify(result));
   };
   await input("hotkey", { keys: ["alt", "f8"] });
+  const previous = await menuState();
   await input("hotkey", { keys: ["alt", "f9"] });
+  const deadline = Date.now() + 10000;
+  let visible;
+  while (true) {
+    visible = await menuState();
+    if (
+      visible.mappedPopupWindows.some(
+        (id) => !previous.mappedPopupWindows.includes(id),
+      )
+    )
+      break;
+    if (Date.now() >= deadline) throw new Error("openbox-menu-not-mapped");
+    await delay(20);
+  }
+  await writeFile(
+    "/home/tool/gui-menu-state.json",
+    JSON.stringify({ previous, visible }),
+  );
   const menu = await driver.call("get_desktop_state", {
     max_image_dimension: 0,
   });
+  assert.notEqual(menu.isError, true);
   const image = menu.content?.find((item) => item.type === "image");
   assert.equal(image?.mimeType, "image/png");
   await writeFile("/home/tool/gui-menu.png", Buffer.from(image.data, "base64"));

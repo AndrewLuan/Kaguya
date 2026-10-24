@@ -60,12 +60,18 @@ try {
   );
   assert.notEqual(evidence.click.isError, true);
   const entry = (evidence.entry = await state("Count: 1"));
+  // bbc3865 原始窗口 PNG 中字段为 x303..641/y330..386。这个固定合成页面
+  // 用窗口像素路线建立真实 renderer 焦点；不把 AX 的 activate 当成文本焦点。
+  assert.equal(entry.structuredContent?.screenshot_width, 1050);
+  assert.equal(entry.structuredContent?.screenshot_height, 780);
   evidence.type = await driver.call(
     "type_text",
     {
       pid,
       window_id: windowId,
-      element_token: element(entry, "Browser unsaved text"),
+      x: 470,
+      y: 355,
+      coordinate_frame: "window",
       text: "W8 browser ASCII",
       delivery_mode: "foreground",
     },

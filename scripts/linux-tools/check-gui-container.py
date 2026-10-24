@@ -208,6 +208,7 @@ finally:
                                 ("/home/tool/gui-drain-unicode.json", "gui-drain-unicode.json"),
                                 ("/home/tool/gui-menu.png", "gui-menu.png"),
                                 ("/home/tool/gui-menu-observation.json", "gui-menu-observation.json"),
+                                ("/home/tool/gui-menu-state.json", "gui-menu-state.json"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
         if podman_unresponsive:
             break
