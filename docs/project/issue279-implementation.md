@@ -104,13 +104,13 @@ Sol 指 `gpt-6.1-sol`，Astra 指 `gpt-6-astra`。依赖规定技术顺序，所
 
 ### W6 rootless Podman 环境与租约
 
-**Owner / 依赖 / issue** — Astra；W3；[拟建环境 issue](./issue279-issues#w6-隔离环境与租约)。
+**Owner / 依赖 / issue** — Astra；W3；[#301](https://github.com/posanbu/Kaguya/issues/301)。
 
 **验收与状态** — 执行账户、环境/工作区归属、显式挂载/网络/凭据、持久目录、完整观察—操作—核对租约与 fencing、产物/接管。验证两 worker、过期持有者、失联/重启；取消保留产物。安装、隔离及恢复均待验收；管理员步骤由用户在 Linux 执行。
 
 ### W7 shell 与 Chromium
 
-**Owner / 依赖 / issue** — Sol；W5/W6（W4 经 W5 传递）；[拟建执行 issue](./issue279-issues#w7-shell-与-chromium)。
+**Owner / 依赖 / issue** — Sol；W5/W6（W4 经 W5 传递）；[#302](https://github.com/posanbu/Kaguya/issues/302)。
 
 **验收与状态** — 隔离环境实跑 shell 和 Chromium DOM/CDP，核对输出/退出码、页面/表单、下载与产物；覆盖超时、取消、重连、profile/工作区归属与租约。进程退出或页面加载不单独计任务成功。待实现验收。
 
@@ -140,7 +140,7 @@ Sol 指 `gpt-6.1-sol`，Astra 指 `gpt-6-astra`。依赖规定技术顺序，所
 
 ### W12 迁移、部署与回退
 
-**Owner / 依赖 / issue** — Sol 实施、Astra 审查；W11 及用户执行管理员脚本；[拟建部署 issue](./issue279-issues#w12-linux-部署)。
+**Owner / 依赖 / issue** — Sol 实施、Astra 审查；W11 及用户执行管理员脚本；[#304](https://github.com/posanbu/Kaguya/issues/304)。
 
 **验收与状态** — 备份/验证数据库和配置恢复点，审查增量迁移与 epoch，按获验收 main SHA 部署；核对 Runtime/PostgreSQL、模型/工具/环境/页面、重启及回退。主协调提供的生产快照是 `60b952a`、Kaguya/PostgreSQL active，本 session 未连服务器复核，新代码部署待验收。NapCat 由用户手动启动，不接管或重建登录。
 
