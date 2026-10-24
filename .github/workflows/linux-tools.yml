@@ -45,6 +45,9 @@ jobs:
           python3 -B scripts/linux-tools/check-container.py
           --archive shell-tools.oci --digest "$(cat shell-image.digest)"
           > shell-container-receipt.json
+      - name: Show actual container diagnostics
+        if: always()
+        run: test ! -f shell-container-receipt.json || cat shell-container-receipt.json
       - name: Preserve OCI archive, hashes and actual smoke receipt
         if: always()
         uses: actions/upload-artifact@v6

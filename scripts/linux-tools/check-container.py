@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import traceback
 import time
 import uuid
 
@@ -27,6 +29,14 @@ def main():
     spec.loader.exec_module(broker)
     backend = broker.PodmanBackend()
     backend.env = {k: v for k, v in os.environ.items() if k in ("HOME", "PATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")}
+    def diagnostic_command(*command, timeout=30):
+        result = subprocess.run(["/usr/bin/podman", *command], env=backend.env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        if result.returncode:
+            print(json.dumps({"podmanCommand": command, "exitCode": result.returncode, "stderr": result.stderr.decode(errors="replace")}), flush=True)
+            raise broker.BrokerError("podman-command-failed")
+        return result.stdout
+    backend.command = diagnostic_command
     info = json.loads(backend.command("info", "--format=json"))
     assert info["host"]["security"]["rootless"] is True and info["host"]["cgroupVersion"] == "v2"
     backend.command("load", "--input", str(Path(args.archive).resolve()), timeout=300)
@@ -64,6 +74,25 @@ def main():
                               "container": json.loads(backend.command("inspect", env["container"]))}), flush=True)
             raise AssertionError("actual namespace job did not exit successfully")
         assert state["uid"] == 1000
+        isolation_code = """const f=require('fs'),a=require('assert');
+a.equal(f.existsSync('/home/tool/kaguya-tools.sock'),false);
+a.equal(f.existsSync('/proc/1/root/home/tool/kaguya-tools.sock'),false);
+a.deepEqual(f.readdirSync('/workspace/.kaguya-tools'),[]);
+for(const d of f.readdirSync('/proc/self/fd')){try{a.equal(f.readlinkSync('/proc/self/fd/'+d).includes('.kaguya-tools'),false)}catch(e){if(e.code!=='ENOENT')throw e}}
+f.writeFileSync('isolation.json',JSON.stringify({uid:process.getuid(),pid:f.readlinkSync('/proc/self/ns/pid'),net:f.readlinkSync('/proc/self/ns/net')}));"""
+        isolated = operation("start", argv=["/usr/local/bin/node", "-e", isolation_code], cwd=".", env={})
+        limit = time.monotonic() + 10
+        while True:
+            isolation_job = operation("query", jobId=isolated["result"]["jobId"])["result"]
+            if isolation_job["state"] in ("exited", "unknown", "stopped"):
+                break
+            assert time.monotonic() < limit
+            time.sleep(0.02)
+        assert isolation_job["state"] == "exited" and isolation_job["exitCode"] == 0, isolation_job
+        import base64
+        isolated_state = json.loads(base64.b64decode(operation("export", path="isolation.json", mime="application/json")["artifacts"][0]["dataBase64"]))
+        assert isolated_state["pid"] != backend.command("exec", env["container"], "/usr/bin/readlink", "/proc/1/ns/pid").decode().strip()
+        assert isolated_state["net"] != backend.command("exec", env["container"], "/usr/bin/readlink", "/proc/1/ns/net").decode().strip()
         original = {k: start["result"][k] for k in ("operationId", "attemptId")}
         verified = operation("verify", path="marker", original=original)["result"]
         assert verified["sha256"] == hashlib.sha256(b"actual-container").hexdigest()
@@ -74,15 +103,35 @@ def main():
         persisted = operation("verify", path="marker", original=original)["result"]
         assert persisted["sha256"] == verified["sha256"]
         print(json.dumps({"rootless": True, "uid": state["uid"], "podman": info["version"], "imageDigest": args.digest,
-                          "archiveSha256": hashlib.sha256(Path(args.archive).read_bytes()).hexdigest(), "generationRecovery": True, "verified": verified}))
+                          "archiveSha256": hashlib.sha256(Path(args.archive).read_bytes()).hexdigest(), "generationRecovery": True,
+                          "sandbox": isolated_state, "verified": verified}))
     finally:
+        primary = sys.exc_info()[0] is not None
+        if primary:
+            traceback.print_exc()
+        failures = []
         for container in containers:
             try:
                 backend.isolate(container)
-            finally:
+            except Exception as error:
+                failures.append(error)
+            try:
                 backend.command("rm", "--force", container["container"])
+            except Exception as error:
+                failures.append(error)
         volume = "kaguya-workspace-" + broker.digest(key)[:24]
-        backend.command("volume", "rm", volume)
+        exists = subprocess.run(["/usr/bin/podman", "volume", "exists", volume], env=backend.env)
+        if exists.returncode == 0:
+            try:
+                backend.command("volume", "rm", volume)
+            except Exception as error:
+                failures.append(error)
+        elif exists.returncode != 1:
+            failures.append(RuntimeError("volume-existence-unconfirmed"))
+        if failures:
+            print(json.dumps({"cleanupFailures": [str(error) for error in failures]}), flush=True)
+            if not primary:
+                raise ExceptionGroup("CI environment cleanup failed", failures)
 
 
 if __name__ == "__main__":

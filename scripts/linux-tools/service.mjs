@@ -10,7 +10,14 @@ import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
-import { constants, openSync, closeSync, readlinkSync } from "node:fs";
+import {
+  constants,
+  openSync,
+  closeSync,
+  readlinkSync,
+  createWriteStream,
+} from "node:fs";
+import { finished } from "node:stream/promises";
 import {
   mkdir,
   lstat,
@@ -350,6 +357,7 @@ export class ToolService {
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
+            "--unshare-net",
             "--die-with-parent",
             "--new-session",
             "--json-status-fd",
@@ -386,11 +394,25 @@ export class ToolService {
         env,
         detached: true,
         stdio: this.sandbox
-          ? ["ignore", out, err, "pipe"]
-          : ["ignore", out, err],
+          ? ["ignore", "pipe", "pipe", "pipe"]
+          : ["ignore", "pipe", "pipe"],
       });
       const completion = Promise.withResolvers();
       const running = { child, record, completion, stopping: false };
+      const output = createWriteStream(stdout, { fd: out, autoClose: true });
+      out = undefined;
+      const errors = createWriteStream(stderr, { fd: err, autoClose: true });
+      err = undefined;
+      running.logs = Promise.all(
+        [finished(output), finished(errors)].map((p) =>
+          p.catch(() => {
+            running.error = "output-unconfirmed";
+            void this.stopTree(running, running.error);
+          }),
+        ),
+      );
+      child.stdout.pipe(output);
+      child.stderr.pipe(errors);
       if (this.sandbox) {
         let status = "";
         child.stdio[3].on("data", (data) => {
@@ -457,6 +479,7 @@ export class ToolService {
   }
   async finish(running, code, signal) {
     clearTimeout(running.timer);
+    await running.logs;
     const r = running.record;
     // 直属父进程退出后也清理仍存活的同组后代，禁止孤儿继续产生副作用。
     try {
