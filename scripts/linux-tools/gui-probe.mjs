@@ -6,11 +6,32 @@
  */
 import { mkdir, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { CuaStdio } from "./cua-stdio.mjs";
 await mkdir("/home/tool/runtime", { mode: 0o700, recursive: true });
 const driver = new CuaStdio();
 const evidence = {};
+const text = (result) =>
+  result.content
+    ?.filter((c) => c.type === "text")
+    .map((c) => c.text)
+    .join("\n") ?? "";
+const element = (result, name) => {
+  const rows = text(result);
+  const snapshot = /snapshot_id=([^\s]+)/.exec(rows)?.[1];
+  const row = rows.split("\n").find((line) => line.includes('"' + name + '"'));
+  const index = /\[(\d+)\]/.exec(row ?? "")?.[1];
+  assert.ok(snapshot && index, "fixture-element-token-missing");
+  return `${snapshot}:${index}`;
+};
 try {
+  const wish = spawnSync("wish", [], { env: { PATH: "/opt/cua/helpers" } });
+  assert.equal(
+    wish.error?.code,
+    "ENOENT",
+    "trusted-driver-must-not-resolve-wish",
+  );
+  evidence.wishExcluded = true;
   const discovery = (evidence.discovery = await driver.start());
   const windows = (evidence.windows = await driver.call("list_windows", {}));
   assert.notEqual(windows.isError, true);
@@ -22,8 +43,8 @@ try {
     max_image_dimension: 0,
   }));
   assert.notEqual(window.isError, true);
-  assert.match(JSON.stringify(window), /Unsaved text/);
-  assert.match(JSON.stringify(window), /Increment once/);
+  assert.match(text(window), /Unsaved text/);
+  assert.match(text(window), /Increment once/);
   const desktop = (evidence.desktop = await driver.call("get_desktop_state", {
     max_image_dimension: 0,
   }));
@@ -36,6 +57,43 @@ try {
     assert.ok(bytes.readUInt32BE(16) > 0 && bytes.readUInt32BE(16) <= 1280);
     assert.ok(bytes.readUInt32BE(20) > 0 && bytes.readUInt32BE(20) <= 800);
   }
+  const windowId = Number(/window_id=(\d+)/.exec(text(window))?.[1]);
+  assert.ok(windowId > 0);
+  const buttonState = await driver.call("get_window_state", {
+    pid,
+    window_id: windowId,
+  });
+  const click = (evidence.click = await driver.call(
+    "click",
+    {
+      pid,
+      window_id: windowId,
+      element_token: element(buttonState, "Increment once"),
+    },
+    () => assert.equal(process.getuid(), 1000),
+  ));
+  assert.notEqual(click.isError, true);
+  const entryState = await driver.call("get_window_state", {
+    pid,
+    window_id: windowId,
+  });
+  const typed = (evidence.typed = await driver.call(
+    "type_text",
+    {
+      pid,
+      window_id: windowId,
+      element_token: element(entryState, "Unsaved text"),
+      text: "W8 暂存",
+      delivery_mode: "foreground",
+    },
+    () => assert.equal(process.getuid(), 1000),
+  ));
+  assert.notEqual(typed.isError, true);
+  evidence.after = await driver.call("get_window_state", {
+    pid,
+    window_id: windowId,
+  });
+  assert.match(text(evidence.after), /W8 暂存/);
   console.log(
     JSON.stringify({
       driver: driver.identity(),

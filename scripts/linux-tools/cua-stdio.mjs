@@ -30,7 +30,8 @@ export class CuaStdio {
         detached: true,
         stdio: ["pipe", "pipe", "pipe"],
         env: {
-          PATH: "/usr/local/bin:/usr/bin:/bin",
+          // 固定源码 type_text 的 Tk fallback 会 Command::new("wish")；绝不让其以控制 UID 启动。
+          PATH: "/opt/cua/helpers",
           HOME: "/home/tool",
           DISPLAY: ":99",
           DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/kaguya-app/session/bus",

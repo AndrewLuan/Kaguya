@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -60,13 +61,20 @@ try:
     assert all(not caps for caps in oci["process"]["capabilities"].values())
     assert oci["root"]["readonly"] is True
     command("exec", "--detach", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
-    until(["exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
+    address_result = until(["exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
+    address = re.search(r'string "([^"]+)"', address_result.decode()).group(1)
+    assert address.startswith("unix:path=/run/kaguya-app/session/at-spi/")
+    command("exec", name, "/usr/bin/dbus-send", "--bus=" + address, "--print-reply", "--dest=org.freedesktop.DBus", "/", "org.freedesktop.DBus.ListNames")
+    print(json.dumps({"controlUid": 1000, "appUid": 1001, "atspiAddress": address, "bothBusesConnected": True}), flush=True)
     command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-fixture.py")
     until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/session/gui-ledger.json"])
     ledger = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
     assert ledger["uid"] == 1001
     probe = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"]), timeout=120)
     print(probe.stdout.decode(), flush=True)
+    after = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
+    assert after == {"uid": 1001, "pid": ledger["pid"], "text": "W8 暂存", "count": 1}, after
+    print(json.dumps({"independentApplicationLedger": after}), flush=True)
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
     Path("gui-packages.txt").write_bytes(command("exec", name, "/bin/cat", "/usr/share/kaguya-gui-packages.txt").stdout)
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
@@ -81,6 +89,11 @@ finally:
                 Path(destination).write_bytes(value.stdout)
         except Exception as error:
             cleanup_errors.append(error)
+    try:
+        app_logs = command("exec", "--user=1001:1001", name, "/usr/bin/tail", "-c", "65536", "/home/app/session/session.log", check=False)
+        print(app_logs.stdout.decode(errors="replace"), flush=True)
+    except Exception as error:
+        cleanup_errors.append(error)
     try:
         logs = command("logs", name, check=False)
         print(logs.stdout.decode(errors="replace"), flush=True)

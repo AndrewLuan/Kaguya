@@ -12,12 +12,17 @@ import time
 
 if os.getuid() != 1001:
     raise RuntimeError("gui-app-uid-required")
-for directory, mode in [("/home/app/session", 0o700), ("/run/kaguya-app/session", 0o711)]:
+for directory, mode in [("/home/app/session", 0o700), ("/run/kaguya-app/session", 0o711),
+                        ("/run/kaguya-app/session/at-spi", 0o711)]:
     path = Path(directory)
     path.mkdir(mode=mode, exist_ok=True)
     info = path.lstat()
     if path.is_symlink() or info.st_uid != 1001 or info.st_mode & 0o022:
         raise RuntimeError("unsafe-app-session-directory")
+log = os.open("/home/app/session/session.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+os.dup2(log, 1)
+os.dup2(log, 2)
+os.close(log)
 os.environ.update(HOME="/home/app/session", DISPLAY=":99", XDG_RUNTIME_DIR="/run/kaguya-app/session",
                   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/kaguya-app/session/bus",
                   GTK_MODULES="gail:atk-bridge", NO_AT_BRIDGE="0", GTK_A11Y="always")
