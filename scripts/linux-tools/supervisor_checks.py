@@ -12,12 +12,31 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
 from broker import Broker, BrokerError, PodmanBackend, digest
 from job_runner import container_command, payload_empty, read_gate
 from shell_jobs import read_json
+
+
+def cleanup_all(actions):
+    primary = sys.exc_info()[1]
+    errors = []
+    for action in actions:
+        try:
+            action()
+        except Exception as error:
+            errors.append(error)
+    if errors:
+        raise BaseExceptionGroup("supervisor probe cleanup failed", ([primary] if primary else []) + errors)
+
+
+def stop_process(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
 
 
 def wait_until(read, predicate, seconds=15):
@@ -41,10 +60,10 @@ def terminal(operation, job_id):
     return wait_until(lambda: operation("query", jobId=job_id)["result"], lambda r: r["state"] in ("exited", "stopped", "unknown"))
 
 
-def request(env, mode="start", ttl=30, **args):
+def request(environment, mode="start", ttl=30, **args):
     op = uuid.uuid4().hex
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
-    ref = {"environmentId": env["environmentId"], "generation": env["generation"], "fencing": "1", "leaseId": "lease", "workflowId": "flow"}
+    ref = {"environmentId": environment["environmentId"], "generation": environment["generation"], "fencing": "1", "leaseId": "lease", "workflowId": "flow"}
     return {"environment": ref, "scope": "ci", "operationId": op, "attemptId": op, "digest": op,
             "deadline": expiry, "toolName": "shell.exec", "arguments": {"mode": mode, **args},
             "permit": {**ref, "operationId": op, "attemptId": op, "digest": op, "expiresAt": expiry}}
@@ -86,13 +105,8 @@ int OSSL_provider_init(void *h,const Dispatch *in,const Dispatch **out,void **ct
         assert base64.b64decode(result["dataBase64"]) == b"after-release"
         print(json.dumps({"gateProvider": {"withheldRunEffects": 0, "releasedProviderLoaded": True, "jobEnvironmentCorrect": True}}), flush=True)
     finally:
-        backend.stop_container(record["container"])
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait(timeout=5)
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if stream:
-                stream.close()
+        cleanup_all([lambda: backend.stop_container(record["container"]), lambda: stop_process(proc),
+                     *[stream.close for stream in (proc.stdin, proc.stdout, proc.stderr) if stream]])
 
 
 def check_deadlines(backend, env, operation):
@@ -121,16 +135,18 @@ while True: time.sleep(1)
     result = operation("query", jobId=start["jobId"])["result"]
     assert result["state"] == "stopped" and result["reason"] == "permit-expired", result
     print(json.dumps({"supervisorStoppedDeadline": {"manifestDeadline": record["permitExpiresAt"], "groups": running, "result": result}}), flush=True)
-    # 模拟已排队但到期后才得到 CPU 的 supervisor：真实入口必须在创建容器前拒绝。
-    req = request(env, ttl=1, argv=["/bin/sh", "-c", "echo bad > expired-before-start"], cwd=".", env={})
+    # 真实 transient unit 在 ExecStartPre 中排队，旧许可到期后 supervisor 才启动。
+    # 延时仅用于制造业务截止场景；等待结果仍观察 unit 终态，不固定休眠猜测完成。
+    req = request(env, ttl=2, argv=["/bin/sh", "-c", "echo bad > expired-before-start"], cwd=".", env={})
     path, record, _ = backend.shell.prepare(env, req, backend.shell.check(env, req))
-    wait_until(time.time, lambda value: value >= record["expires"], 3)
-    runner = Path(__file__).resolve().parent.parent / "linux-environments/job_runner.py"
-    delayed = subprocess.run(["/usr/bin/python3", "-I", str(runner), str(path)], env=backend.env,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-    assert delayed.returncode != 0 and b"job-expired-before-launch" in delayed.stderr
+    delayed = backend.shell.unit_command(path, record)
+    delayed.insert(2, "--property=ExecStartPre=/usr/bin/sleep 3")
+    backend.shell.system(*delayed, check=False)
+    wait_until(lambda: backend.shell.properties(record["unit"]), lambda p: p.get("ActiveState") in ("inactive", "failed"), 8)
     assert not (path / "claimed").exists() and not exists(backend, env, "expired-before-start")
-    print(json.dumps({"expiredBeforeLaunchEffects": 0}), flush=True)
+    journal = subprocess.check_output(["/usr/bin/journalctl", "--user", "-u", record["unit"], "--no-pager"], env=backend.env)
+    assert b"job-expired-before-launch" in journal
+    print(json.dumps({"expiredBeforeLaunchEffects": 0, "queuedUnitDeadline": record["permitExpiresAt"]}), flush=True)
 
 
 def check_broker_crash(parent_backend, image, root):
@@ -173,26 +189,26 @@ def check_broker_crash(parent_backend, image, root):
         assert base64.b64decode(backend.shell.workspace_read(env, "once", time.time() + 10, length=100)["dataBase64"]) == b"1"
         for name, data in immutable.items():
             assert (state / "journal" / name).read_bytes() == data
+        before_replay = {p.name: p.read_bytes() for p in (state / "journal").glob("*.json")}
         try:
             broker.execute({**message["request"], "environment": binding["environment"], "token": binding["token"]})
             raise AssertionError("old operation reexecuted")
-        except BrokerError:
-            pass
+        except BrokerError as error:
+            assert str(error) == "operation-conflict", str(error)
+        assert {p.name: p.read_bytes() for p in (state / "journal").glob("*.json")} == before_replay
+        assert base64.b64decode(backend.shell.workspace_read(env, "once", time.time() + 10, length=100)["dataBase64"]) == b"1"
         print(json.dumps({"brokerCrash": {"groups": running, "deadline": record["permitExpiresAt"], "recoveredGeneration": recovered["generation"],
                                            "originalOutcome": "unknown", "effectCount": 1, "desktopPidPreserved": True}}), flush=True)
     finally:
-        if child.poll() is None:
-            child.kill()
-        child.wait(timeout=5)
-        for stream in (child.stdin, child.stdout, child.stderr):
-            stream.close()
+        actions = [lambda: stop_process(child), *[stream.close for stream in (child.stdin, child.stdout, child.stderr)]]
         if broker:
-            broker.close()
+            actions.append(broker.close)
         for path, record in backend.shell.records(env):
-            backend.shell.stop(path, record, "ci-cleanup")
-            backend.command("rm", "--force", "--ignore", record["container"])
-        backend.stop_container(env["container"])
-        backend.command("rm", "--force", "--ignore", env["container"])
+            actions.append(lambda p=path, r=record: backend.shell.stop(p, r, "ci-cleanup"))
+            actions.append(lambda r=record: backend.command("rm", "--force", "--ignore", r["container"]))
+        actions.extend([lambda: backend.stop_container(env["container"]),
+                        lambda: backend.command("rm", "--force", "--ignore", env["container"])])
         for prefix in ("kaguya-workspace-", "kaguya-private-"):
-            backend.command("volume", "rm", "--force", prefix + digest(key)[:24])
-        backend.shell.system("/usr/bin/systemctl", "--user", "stop", backend.shell.slice(env), check=False)
+            actions.append(lambda p=prefix: backend.command("volume", "rm", "--force", p + digest(key)[:24]))
+        actions.append(lambda: backend.shell.system("/usr/bin/systemctl", "--user", "stop", backend.shell.slice(env)))
+        cleanup_all(actions)

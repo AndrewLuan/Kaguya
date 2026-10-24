@@ -138,7 +138,8 @@ def run(path):
                     write_json(path / "running.json", {"pidNamespace": os.readlink(f"/proc/{pid}/ns/pid"),
                                                        "payloadGroup": payload_group, "unitGroup": group,
                                                        "conmonGroup": conmon_group, "containerId": info["Id"],
-                                                       "supervisorPid": os.getpid(), "deadlineArmed": True})
+                                                       "supervisorPid": os.getpid(), "deadlineArmed": True,
+                                                       "armedMonotonicDeadline": armed_deadline, "timerUnit": expiry_unit + ".timer"})
                     proc.stdin.write(b"run\n")
                     proc.stdin.close()
                     break

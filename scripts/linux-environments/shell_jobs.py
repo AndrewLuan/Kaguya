@@ -313,7 +313,7 @@ class ShellJobs:
         write_json(path / "manifest.json", record, exclusive=True)
         return path, record, False
 
-    def launch(self, path, record):
+    def unit_command(self, path, record):
         expires = record["expires"]
         left = min(expires - time.time(), record["monotonicDeadline"] - time.monotonic())
         if left <= 0:
@@ -325,7 +325,11 @@ class ShellJobs:
                    "--property=TimeoutStopSec=5s", "--property=RuntimeMaxSec=" + str(left) + "s",
                    "--property=UMask=0077", "--property=StandardOutput=null", "--property=StandardError=journal"]
         command += ["--setenv=" + k + "=" + v for k, v in self.backend.env.items()]
-        self.system(*command, "/usr/bin/python3", "-I", runner, str(path))
+        return [*command, "/usr/bin/python3", "-I", runner, str(path)]
+
+    def launch(self, path, record):
+        expires = record["expires"]
+        self.system(*self.unit_command(path, record))
         end = min(expires, time.time() + 20)
         while time.time() < end:
             if (path / "running.json").exists() or (path / "receipt.json").exists():
@@ -365,6 +369,12 @@ class ShellJobs:
             self.backend.command("rm", "--force", record["container"])
         if not self.stopped(record):
             raise BrokerError("job-isolation-unconfirmed")
+        expiry = record["unit"].removesuffix(".service") + "-expiry"
+        for unit in (expiry + ".timer", expiry + ".service"):
+            self.system("/usr/bin/systemctl", "--user", "stop", unit, check=False)
+            if self.properties(unit).get("ActiveState") not in ("inactive", "failed"):
+                raise BrokerError("deadline-unit-cleanup-unconfirmed")
+        self.system("/usr/bin/systemctl", "--user", "reset-failed", record["unit"], expiry + ".service", check=False)
 
     def stopped(self, record):
         if not self.unit_empty(record):
@@ -386,8 +396,6 @@ class ShellJobs:
                 raise BrokerError("job-isolation-unconfirmed")
             time.sleep(0.02)
         self.retire(path, record)
-        self.system("/usr/bin/systemctl", "--user", "stop",
-                    record["unit"].removesuffix(".service") + "-expiry.timer", check=False)
         if not (path / "receipt.json").exists():
             self.finalize(path, record, "stopped", reason)
 
