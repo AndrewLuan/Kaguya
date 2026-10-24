@@ -1,11 +1,11 @@
 ---
 title: 持续 Agent 实施 issue 映射与草稿
-description: issue 279 的已有追踪承接及六个待建实施 issue 草稿。
+description: issue 279 的已有追踪、六个已发布实施 issue 及待更新的 Lifecycle 正文。
 ---
 
 # 持续 Agent 实施 issue 映射与草稿
 
-本页承接[实施台账](./issue279-implementation)。新 issue 尚未创建，已有 issue 的调整尚未发布。以下正文是可审查的紧凑草稿；主协调发布时补入实际依赖编号，各工作包推进时再细化接口。所有草稿沿用台账的公共验收、迁移/回退、最新 head CI 和 PR 审查门槛。
+本页承接[实施台账](./issue279-implementation)。六个实施 issue 已发布为 #299–#304，以下保留经审查的紧凑正文与编号映射。#193 更新返回 403，现有标题、正文和状态均保持，待有权限维护者采用末节草稿；其他已有 issue 状态保持。各工作包推进时再细化接口。所有草稿沿用台账的公共验收、迁移/回退、最新 head CI 和 PR 审查门槛。
 
 ## 已有 issue 映射
 
@@ -21,6 +21,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 
 ## W4：Heavy 原生工具循环
 
+**实施 issue** — [#299](https://github.com/posanbu/Kaguya/issues/299)。
+
 **标题** — 实现 Heavy 原生工具循环与持久化调用结果。
 
 **正文草稿** — 父追踪 #279，Owner Astra，依赖 W3/#249，Memory 工具接 W2/#248。当前专用 recall 和原生历史尚未提供通用工具执行链。本项复用行动执行器，接通原生声明、参数校验、call/result、call ID、usage 与多步继续推理；提供受 scope/来源/修订约束的 Memory 查询、阅读、更正和经历回看。工具声明区分权限、版本、并行/串行、取消、幂等及结果核对；长任务独立于单次模型请求。
@@ -28,6 +30,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 **验收** — 覆盖多步/并行/有序、失败/不支持/预算、取消/迟到、重启和模型切换，原生历史裁剪保留完整配对。真实模型协议按获配额请求单独验收。迁移明确旧 recall 承接，停新领取后排空，保留调用/结果/unknown，不重复执行；满足台账公共门槛。
 
 ## W5：MCP 客户端
+
+**实施 issue** — [#300](https://github.com/posanbu/Kaguya/issues/300)。
 
 **标题** — 接入 MCP stdio 与 Streamable HTTP，统一 tools、resources 和 prompts。
 
@@ -37,6 +41,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 
 ## W6：隔离环境与租约
 
+**实施 issue** — [#301](https://github.com/posanbu/Kaguya/issues/301)。
+
 **标题** — 建立 rootless Podman 执行环境、资源租约与用户接管。
 
 **正文草稿** — 父追踪 #279，Owner Astra，依赖 W3。目标 Linux 执行前复核 rootless 前置，系统安装整合为用户亲自执行的一份已审查幂等脚本。环境服务拥有执行账户、workspace/environment ID、scene/任务归属、固定镜像、显式挂载/网络/凭据、资源限额、持久目录及产物。租约覆盖完整观察—操作—核对，使用 fencing；浏览器/profile、桌面和账号独占分别声明。默认不授予宿主用户目录、真实桌面或 NapCat。
@@ -44,6 +50,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 **验收** — Linux 实测身份/隔离/持久恢复、两 worker 竞争、过期旧持有者、失联及用户接管。接管停止自动输入，恢复前重新观察；取消保留产物。回退停止新任务与租约并排空，保留审计，不删除既有容器/卷/数据库；满足台账公共门槛。
 
 ## W7：shell 与 Chromium
+
+**实施 issue** — [#302](https://github.com/posanbu/Kaguya/issues/302)。
 
 **标题** — 在隔离环境接入 shell 与 Chromium DOM/CDP 工具。
 
@@ -53,6 +61,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 
 ## W8：隔离 GUI 与视觉
 
+**实施 issue** — [#303](https://github.com/posanbu/Kaguya/issues/303)。
+
 **标题** — 接入隔离 GUI 与视觉模型，验证截图、输入及用户接管。
 
 **正文草稿** — 父追踪 #279，Owner Astra，依赖 W5/W6，仅共用浏览器场景依赖 W7。在 rootless 隔离桌面准备合成应用，记录显示身份、分辨率、输入坐标；截图绑定时间、尺寸、环境与租约。获具体配额后探测授权模型的真实图像输入，再接通截图→模型→输入→核对。截图过期、环境变化或接管使旧操作失效；取消不撤销已发生点击/键盘输入，失联后重新观察。
@@ -60,6 +70,8 @@ description: issue 279 的已有追踪承接及六个待建实施 issue 草稿�
 **验收** — 实际隔离 GUI 完成合成任务，以前后截图和应用状态核对；真实视觉请求保存模型/协议/usage，与文本替身分别报告。覆盖旧截图、窗口变化、并发、接管、取消和恢复。停用先停止输入并保留媒体/产物，不控制宿主桌面/NapCat；视觉受阻交主协调决定，满足台账公共门槛。
 
 ## W12：Linux 部署
+
+**实施 issue** — [#304](https://github.com/posanbu/Kaguya/issues/304)。
 
 **标题** — 部署持续 Agent 能力底座到 Linux，完成迁移、恢复与回退验收。
 

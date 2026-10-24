@@ -60,7 +60,7 @@ flowchart TB
 - **D6 Tools/MCP 接口 → W3/W4/W5** — 专用 recall 已有；统一发现/权限、主动与自动使用、长任务、两种 transport、tools/resources/prompts 和结果恢复待验收。
 - **D7 Computer Use 环境 → W6/W7/W8/W12** — 首版为 Linux rootless Podman，分别验证 shell、Chromium DOM/CDP、隔离 GUI/视觉、租约、产物与接管，均待验收；VM/其他平台另议。
 - **D8 代表性原型/重放 → W11** — 既有局部回归不替代本计划贯穿结果；多人案例、真实 PostgreSQL、浏览器、GUI、模型效果与开销待分层验收。
-- **D9 设计记录与实施拆分 → W0–W12** — 本页及 issue 草稿待审；实现交付逐包补入实际 SHA/PR/CI/迁移/部署证据，计划本身不计功能完成。
+- **D9 设计记录与实施拆分 → W0–W12** — 台账已由主协调审查，实施 issue 已分发，#193 正文调整待有权限维护者发布；实现交付逐包补入实际 SHA/PR/CI/迁移/部署证据，计划本身不计功能完成。
 
 ## 工作包台账
 
@@ -70,7 +70,7 @@ Sol 指 `gpt-6.1-sol`，Astra 指 `gpt-6-astra`。依赖规定技术顺序，所
 
 **Owner / 依赖 / issue** — Sol；无代码前置；#279。
 
-**验收与状态** — 核对基线、九项交付、路线与实施映射，完成文档检查、本地提交及主协调审查。原分支 `feat/memory-graph-management` 的 `2395dcf6` 是已 squash 合入 #283 的 head，保留原分支；同一 checkout 已安全切至更新 main，再建立单个短期 W0 分支。文档待审，本轮不推送、建 issue、评论或部署。
+**验收与状态** — 核对基线、九项交付、路线与实施映射，完成文档检查、本地提交及主协调审查。原分支 `feat/memory-graph-management` 的 `2395dcf6` 是已 squash 合入 #283 的 head，保留原分支；同一 checkout 已安全切至更新 main，再建立单个短期 W0 分支。台账内容已由主协调审查，本轮交付范围为文档及 GitHub 分发，不进行功能开发、模型调用或部署。上游账号无 push/triage 权限；采用已获授权的同账号远端 fork 提 PR，唯一 checkout 与原 origin 保留。
 
 ### W1 公共契约与持久观察
 
@@ -92,13 +92,13 @@ Sol 指 `gpt-6.1-sol`，Astra 指 `gpt-6-astra`。依赖规定技术顺序，所
 
 ### W4 Heavy 原生工具循环
 
-**Owner / 依赖 / issue** — Astra；W3，Memory 工具接 W2；[拟建 Heavy issue](./issue279-issues#w4-heavy-原生工具循环)。
+**Owner / 依赖 / issue** — Astra；W3，Memory 工具接 W2；[#299](https://github.com/posanbu/Kaguya/issues/299)。
 
 **验收与状态** — 原生工具声明/call/result、持久 call ID、usage、长任务、多步/并行/有序、预算、取消/重启及不支持分支。Memory 查询/阅读/更正/经历回看复用范围接口，历史裁剪保留完整配对。现有专用 recall/原生历史可复用，通用循环及真实协议效果待验收。
 
 ### W5 MCP 接入
 
-**Owner / 依赖 / issue** — Sol；W3/W4；[拟建 MCP issue](./issue279-issues#w5-mcp-客户端)。
+**Owner / 依赖 / issue** — Sol；W3/W4；[#300](https://github.com/posanbu/Kaguya/issues/300)。
 
 **验收与状态** — stdio、Streamable HTTP 的 tools/resources/prompts，含发现/分页、认证引用、连接/进程、取消/重连/卸载。内容保留来源、scope 和预算；错误及 unknown 回写同一行动链，重连不盲重发。resources 首版按需 list/templates/read；resource subscriptions、elicitation、MCP tasks、自动 OAuth 授权暂缓，对外 MCP 服务端另议。待实现验收。
 
@@ -116,7 +116,7 @@ Sol 指 `gpt-6.1-sol`，Astra 指 `gpt-6-astra`。依赖规定技术顺序，所
 
 ### W8 隔离 GUI 与视觉
 
-**Owner / 依赖 / issue** — Astra；W5/W6，仅共用浏览器场景依赖 W7；[拟建 GUI issue](./issue279-issues#w8-隔离-gui-与视觉)。
+**Owner / 依赖 / issue** — Astra；W5/W6，仅共用浏览器场景依赖 W7；[#303](https://github.com/posanbu/Kaguya/issues/303)。
 
 **验收与状态** — 隔离桌面、真实截图/图像输入、坐标/键盘、画面时效、连续租约和用户接管；以合成应用前后状态核对副作用。环境变化/接管使旧操作失效。视觉模型待能力探测，完整链待验收；文本替身不计视觉成功，受阻交主协调决定。
 
