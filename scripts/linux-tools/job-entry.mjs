@@ -1,9 +1,42 @@
-/** 功能概述：在 bubblewrap 最终 namespace 内、真正启动命令前核对固定 permit 截止时间。
- * 代码库关系：service.mjs 传入已绑定操作的截止值和 argv；环境/文件视图由外层 sandbox 固定。
- * 输入输出与副作用：仅启动一次指定命令，继承隔离后的 stdio；许可过期退出且不运行用户命令。 */
-import { spawn } from 'node:child_process';
-const [expiry, command, ...args] = process.argv.slice(2);
-if (!Number.isFinite(Number(expiry)) || Number(expiry) <= Date.now()) process.exit(125);
-const child = spawn(command, args, { stdio: 'inherit' });
-child.once('error', () => { process.exitCode = 126; });
-child.once('exit', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 126); });
+/**
+ * 功能概述：独立 shell 容器内的启动门，不持有 permit、回执或控制 socket。
+ * 主要职责：等待宿主 supervisor 核对截止与 cgroup 后发送 run，再执行绝对 argv。
+ * 代码库关系：job_runner.py 经 Podman stdin 放行；容器 init 退出会清理整个 PID namespace。
+ * 输入输出与副作用：cwd 为 workspace 相对目录，stdout/stderr 仅为管道；子进程退出即退出。
+ */
+import { spawn } from "node:child_process";
+import { constants, openSync, closeSync } from "node:fs";
+const [cwd, command, ...args] = process.argv.slice(2);
+let input = "";
+process.stdin.on("data", (data) => {
+  input += data;
+  if (input.length > 4) process.exit(125);
+});
+process.stdin.on("end", () => {
+  if (input !== "run\n" || !command?.startsWith("/")) process.exit(125);
+  let fd = openSync(
+    "/workspace",
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    for (const part of cwd === "." ? [] : cwd.split("/")) {
+      if (!part || [".", "..", ".kaguya-tools"].includes(part))
+        process.exit(125);
+      const next = openSync(
+        `/proc/self/fd/${fd}/${part}`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      closeSync(fd);
+      fd = next;
+    }
+    process.chdir(`/proc/self/fd/${fd}`);
+  } finally {
+    closeSync(fd);
+  }
+  const child = spawn(command, args, {
+    env: process.env,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  child.on("error", () => process.exit(127));
+  child.on("exit", (code) => process.exit(code ?? 128));
+});

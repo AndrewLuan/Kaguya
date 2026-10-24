@@ -2,9 +2,9 @@
 主要职责：Journal 原子追加 fsync 事件；Broker 管理 acquire/renew/release/takeover、
 实际入口 fencing、取消 tombstone、历史核对及内容寻址产物；PodmanBackend 固定容器参数。
 代码库关系：server.py 验 SO_PEERCRED 后调用；TypeScript provider 消费 ActionExecution。
-helper 只收到 operation/参数，不接收租约秘密；W7/W8 提供镜像内固定 init/helper 入口。
+shell_jobs/job_runner 在宿主监督独立命令容器；GUI/browser helper 从不执行任意 shell。
 输入输出与副作用：按环境锁串行 admission/启动，外部完成等待不占全局锁；接管先隔离容器。
-日志保留旧 generation 和 unknown 事实；重启隔离全部旧环境，绝不恢复派发。
+日志保留旧 generation 和 unknown 事实；重启隔离自动化并保留桌面，绝不恢复派发。
 """
 import base64
 from datetime import datetime, timezone
@@ -148,6 +148,8 @@ class Broker:
                  max_artifact_bytes=16 * 1024 ** 2, max_stored_bytes=2 * 1024 ** 3):
         self.root, self.backend, self.clock = Path(root), backend, clock
         self.journal = Journal(self.root)
+        if hasattr(backend, "configure"):
+            backend.configure(self.root)
         self.guard = threading.RLock()
         self.closed = False
         self.faulted = False
@@ -350,9 +352,14 @@ class Broker:
             generation = env["generation"] + 1
             new = {**env, "state": "preparing", "generation": generation, "lease": None,
                    "container": "kaguya-" + digest(env_id)[:20] + "-" + str(generation)}
+            if hasattr(self.backend, "recover_existing"):
+                new["container"] = env["container"]
             self._save_env(new)
             try:
-                self.backend.create(new)
+                if hasattr(self.backend, "recover_existing"):
+                    self.backend.recover_existing(env, new)
+                else:
+                    self.backend.create(new)
                 self._save_env({**new, "state": "ready"})
             except Exception:
                 try:
@@ -610,9 +617,14 @@ class Broker:
 
 class PodmanBackend:
     def __init__(self):
+        self.shell = None
         self.env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": "/var/lib/kaguya-tools",
                     "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
                     "CONTAINERS_STORAGE_CONF": "/etc/kaguya-tools/storage.conf"}
+
+    def configure(self, root):
+        from shell_jobs import ShellJobs
+        self.shell = ShellJobs(root, self)
 
     def import_image(self, sha):
         if not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
@@ -657,7 +669,13 @@ class PodmanBackend:
         # 仅使用命名卷；不接受任何客户端宿主路径或 Podman 参数。
         volume = "kaguya-workspace-" + digest(env["workspaceId"])[:24]
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
+        member_args = []
+        if self.shell is not None:
+            member_args = ["--cgroup-parent=" + self.shell.configure_environment(env),
+                           "--label=kaguya.role=desktop", "--volume",
+                           "kaguya-private-" + digest(env["environmentId"])[:24] + ":/private:rw"]
         self.command("run", "--detach", "--pull=never", "--name", env["container"],
+                     *member_args,
                      "--label", "kaguya.environment=" + env["environmentId"],
                      "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges", "--read-only", "--network=" + network,
@@ -680,6 +698,8 @@ class PodmanBackend:
             raise BrokerError("helper-not-ready")
 
     def handoff(self, env, generation, mode):
+        if self.shell is not None:
+            self.shell.isolate(env, "handoff")
         request = {"helperProtocolVersion": 1, "kind": "control", "action": "handoff",
                    "environmentId": env["environmentId"], "expectedGeneration": env["generation"],
                    "generation": generation, "mode": mode,
@@ -687,7 +707,29 @@ class PodmanBackend:
         return self.collect(self.launch(env, request), 15)
 
     def isolate(self, env):
-        name = env["container"]
+        if self.shell is not None:
+            self.shell.isolate(env)
+            exists = self.command("ps", "--filter", "name=^" + env["container"] + "$", "--format={{.ID}}")
+            if exists.strip():
+                request = {"helperProtocolVersion": 1, "kind": "control", "action": "fence",
+                           "environmentId": env["environmentId"], "expectedGeneration": env["generation"],
+                           "controlOperationId": digest([env["environmentId"], env["generation"], "fence"])}
+                ack = self.collect(self.launch(env, request), 15)
+                if ack.get("automationIsolated") is not True:
+                    raise BrokerError("automation-isolation-unconfirmed")
+            return
+        self.stop_container(env["container"])
+
+    def recover_existing(self, old, new):
+        if self.command("ps", "--filter", "name=^" + old["container"] + "$", "--format={{.ID}}").strip():
+            ack = self.handoff(old, new["generation"], "automation")
+            if ack.get("automationIsolated") is not True or ack.get("generation") != new["generation"]:
+                raise BrokerError("recovery-control-unconfirmed")
+        else:
+            self.command("rm", "--force", "--ignore", old["container"])
+            self.create(new)
+
+    def stop_container(self, name):
         exists = subprocess.run(["/usr/bin/podman", "container", "exists", name], env=self.env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         if exists.returncode == 1:
@@ -706,11 +748,17 @@ class PodmanBackend:
             raise BrokerError("isolation-unconfirmed")
 
     def launch(self, env, body):
+        if body.get("toolName") == "shell.exec":
+            if self.shell is None:
+                raise BrokerError("shell-control-not-configured")
+            return self.shell.handle(env, body)
         proc = subprocess.Popen(["/usr/bin/podman", "exec", "-i", env["container"], "/opt/kaguya-tools/helper"],
                                 env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return proc, canonical(body).encode() + b"\n"
 
     def discard(self, handle):
+        if isinstance(handle, dict):
+            return
         proc, _ = handle
         if proc.poll() is None:
             proc.kill()
@@ -719,6 +767,8 @@ class PodmanBackend:
             stream.close()
 
     def collect(self, handle, timeout):
+        if isinstance(handle, dict):
+            return handle
         proc, request = handle
         selector = selectors.DefaultSelector()
         output = bytearray()
