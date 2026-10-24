@@ -5,6 +5,7 @@
 本模块只在 unit 和整个 cgroup 已停止后补写终态，不与 supervisor 并发写 receipt。
 输入输出与副作用：私有宿主目录保存 manifest/日志，只有 workspace 命名卷进入容器。
 启动声明一旦落盘就不重放；截止时间固定，未知状态必须隔离后核对，不恢复执行。
+GUI 桌面占用 384 tasks 时，全部 shell jobs 共用 112 tasks；环境总额仍为 512 tasks/4G。
 """
 import base64
 from datetime import datetime, timezone
@@ -146,7 +147,7 @@ class ShellJobs:
                     "CPUQuota=200%", "MemoryMax=4G", "MemorySwapMax=0", "TasksMax=512")
         self.system("/usr/bin/systemctl", "--user", "start", name)
         self.system("/usr/bin/systemctl", "--user", "set-property", "--runtime", self.job_slice(env),
-                    "CPUQuota=100%", "MemoryMax=2G", "MemorySwapMax=0", "TasksMax=256")
+                    "CPUQuota=100%", "MemoryMax=2G", "MemorySwapMax=0", "TasksMax=" + ("112" if env.get("desktopKind") == "gui" else "256"))
         self.system("/usr/bin/systemctl", "--user", "start", self.job_slice(env))
         return name
 
@@ -308,6 +309,7 @@ class ShellJobs:
                   "startedAt": now_iso(), "uid": 1000, "gid": 1000, "exitCode": None, "signal": None,
                   "unit": "kaguya-job-" + job_id + ".service", "container": "kaguya-job-" + job_id,
                   "slice": self.job_slice(env), "image": env["image"], "network": env["network"],
+                  "desktopKind": env.get("desktopKind", "tools"),
                   "volume": "kaguya-workspace-" + digest(env["workspaceId"])[:24],
                   "argv": argv, "env": variables, "hostEnv": self.backend.env}
         write_json(path / "manifest.json", record, exclusive=True)

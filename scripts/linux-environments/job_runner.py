@@ -4,6 +4,7 @@
 收集有界输出，并在整个 payload cgroup 清空后写回执。systemd 清理崩溃或暂停的 supervisor。
 代码库关系：shell_jobs.py 传入私有 manifest 目录，job-entry.mjs 仅通过 stdin 接收启动消息。
 输入输出与副作用：命令没有 permit、控制 FD 或宿主路径；lease renew 不改变原截止。
+GUI 环境的单 job 也遵循 112 tasks 上限，其父 jobs slice 限制并发 job 总额。
 """
 import fcntl
 from datetime import datetime, timezone
@@ -57,7 +58,7 @@ def container_command(record, cidfile=None):
                "--label=kaguya.generation=" + str(record["generation"]), "--cgroups=split",
                "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--read-only", "--ipc=private", "--pid=private",
-               "--cgroupns=private", "--cpus=1", "--memory=2g", "--memory-swap=2g", "--pids-limit=256",
+               "--cgroupns=private", "--cpus=1", "--memory=2g", "--memory-swap=2g", "--pids-limit=" + ("112" if record.get("desktopKind") == "gui" else "256"),
                "--shm-size=512m", "--init", "--log-driver=none", "--restart=no",
                "--network=" + ("none" if record["network"] == "none" else "pasta:--no-map-gw"),
                "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",

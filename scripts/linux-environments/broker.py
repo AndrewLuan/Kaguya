@@ -273,6 +273,10 @@ class Broker:
             raise BrokerError("network-policy-not-allowed")
         if req.get("sandboxPolicy", "default") not in ("default", "chromium-v1"):
             raise BrokerError("sandbox-policy-not-allowed")
+        if req.get("desktopKind", "tools") not in ("tools", "gui"):
+            raise BrokerError("desktop-kind-not-allowed")
+        if req.get("desktopKind") == "gui" and req.get("sandboxPolicy") != "chromium-v1":
+            raise BrokerError("gui-sandbox-policy-required")
         resources = req["resourceIds"]
         if not isinstance(resources, list) or not 0 < len(resources) <= 16 or len(set(resources)) != len(resources):
             raise BrokerError("invalid-resources")
@@ -293,6 +297,7 @@ class Broker:
                 env = {"environmentId": env_id, "scope": text(req["scope"]), "workspaceId": workspace,
                        "resourceIds": resources, "image": image, "network": req.get("network", "none"),
                        "sandboxPolicy": req.get("sandboxPolicy", "default"),
+                       "desktopKind": req.get("desktopKind", "tools"),
                        "generation": 0, "fencing": "0", "lease": None, "state": "preparing",
                        "container": "kaguya-" + digest(env_id)[:20] + "-0"}
                 self._save_env(env)
@@ -861,35 +866,77 @@ class PodmanBackend:
         volume = "kaguya-workspace-" + digest(env["workspaceId"])[:24]
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
         member_args = []
+        gui = env.get("desktopKind") == "gui"
+        if gui and self.shell is None:
+            raise BrokerError("gui-managed-resource-slice-required")
         if env.get("sandboxPolicy") == "chromium-v1":
             profile = self.chromium_profile()
-            member_args += ["--security-opt=seccomp=" + str(profile), "--env=KAGUYA_BROWSER_ENABLED=1"]
+            member_args += ["--security-opt=seccomp=" + str(profile)]
+            if not gui:
+                member_args += ["--env=KAGUYA_BROWSER_ENABLED=1"]
         if self.shell is not None:
+            if gui:
+                self.prepare_gui_home(env)
             member_args += ["--cgroup-parent=" + self.shell.configure_environment(env),
                            "--label=kaguya.role=desktop", "--volume",
                            "kaguya-private-" + digest(env["environmentId"])[:24] + ":/private:rw"]
+        if gui:
+            member_args += ["--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,mode=1777",
+                            "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,mode=1777"]
+        entry = ["--entrypoint=/usr/local/bin/node", env["image"], "/opt/kaguya-tools/gui-init.mjs"] if gui else ["--entrypoint=/opt/kaguya-tools/init", env["image"]]
         self.command("run", "--detach", "--pull=never", "--name", env["container"],
                      *member_args,
                      "--label", "kaguya.environment=" + env["environmentId"],
                      "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges", "--read-only", "--network=" + network,
                      "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
-                     "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
+                     "--memory-swap=2g", "--pids-limit=" + ("384" if gui else "256"), "--shm-size=512m", "--init",
                      "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
                      "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
                      "--volume", volume + ":/workspace:rw", "--env=HOME=/home/tool",
                      "--env=KAGUYA_HELPER_PROTOCOL_VERSION=1", "--env=KAGUYA_ENVIRONMENT_ID=" + env["environmentId"],
                      "--env=KAGUYA_ENVIRONMENT_GENERATION=" + str(env["generation"]),
                      "--env=CUA_DRIVER_RS_TELEMETRY_ENABLED=false", "--env=DO_NOT_TRACK=1", "--env=CUA_TELEMETRY=0",
-                     "--entrypoint=/opt/kaguya-tools/init", env["image"], timeout=60)
+                     *entry, timeout=60)
         info = json.loads(self.command("inspect", env["container"]))[0]
         if not info["State"]["Running"]:
             raise BrokerError("environment-not-running")
+        if gui:
+            self.command("exec", "--detach", "--user=1001:1001", env["container"],
+                         "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
+            self.command("exec", "--user=1001:1001", env["container"], "/usr/bin/python3", "-I", "-c",
+                         "import pathlib,time; p=pathlib.Path('/run/kaguya-app/session/ready'); "
+                         "deadline=time.monotonic()+15\n"
+                         "while not p.is_file():\n"
+                         " if time.monotonic()>=deadline: raise RuntimeError('gui-session-not-ready')\n"
+                         " time.sleep(.02)\n", timeout=20)
         # init 必须先就绪固定内部服务，再让 helper 的 health 返回；running 不是能力就绪证明。
         ready = self.collect(self.launch(env, {"helperProtocolVersion": 1, "kind": "health"}), 15)
         if (ready.get("helperProtocolVersion") != 1 or ready.get("ready") is not True or
                 ready.get("generation") != env["generation"]):
             raise BrokerError("helper-not-ready")
+        if gui and not {"gui.observe", "gui.act", "gui.verify"}.issubset(ready.get("capabilities", [])):
+            raise BrokerError("gui-helper-capabilities-required")
+
+    def prepare_gui_home(self, env):
+        """在 rootless 用户 namespace 初始化固定命名卷；不提升容器 capability，也不递归 chown 用户内容。"""
+        volume = "kaguya-private-" + digest(env["environmentId"])[:24]
+        self.command("volume", "create", volume)
+        info = json.loads(self.command("volume", "inspect", volume))[0]
+        if info.get("Name") != volume or not isinstance(info.get("Mountpoint"), str):
+            raise BrokerError("gui-private-volume-unconfirmed")
+        self.command("unshare", "/usr/bin/python3", "-I", "-c",
+                     "import os,pathlib,stat,sys; p=pathlib.Path(sys.argv[1]); "
+                     "assert p.is_absolute() and p.resolve()==p; "
+                     "root=os.open(p,os.O_DIRECTORY|os.O_NOFOLLOW); "
+                     "assert os.fstat(root).st_uid in (0,1000); "
+                     "os.fchown(root,1000,1000); os.fchmod(root,0o711)\n"
+                     "try: os.mkdir('app',0o700,dir_fd=root)\n"
+                     "except FileExistsError: pass\n"
+                     "app=os.open('app',os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root); "
+                     "assert os.fstat(app).st_uid in (0,1001); "
+                     "os.fchown(app,1001,1001); os.fchmod(app,0o700); os.close(app); os.close(root)",
+                     info["Mountpoint"])
 
     def chromium_profile(self):
         info = json.loads(self.command("info", "--format=json"))

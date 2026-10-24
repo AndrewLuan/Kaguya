@@ -118,6 +118,7 @@ jobs:
           docker buildx create --name kaguya-gui-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
           docker buildx inspect --bootstrap
       - name: Build fixed Cua Linux amd64 GUI image
+        id: gui_image
         run: >-
           docker buildx build --platform linux/amd64
           --provenance=false --sbom=false
@@ -137,6 +138,11 @@ jobs:
       - name: Show GUI diagnostics
         if: always()
         run: test ! -f gui-container-receipt.json || cat gui-container-receipt.json
+      - name: Verify production broker and GUI provider without a model
+        if: ${{ !cancelled() && steps.gui_image.outcome == 'success' }}
+        run: >-
+          python3 -B scripts/linux-tools/check-gui-provider.py
+          --digest "$(cat gui-image.digest)"
       - name: Preserve GUI evidence
         if: always()
         uses: actions/upload-artifact@v6
@@ -155,6 +161,9 @@ jobs:
             gui-chromium-probe.json
             gui-chromium.log
             gui-resources.json
+            gui-provider-receipt.json
+            gui-provider-original.png
+            gui-provider-final.png
             gui-chromium-ledger.json
             gui-gtk-ledger.json
             gui-key-events.json

@@ -121,7 +121,7 @@ try:
             "--security-opt=no-new-privileges", "--read-only", "--network=none",
             "--security-opt=seccomp=" + str(selected_profile),
             "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
-            "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
+            "--memory-swap=2g", "--pids-limit=384", "--shm-size=512m", "--init",
             "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
             "--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,mode=1777",
             "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,mode=1777",
@@ -135,7 +135,7 @@ try:
     assert all(not caps for caps in oci["process"]["capabilities"].values())
     assert oci["root"]["readonly"] is True
     assert oci["linux"]["seccomp"]["defaultAction"] == "SCMP_ACT_ERRNO"
-    command("exec", "--detach", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
+    command("exec", "--detach", "--user=1001:1001", "--env=KAGUYA_GUI_ACCEPTANCE=1", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
     address_result = until(["exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
     address = re.search(r'string "([^"]+)"', address_result.decode()).group(1)
     assert address.startswith("unix:path=/run/kaguya-app/session/at-spi/")

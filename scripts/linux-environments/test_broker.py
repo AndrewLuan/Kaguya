@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from broker import Broker, BrokerError, PodmanBackend, chromium_profile, CHROMIUM_POLICIES
 
@@ -342,6 +343,32 @@ class BrokerTest(unittest.TestCase):
         self.assertIn("--read-only", args)
         self.assertIn("--cap-drop=ALL", args)
         self.assertIn("--security-opt=no-new-privileges", args)
+
+    def test_gui_creation_uses_persisted_kind_fixed_uid_and_managed_budget(self):
+        backend = PodmanBackend()
+        calls = []
+        env = {**self.env, "container": "controlled", "desktopKind": "gui", "sandboxPolicy": "chromium-v1"}
+        with self.assertRaisesRegex(BrokerError, "managed-resource-slice-required"):
+            backend.create(env)
+        backend.shell = SimpleNamespace(configure_environment=lambda value: "controlled.slice")
+        def command(*args, **_kwargs):
+            calls.append(args)
+            return b'[{"State":{"Running":true}}]' if args[0] == "inspect" else b""
+        with patch.object(backend, "prepare_gui_home") as home, patch.object(backend, "chromium_profile", return_value=Path("profile")), patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0, "capabilities": ["gui.observe", "gui.act", "gui.verify"]}):
+            backend.create(env)
+            home.assert_called_once_with(env)
+        run = calls[0]
+        for option in ("--pids-limit=384", "--memory=2g", "--cgroup-parent=controlled.slice", "--user=1000:1000", "--cap-drop=ALL", "--read-only"):
+            self.assertIn(option, run)
+        self.assertEqual(run[-3:], ("--entrypoint=/usr/local/bin/node", env["image"], "/opt/kaguya-tools/gui-init.mjs"))
+        self.assertIn(("exec", "--detach", "--user=1001:1001", "controlled", "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py"), calls)
+        self.assertNotIn("--env=KAGUYA_BROWSER_ENABLED=1", run)
+        self.assertTrue(any("/run/kaguya-app/session/ready" in item for call in calls for item in call))
+
+    def test_gui_requires_explicit_sandbox_and_valid_kind(self):
+        for extra, message in (({"desktopKind": "other"}, "desktop-kind"), ({"desktopKind": "gui"}, "gui-sandbox")):
+            with self.subTest(extra=extra), self.assertRaisesRegex(BrokerError, message):
+                self.broker.create({"environmentId": "another", "image": self.env["image"], **extra})
 
     def test_chromium_profile_is_explicit_and_keeps_outer_isolation(self):
         backend = PodmanBackend()

@@ -20,6 +20,7 @@ RUN (getent passwd 1001 || useradd --uid 1001 --create-home --home-dir /home/app
     && chown 1000:1000 /home/tool /private /workspace \
     && chmod 0700 /home/tool \
     && chown 1001:1001 /home/app /run/kaguya-app /private/app \
+    && chmod 0700 /private/app \
     && chmod 0711 /run/kaguya-app \
     && cp /opt/kaguya-tools/gui-accessibility.conf /usr/share/defaults/at-spi2/accessibility.conf \
     && cp /opt/kaguya-tools/gui-marker.service /usr/share/dbus-1/services/org.kaguya.GuiAcceptance.service \

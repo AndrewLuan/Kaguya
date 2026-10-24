@@ -207,6 +207,7 @@ export class LinuxEnvironmentClient {
     image: string;
     network?: "none" | "public-web";
     sandboxPolicy?: "default" | "chromium-v1";
+    desktopKind?: "tools" | "gui";
   }) {
     return this.#transport("environment.create", input);
   }
