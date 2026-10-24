@@ -3,12 +3,14 @@
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
  * snapshot 提供 shell.exec 的有界 schema、scope/target 授权与 broker provider，不另建工具循环。
  * close 释放所持 lease，W6 负责物理隔离；失败保留 owner 以便再次清理，禁止盲目 recover。
+ * 管理接管与 lease 共享 scope 锁；人工输入不占用控制锁，使关闭/恢复可立即撤销正在执行的输入。
  * 代码库关系：Server 从敏感 linux-tools.json 构建此宿主；init/helper 实现 job 与真实 verify。
  */
 import { z } from "@kaguya/schema";
 import {
   LinuxEnvironmentClient,
   type ActionEnvironment,
+  type HumanOperation,
 } from "./environment.js";
 import type { NativeToolLoopOptions } from "./native-tool-loop.js";
 import {
@@ -172,6 +174,115 @@ export class LinuxToolsHost {
     this.locks.set(scope, work);
     return work;
   }
+
+  private managed(environmentId: string) {
+    const config = this.configuration.bindings.find(
+      (binding) => binding.environmentId === environmentId && binding.gui,
+    );
+    if (!config || this.closed) throw new Error("linux-gui-management-denied");
+    return config;
+  }
+
+  inspect(environmentId: string) {
+    return this.client.inspect(
+      environmentId,
+      this.managed(environmentId).scope,
+    );
+  }
+
+  private manage<T>(
+    environmentId: string,
+    operation: (scope: string) => Promise<T>,
+  ) {
+    const { scope } = this.managed(environmentId);
+    this.unavailable.add(scope);
+    const work = (this.locks.get(scope) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.closed) throw new Error("linux-tools-closed");
+        this.leases.delete(scope);
+        return operation(scope);
+      });
+    this.locks.set(scope, work);
+    return work;
+  }
+
+  handoff(
+    environmentId: string,
+    generation: number,
+    controlAuthorizationId: string,
+  ) {
+    return this.manage(environmentId, (scope) =>
+      this.client.openHuman({
+        environmentId,
+        scope,
+        generation,
+        controlAuthorizationId,
+      }),
+    );
+  }
+
+  resume(
+    environmentId: string,
+    generation: number,
+    controlAuthorizationId: string,
+  ) {
+    return this.manage(environmentId, async (scope) => {
+      await this.client.resume({
+        environmentId,
+        scope,
+        generation,
+        controlAuthorizationId,
+      });
+      const current = await this.client.inspect(environmentId, scope);
+      if (current.state !== "ready" || current.generation !== generation + 1)
+        throw new Error("linux-resume-unconfirmed");
+      this.unavailable.delete(scope);
+      return current;
+    });
+  }
+
+  operateHuman(input: Omit<HumanOperation, "scope">) {
+    const { scope } = this.managed(input.environmentId);
+    return this.client.operateHuman({ ...input, scope });
+  }
+
+  renewHuman(input: {
+    environmentId: string;
+    generation: number;
+    sessionId: string;
+  }) {
+    return this.client.renewHuman({
+      ...input,
+      scope: this.managed(input.environmentId).scope,
+    });
+  }
+
+  closeHuman(input: {
+    environmentId: string;
+    generation: number;
+    sessionId: string;
+  }) {
+    return this.manage(input.environmentId, (scope) =>
+      this.client.closeHuman({ ...input, scope }),
+    );
+  }
+
+  queryHuman(environmentId: string, operationId: string) {
+    return this.client.queryHuman(
+      environmentId,
+      this.managed(environmentId).scope,
+      operationId,
+    );
+  }
+
+  readGuiArtifact(environmentId: string, id: string) {
+    return this.client.readArtifact(
+      id,
+      this.managed(environmentId).scope,
+      environmentId,
+    );
+  }
   snapshot() {
     const provider = this.client.provider();
     const declarations = [
@@ -304,12 +415,13 @@ export class LinuxToolsHost {
     this.closed = true;
     clearInterval(this.timer);
     await Promise.allSettled(this.locks.values());
-    const results = await Promise.allSettled(
-      [...this.leases].map(async ([scope, ref]) => {
+    const results = await Promise.allSettled([
+      this.client.closeHumans(),
+      ...[...this.leases].map(async ([scope, ref]) => {
         await this.client.release(ref.environmentId, scope);
         this.leases.delete(scope);
       }),
-    );
+    ]);
     if (results.some((r) => r.status === "rejected"))
       throw new Error("linux-tools-cleanup-unconfirmed");
   }

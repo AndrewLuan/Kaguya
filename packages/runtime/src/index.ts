@@ -26,6 +26,9 @@ export {
   createUnixBrokerTransport,
   type BrokerTransport,
   type ActionEnvironment,
+  type EnvironmentControl,
+  type HumanOperation,
+  type HumanReceipt,
 } from "./environment.js";
 
 export * from "./native-tool-loop.js";

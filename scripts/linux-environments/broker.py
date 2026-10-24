@@ -775,7 +775,8 @@ class Broker:
 
     def read_artifact(self, req):
         record = self.artifacts.get(req["id"])
-        if record is None or record["metadata"]["scope"] != req["scope"]:
+        if (record is None or record["metadata"]["scope"] != req["scope"] or
+                (req.get("environmentId") is not None and record["environmentId"] != req["environmentId"])):
             raise BrokerError("artifact-not-authorized")
         artifact = record["metadata"]
         fd = os.open(self.blobs / artifact["hash"], os.O_RDONLY | os.O_NOFOLLOW)
