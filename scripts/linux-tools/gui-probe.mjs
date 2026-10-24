@@ -78,8 +78,18 @@ try {
   assert.match(JSON.stringify(windows), /Kaguya GUI acceptance/);
   const pid = Number(process.argv[2]);
   assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  const windowId = windows.structuredContent?.windows.find(
+    (candidate) =>
+      candidate.pid === pid && candidate.title === "Kaguya GUI acceptance",
+  )?.window_id;
+  assert.ok(Number.isSafeInteger(windowId) && windowId > 0);
   const window = (evidence.window = await observed(
-    () => driver.call("get_window_state", { pid, max_image_dimension: 0 }),
+    () =>
+      driver.call("get_window_state", {
+        pid,
+        window_id: windowId,
+        max_image_dimension: 0,
+      }),
     (result) =>
       text(result).includes("Unsaved text") &&
       text(result).includes("Increment once"),
@@ -100,8 +110,6 @@ try {
     assert.ok(bytes.readUInt32BE(16) > 0 && bytes.readUInt32BE(16) <= 1280);
     assert.ok(bytes.readUInt32BE(20) > 0 && bytes.readUInt32BE(20) <= 800);
   }
-  const windowId = Number(/window_id=(\d+)/.exec(text(window))?.[1]);
-  assert.ok(windowId > 0);
   const buttonState = await driver.call("get_window_state", {
     pid,
     window_id: windowId,

@@ -7,7 +7,8 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { CuaStdio } from "./cua-stdio.mjs";
 const exec = promisify(execFile);
 import { x11State as keyboard } from "./gui-x11.mjs";
@@ -20,8 +21,12 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
   try {
     await driver.start();
     const windows = await driver.call("list_windows", {});
-    const target = windows.structuredContent?.windows.find((w) =>
-      JSON.stringify(w).includes("Kaguya isolated terminal"),
+    const target = windows.structuredContent?.windows.find(
+      (w) =>
+        w.title ===
+        (mode === "held"
+          ? "Kaguya keyboard acceptance"
+          : "Kaguya isolated terminal"),
     );
     assert.ok(target, "terminal-must-remain-alive");
     const pid = target.pid,
@@ -181,6 +186,23 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
     });
     assert.deepEqual(reset.keys, []);
     assert.deepEqual(reset.buttons, []);
+    let applicationKeyRelease;
+    if (mode === "held") {
+      const deadline = Date.now() + 3000;
+      while (true) {
+        applicationKeyRelease = JSON.parse(
+          await readFile("/run/kaguya-app/session/gui-key-events.json", "utf8"),
+        );
+        if (
+          applicationKeyRelease.held.length === 0 &&
+          applicationKeyRelease.releases > 0
+        )
+          break;
+        if (Date.now() >= deadline)
+          throw new Error("application-key-release-unconfirmed");
+        await delay(20);
+      }
+    }
     if (mode === "unicode") assert.ok(reset.restoredKeycodes.length > 0);
     const after = await keyboard({ mode: "snapshot" });
     assert.deepEqual(after.mapping, before.mapping);
@@ -192,6 +214,7 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
         interruptedKeys: interruption.observed.keys,
         interruptedButtons: interruption.observed.buttons,
         autoRepeat: interruption.autoRepeat,
+        applicationKeyRelease,
         reset,
         mappingRestored: true,
       }),

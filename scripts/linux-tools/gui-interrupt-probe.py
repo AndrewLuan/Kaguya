@@ -39,35 +39,16 @@ def matches(state):
     return bool(state["keys"])
 
 
-def observe_repeat(x, display, keys):
-    """冻结真实 key-down 后观察额外 KeyPress，证明本例实际进入 XServer auto-repeat。"""
-    C = x11.C
-    class KeyEvent(C.Structure):
-        _fields_ = [("type", C.c_int), ("serial", C.c_ulong), ("send_event", C.c_int), ("display", C.c_void_p),
-                    ("window", C.c_ulong), ("root", C.c_ulong), ("subwindow", C.c_ulong), ("time", C.c_ulong),
-                    ("x", C.c_int), ("y", C.c_int), ("x_root", C.c_int), ("y_root", C.c_int),
-                    ("state", C.c_uint), ("keycode", C.c_uint), ("same_screen", C.c_int)]
-    class Event(C.Union):
-        _fields_ = [("type", C.c_int), ("key", KeyEvent), ("pad", C.c_long * 24)]
-    x.XGetInputFocus.argtypes = [C.c_void_p, C.POINTER(C.c_ulong), C.POINTER(C.c_int)]
-    x.XSelectInput.argtypes = [C.c_void_p, C.c_ulong, C.c_long]
-    x.XPending.argtypes = [C.c_void_p]
-    x.XNextEvent.argtypes = [C.c_void_p, C.c_void_p]
-    focus, revert = C.c_ulong(), C.c_int()
-    x.XGetInputFocus(display, C.byref(focus), C.byref(revert))
-    if focus.value <= 1:
-        raise RuntimeError("repeat-focus-unconfirmed")
-    x.XSelectInput(display, focus, 1)  # KeyPressMask 可被多个只读观察客户端订阅。
-    x.XSync(display, 0)
+def observe_repeat(_x, _display, keys):
+    """冻结真实 key-down 后读取 GTK 实际重复按下事件，不依赖另一个 X 客户端的事件路由。"""
     deadline = time.monotonic() + 3
-    event = Event()
+    path = Path("/run/kaguya-app/session/gui-key-events.json")
     while True:
-        while x.XPending(display):
-            x.XNextEvent(display, C.byref(event))
-            if event.type == 2 and event.key.keycode in keys and not event.key.send_event:
-                return {"keycode": event.key.keycode, "window": event.key.window, "serverTime": event.key.time}
+        events = json.loads(path.read_text())
+        if events["uid"] == 1001 and events["presses"] >= 2 and any(key in events["held"] for key in keys):
+            return events
         if time.monotonic() >= deadline:
-            raise RuntimeError("real-auto-repeat-not-observed")
+            raise RuntimeError("real-auto-repeat-not-observed:" + json.dumps(events))
         time.sleep(.001)
 
 

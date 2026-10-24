@@ -27,6 +27,8 @@ async function state(
       pid,
       max_image_dimension: 0,
     });
+    evidence.lastObserved = result;
+    evidence.waitingFor = contains;
     assert.notEqual(result.isError, true);
     if (matches(result)) return result;
     if (Date.now() >= deadline)

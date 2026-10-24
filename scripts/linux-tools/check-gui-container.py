@@ -202,6 +202,9 @@ finally:
                                 ("/home/tool/gui-chromium.png", "gui-chromium.png"),
                                 ("/home/tool/gui-chromium-probe.json", "gui-chromium-probe.json"),
                                 ("/home/app/session/chromium.log", "gui-chromium.log"),
+                                ("/home/app/session/chromium-ledger.json", "gui-chromium-ledger.json"),
+                                ("/home/app/session/gui-ledger.json", "gui-gtk-ledger.json"),
+                                ("/run/kaguya-app/session/gui-key-events.json", "gui-key-events.json"),
                                 ("/home/tool/gui-drain-held.json", "gui-drain-held.json"),
                                 ("/home/tool/gui-drain-modifier.json", "gui-drain-modifier.json"),
                                 ("/home/tool/gui-drain-button.json", "gui-drain-button.json"),
@@ -213,7 +216,8 @@ finally:
         if podman_unresponsive:
             break
         try:
-            value = command("exec", name, "/bin/cat", source, check=False)
+            reader = ["--user=1001:1001"] if source.startswith("/home/app/") else []
+            value = command("exec", *reader, name, "/bin/cat", source, check=False)
             if value.returncode == 0:
                 Path(destination).write_bytes(value.stdout)
         except Exception as error:
