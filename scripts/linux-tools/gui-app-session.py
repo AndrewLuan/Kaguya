@@ -41,14 +41,19 @@ def start(args, required=True):
 def ready(args, seconds=12):
     deadline = time.monotonic() + seconds
     while True:
-        if any(child.poll() is not None for child in critical):
-            raise RuntimeError("gui-session-child-exited")
+        check_children()
         result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
         if result.returncode == 0:
             return
         if time.monotonic() >= deadline:
             raise RuntimeError("gui-session-not-ready")
         time.sleep(.02)
+
+
+def check_children():
+    for child in critical:
+        if child.poll() is not None:
+            raise RuntimeError(f"gui-session-child-exited: {child.args!r} code={child.returncode}")
 
 
 def stop(_signum, _frame):
@@ -61,15 +66,14 @@ try:
     ready(["/usr/bin/xdpyinfo"])
     start(["/usr/bin/dbus-daemon", "--nofork", "--config-file=/opt/kaguya-tools/gui-session.conf"])
     ready(["/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus", "/", "org.freedesktop.DBus.ListNames"])
-    start(["/usr/libexec/at-spi-bus-launcher", "--launch-immediately"])
+    # 只通过镜像内固定 D-Bus service 激活一次。显式 launcher 与 GetAddress 自动激活
+    # 竞争同一名称时，后启动的 launcher 正常退出，不能误判为整个应用会话失败。
     ready(["/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
     start(["/usr/bin/openbox", "--config-file", "/opt/kaguya-tools/gui-openbox.xml"])
     start(["/usr/bin/xterm", "-fa", "monospace", "-fs", "11", "-title", "Kaguya isolated terminal"], required=False)
     while True:
         # 这里是会话存活监视；就绪和测试行为使用上方有界条件，不以休眠猜测完成。
-        for child in critical:
-            if child.poll() is not None:
-                raise RuntimeError("gui-session-child-exited")
+        check_children()
         time.sleep(.2)
 finally:
     for child in children:

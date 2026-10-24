@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """功能概述：Linux CI 在真实 X11 key-down/临时映射出现时中断固定 Cua 进程组。
-主要职责：先报告观察就绪，轮询真实状态；验证 pid/exe/start-time 后 SIGKILL，不凭固定延迟猜窗口。
+主要职责：先验证 pid/exe/start-time，观察目标状态后冻结进程组并复查，再 SIGKILL。
 代码库关系：gui-drain-probe.mjs 先冻结 baseline，再触发一次真实 Cua 输入；生产不注册此探针。
 输入输出与副作用：仅 UID1000、本容器 /opt/cua/cua-driver 组；输出实际触发状态供 release/readback 验证。
 """
@@ -38,9 +38,16 @@ try:
         state = x11.snapshot(x, display)
         matched = bool(state["keys"]) if mode == "held" else any(0x1004e2d in row for row in state["mapping"])
         if matched:
-            validate()
-            os.killpg(pid, signal.SIGKILL)
-            print(json.dumps({"mode": mode, "observed": state}), flush=True)
+            os.killpg(pid, signal.SIGSTOP)
+            try:
+                validate()
+                frozen = x11.snapshot(x, display)
+                remains = bool(frozen["keys"]) if mode == "held" else any(0x1004e2d in row for row in frozen["mapping"])
+                if not remains:
+                    raise RuntimeError("input-state-ended-before-freeze")
+                print(json.dumps({"mode": mode, "observed": frozen}), flush=True)
+            finally:
+                os.killpg(pid, signal.SIGKILL)
             break
         if time.monotonic() >= deadline:
             raise RuntimeError("input-interruption-state-not-observed")

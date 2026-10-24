@@ -14,6 +14,8 @@ import { x11State as keyboard } from "./gui-x11.mjs";
 for (const mode of ["held", "unicode"]) {
   const driver = new CuaStdio();
   let monitor;
+  let monitorClosed;
+  let primary;
   try {
     await driver.start();
     const windows = await driver.call("list_windows", {});
@@ -57,6 +59,14 @@ for (const mode of ["held", "unicode"]) {
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
+    // close 在 spawn error 后也会发生；立即登记，不能在 finally 等可能永不发生的 exit。
+    let spawnError;
+    monitorClosed = new Promise((resolve) => {
+      monitor.once("error", (error) => {
+        spawnError = error;
+      });
+      monitor.once("close", (code) => resolve({ code, error: spawnError }));
+    });
     let output = "",
       error = "",
       readyResolve;
@@ -70,11 +80,9 @@ for (const mode of ["held", "unicode"]) {
     monitor.stderr.on("data", (data) => {
       error += data;
     });
-    const completed = new Promise((resolve, reject) => {
-      monitor.once("error", reject);
-      monitor.once("exit", (code) =>
-        code === 0 ? resolve() : reject(new Error(error || "monitor-failed")),
-      );
+    const completed = monitorClosed.then((result) => {
+      if (result.error || result.code !== 0)
+        throw result.error ?? new Error(error || "monitor-failed");
     });
     await Promise.race([
       ready,
@@ -107,6 +115,17 @@ for (const mode of ["held", "unicode"]) {
     await driver.stop();
     assert.equal(await settled, "interrupted");
     const interruption = JSON.parse(output.split("\n")[1]);
+    const residual = await keyboard({ mode: "snapshot" });
+    if (mode === "held")
+      assert.ok(
+        residual.keys.length > 0,
+        "held-input-must-survive-driver-exit",
+      );
+    else
+      assert.ok(
+        residual.mapping.some((row) => row.includes(0x1004e2d)),
+        "temporary-mapping-must-survive-driver-exit",
+      );
     const reset = await keyboard({
       mode: "reset",
       before,
@@ -127,11 +146,23 @@ for (const mode of ["held", "unicode"]) {
         mappingRestored: true,
       }),
     );
+  } catch (error) {
+    primary = error;
   } finally {
-    if (monitor && monitor.exitCode === null && monitor.signalCode === null) {
-      monitor.kill("SIGKILL");
-      await new Promise((resolve) => monitor.once("exit", resolve));
+    const errors = primary ? [primary] : [];
+    try {
+      if (monitor && monitor.exitCode === null && monitor.signalCode === null)
+        monitor.kill("SIGKILL");
+      await monitorClosed;
+    } catch (error) {
+      errors.push(error);
     }
-    await driver.stop();
+    try {
+      await driver.stop();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "gui-drain-probe-failed");
   }
 }

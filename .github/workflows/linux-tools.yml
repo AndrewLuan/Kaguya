@@ -145,6 +145,7 @@ jobs:
             gui-container-receipt.json
             gui-probe.json
             gui-packages.txt
+            gui-host-diagnostics.jsonl
             gui-gtk.png
             gui-desktop.png
           retention-days: 7

@@ -20,10 +20,49 @@ parser.add_argument("--digest", required=True)
 args = parser.parse_args()
 name = "kaguya-gui-ci-" + uuid.uuid4().hex
 probe_process = None
+podman_unresponsive = False
+
+
+def host_diagnostics(reason):
+    """不依赖容器 exec/Podman 锁的宿主证据；不读取进程环境或应用内容。"""
+    evidence = {"reason": reason, "processes": [], "storage": {}}
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            comm = (process / "comm").read_text().strip()
+            if comm not in ("podman", "conmon", "crun", "runc", "fuse-overlayfs"):
+                continue
+            item = {"pid": int(process.name), "comm": comm}
+            for field in ("status", "wchan", "cgroup", "stack"):
+                try:
+                    item[field] = (process / field).read_text()[:8192]
+                except OSError as error:
+                    item[field] = str(error)
+            evidence["processes"].append(item)
+        except OSError:
+            continue
+    for directory in (Path.home() / ".local/share/containers/storage", Path(f"/run/user/{os.getuid()}/containers")):
+        try:
+            stats = os.statvfs(directory)
+            evidence["storage"][str(directory)] = {
+                "availableBytes": stats.f_bavail * stats.f_frsize, "availableInodes": stats.f_favail,
+                "entries": sorted(entry.name for entry in directory.iterdir())[:100],
+            }
+        except OSError as error:
+            evidence["storage"][str(directory)] = str(error)
+    with Path("gui-host-diagnostics.jsonl").open("a") as output:
+        output.write(json.dumps(evidence) + "\n")
 
 
 def command(*parts, timeout=30, check=True, input=None):
-    result = subprocess.run(["/usr/bin/podman", *parts], input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    global podman_unresponsive
+    try:
+        result = subprocess.run(["/usr/bin/podman", *parts], input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        podman_unresponsive = True
+        host_diagnostics(f"podman {parts[0]} exceeded {timeout}s")
+        raise
     if check and result.returncode:
         raise RuntimeError(result.stderr.decode(errors="replace"))
     return result
@@ -108,11 +147,15 @@ try:
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
 finally:
     primary = sys.exc_info()[1]
+    if primary:
+        print(f"Primary GUI failure: {primary!r}", file=sys.stderr, flush=True)
     cleanup_errors = []
     for source, destination in [("/home/tool/gui-probe.json", "gui-probe.json"),
                                 ("/home/tool/gui-gtk.png", "gui-gtk.png"),
                                 ("/home/tool/gui-desktop.png", "gui-desktop.png"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
+        if podman_unresponsive:
+            break
         try:
             value = command("exec", name, "/bin/cat", source, check=False)
             if value.returncode == 0:
@@ -120,14 +163,16 @@ finally:
         except Exception as error:
             cleanup_errors.append(error)
     try:
-        app_logs = command("exec", "--user=1001:1001", name, "/usr/bin/tail", "-c", "65536", "/home/app/session/session.log", check=False)
-        print(app_logs.stdout.decode(errors="replace"), flush=True)
+        if not podman_unresponsive:
+            app_logs = command("exec", "--user=1001:1001", name, "/usr/bin/tail", "-c", "65536", "/home/app/session/session.log", check=False)
+            print(app_logs.stdout.decode(errors="replace"), flush=True)
     except Exception as error:
         cleanup_errors.append(error)
     try:
-        logs = command("logs", name, check=False)
-        print(logs.stdout.decode(errors="replace"), flush=True)
-        print(logs.stderr.decode(errors="replace"), flush=True)
+        if not podman_unresponsive:
+            logs = command("logs", name, check=False)
+            print(logs.stdout.decode(errors="replace"), flush=True)
+            print(logs.stderr.decode(errors="replace"), flush=True)
     except Exception as error:
         cleanup_errors.append(error)
     try:
