@@ -7,6 +7,8 @@ description: Kaguya 当前已实现能力、明确边界和后续演进方向。
 
 本页只把有代码和测试支持的行为作为当前事实。后续方向可能在 Issue 与 PR 中调整，不应被当作已交付接口。
 
+[#279 实施与验收台账](./issue279-implementation)记录当前 native Memory、Kaguya runtime 与执行环境路线，覆盖原九项交付、W0–W12 和[实施 issue 草稿](./issue279-issues)。各项按实现、CI、真实模型与部署证据分别验收。
+
 ## 持续 Agent 故事的实现状态
 
 项目以“持续感知、自然互动”为统一故事：相关 Information 到达可以唤醒 Agent，但 tick 不自动等于 turn；模块的订阅单位也不自动等于完整语义输入。完整约束见[持续 Agent 设计原则](../developers/continuous-agent)。
