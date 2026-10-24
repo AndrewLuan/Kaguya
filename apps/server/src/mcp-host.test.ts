@@ -2,6 +2,7 @@
  * 功能概述：验证真实 Server 装配、Web→Heavy→W3→MCP→后继模型回复及管理端显式资源/prompt。
  * 只替换模型 HTTP 和数据库连接工厂；MCP 为真实独立 stdio/回环 HTTP 合成服务。
  * 使用临时配置、真实 PGlite 或显式 PostgreSQL schema；等待持久回执及队列收敛，精确核对副作用。
+ * 正式链路按 MCP 回执、匹配 run 的模型/assistant 持久化、Web 交付与队列收敛分阶段等待。
  * fixture 在 setup 失败和 shutdown 异常时也尝试释放所有资源；记录子进程 PID，验证关闭后不残留。
  */
 import { mkdtemp, writeFile, mkdir, readFile, rm } from "node:fs/promises";
@@ -320,26 +321,96 @@ it.each(["stdio", "http"] as const)(
     });
     expect(response.statusCode).toBe(202);
     const wait = createPersistenceWait(f.db, () => ({ heavy: models.heavy }));
-    await wait("MCP receipt and Heavy final persisted", async () => {
-      const receipts = await f.db.information.find({
-        kinds: ["agent.heavy.tool.result.v1"],
-        limit: 10,
-      });
-      expect(receipts).toHaveLength(1);
-      expect(receipts[0]!.payload.toolCallId).toBe("mcp-model-original");
-      expect(receipts[0]!.payload.value).toMatchObject({
-        status: "succeeded",
-        evidence: "returned",
-        result: {
-          source: { scope: f.scope, trust: "untrusted-mcp-data" },
-          requests: [
-            { method: "tools/call", modelToolCallId: "mcp-model-original" },
-          ],
-        },
-      });
-      expect(models.heavy).toBe(2);
-      await expectPersistenceSettled(f.db);
+    let runInformationId: unknown;
+    let assistantInformationId: string;
+    await wait(
+      "MCP receipt persisted and follow-up Heavy started",
+      async () => {
+        const receipts = await f.db.information.find({
+          kinds: ["agent.heavy.tool.result.v1"],
+          limit: 10,
+        });
+        expect(receipts).toHaveLength(1);
+        runInformationId = receipts[0]!.payload.runInformationId;
+        expect(receipts[0]!.payload.toolCallId).toBe("mcp-model-original");
+        expect(receipts[0]!.payload.value).toMatchObject({
+          status: "succeeded",
+          evidence: "returned",
+          result: {
+            source: { scope: f.scope, trust: "untrusted-mcp-data" },
+            requests: [
+              { method: "tools/call", modelToolCallId: "mcp-model-original" },
+            ],
+          },
+        });
+        expect(models.heavy).toBe(2);
+      },
+    );
+    // 三个顺序阶段各继承既有 8 秒预算；模型请求启动、最终持久化和出站交付是不同边界。
+    await wait(
+      "matching native final, model completion and assistant persisted",
+      async () => {
+        const terminals = (
+          await f.db.information.find({
+            kinds: ["agent.heavy.tool.terminal.v1"],
+            limit: 10,
+          })
+        ).filter((atom) => atom.payload.runInformationId === runInformationId);
+        expect(terminals).toHaveLength(1);
+        expect(terminals[0]!.payload.reason).toBe("final");
+        const finalResult = terminals[0]!.payload.modelResult as any;
+        const completed = await f.db.information.get(
+          finalResult.terminalInformationId,
+        );
+        expect(completed?.kind).toBe("core.model.task.completed");
+        const assistants = await f.db.information.find({
+          kinds: ["core.message.assistant.text"],
+          limit: 10,
+        });
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0]!.payload.text).toBe("MCP completed");
+        expect(assistants[0]!.references).toContainEqual({
+          relation: "core:caused-by",
+          informationId: completed!.informationId,
+        });
+        assistantInformationId = assistants[0]!.informationId;
+      },
+    );
+    await wait(
+      "Heavy reply durably delivered and persistence settled",
+      async () => {
+        const deliveries = await f.db.information.find({
+          kinds: ["core.delivery.delivered"],
+          limit: 10,
+        });
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0]!.payload.ok).toBe(true);
+        const requestId = deliveries[0]!.references.find(
+          (reference) => reference.relation === "core:status-of",
+        )!.informationId;
+        const request = await f.db.information.get(requestId);
+        expect(request?.kind).toBe("core.delivery.requested");
+        expect(request!.references).toContainEqual({
+          relation: "core:caused-by",
+          informationId: assistantInformationId,
+        });
+        await expectPersistenceSettled(f.db);
+      },
+    );
+    // 队列收敛后只读一次正式 HTTP 历史，避免把持久化轮询变成受限流的重复请求。
+    const history = await server.app.inject({
+      method: "GET",
+      url: "/api/v1/messages?conversationId=47d34f33-c005-45e1-bae4-06df09bd9dc1",
+      headers: { authorization: "Bearer synthetic-gateway" },
     });
+    expect(history.statusCode).toBe(200);
+    expect(
+      history
+        .json()
+        .data.messages.filter((message: any) => message.role === "assistant"),
+    ).toEqual([
+      expect.objectContaining({ role: "assistant", text: "MCP completed" }),
+    ]);
     expect(
       (await f.logs()).filter((row) => row.kind === "effect"),
     ).toHaveLength(1);
@@ -404,7 +475,7 @@ it.each(["stdio", "http"] as const)(
     f.clearServer();
     if (mode === "stdio") expect(() => process.kill(pid, 0)).toThrow();
   },
-  30000,
+  40000, // 三段各 8 秒；其余预算用于真实 Server/DB 初始化、MCP 管理读取与清理。
 );
 it("still closes MCP when the Runtime cleanup reports a failure", async () => {
   const f = await fixture("stdio");
