@@ -35,6 +35,21 @@ def payload_empty(group):
     return not path.exists() or "populated 0" in path.read_text()
 
 
+def read_gate(proc, deadline):
+    ready = bytearray()
+    with selectors.DefaultSelector() as handshake:
+        handshake.register(proc.stdout, selectors.EVENT_READ)
+        while not ready.endswith(b"\n"):
+            if not handshake.select(max(0, deadline - time.monotonic())):
+                raise BrokerError("gate-ready-timeout")
+            data = os.read(proc.stdout.fileno(), 1)
+            if not data or len(ready) >= 128:
+                raise BrokerError("gate-ready-invalid")
+            ready.extend(data)
+    if ready != b"kaguya-job-ready\n":
+        raise BrokerError("gate-ready-invalid")
+
+
 def container_command(record):
     command = ["/usr/bin/podman", "--cgroup-manager=cgroupfs", "run", "--pull=never", "--interactive",
                "--name=" + record["container"], "--label=kaguya.environment=" + record["environmentId"],
@@ -103,18 +118,7 @@ def run(path):
         proc = subprocess.Popen(command, env=backend.env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         end = time.monotonic() + min(15, remaining(record))
-        ready = bytearray()
-        with selectors.DefaultSelector() as handshake:
-            handshake.register(proc.stdout, selectors.EVENT_READ)
-            while not ready.endswith(b"\n"):
-                if not handshake.select(max(0, end - time.monotonic())):
-                    raise BrokerError("gate-ready-timeout")
-                data = os.read(proc.stdout.fileno(), 1)
-                if not data or len(ready) >= 128:
-                    raise BrokerError("gate-ready-invalid")
-                ready.extend(data)
-        if ready != b"kaguya-job-ready\n":
-            raise BrokerError("gate-ready-invalid")
+        read_gate(proc, end)
         while time.monotonic() < end:
             if proc.poll() is not None:
                 os.write(streams["stderr"], proc.stderr.read(LOG_RESERVATION))
@@ -181,6 +185,7 @@ def run(path):
         try:
             backend.stop_container(record["container"])
         finally:
+            jobs.system("/usr/bin/systemctl", "--user", "stop", expiry_unit + ".timer", check=False)
             for fd in streams.values():
                 os.close(fd)
             if proc:

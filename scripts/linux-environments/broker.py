@@ -749,6 +749,9 @@ class PodmanBackend:
             return
         if exists.returncode != 0:
             raise BrokerError("isolation-unconfirmed")
+        # systemd 可能同时杀死 conmon 和 payload；先向 OCI runtime 同步，不能将
+        # 缺少 conmon exit-file 的缓存 Running/Pid 当作真实进程状态，也不能直接忽略它。
+        self.command("ps", "--all", "--sync", "--filter", "name=^" + name + "$", "--format={{.ID}}")
         current = json.loads(self.command("inspect", name))[0]["State"]
         if current["Running"]:
             try:
@@ -756,6 +759,7 @@ class PodmanBackend:
                 self.command("wait", name, timeout=15)
             except BrokerError:
                 pass  # 并发自然退出后仍以下面的真实状态为准。
+        self.command("ps", "--all", "--sync", "--filter", "name=^" + name + "$", "--format={{.ID}}")
         state = json.loads(self.command("inspect", name))[0]["State"]
         if state["Running"] or state.get("Pid", 0) != 0:
             raise BrokerError("isolation-unconfirmed")
