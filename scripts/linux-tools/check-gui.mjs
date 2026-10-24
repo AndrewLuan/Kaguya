@@ -5,6 +5,7 @@
  * 输入输出与副作用：仅临时 HOME；测试结束等待收尾并删除，PNG 字节用于原尺寸/hash 配对断言。
  */
 import test from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,6 +50,7 @@ async function fixture(t) {
       state.resetStarted?.resolve();
       await state.resetWait?.promise;
       if (state.failReset) throw new Error("release-unconfirmed");
+      state.resetFinished = true;
       return { keys: [], buttons: [], restoredKeycodes: [], roundTrip: true };
     },
     driverFactory: () => {
@@ -240,11 +242,20 @@ test("both audiences wait for input release before handoff acknowledgement", asy
     f.service.mode = "draining";
     let acknowledged = false;
     const handoff = f.component.isolate().then(() => {
+      assert.equal(
+        f.state.resetFinished,
+        true,
+        "ACK must follow reset completion",
+      );
       acknowledged = true;
     });
-    await f.state.resetStarted.promise;
-    assert.equal(acknowledged, false);
-    f.state.resetWait.resolve();
+    try {
+      await f.state.resetStarted.promise;
+      await nextTurn();
+      assert.equal(acknowledged, false);
+    } finally {
+      f.state.resetWait.resolve();
+    }
     await handoff;
     assert.equal((await action).status, "unknown");
     assert.equal(f.state.input.length, 1);

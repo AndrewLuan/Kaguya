@@ -61,6 +61,7 @@ export class ToolService {
         ready: !this.closed,
         generation: this.generation,
         mode: this.mode,
+        humanSessionId: this.humanSessionId,
         serviceInstanceId: this.instanceId,
         executors: this.components.map(
           (component) => component.identity?.() ?? { kind: "component" },
@@ -143,6 +144,7 @@ export class ToolService {
       humanInputsIsolated: true,
       generation: this.generation,
       mode: this.mode,
+      humanSessionId: this.humanSessionId,
     };
     this.controls.set(req.controlOperationId, {
       request: canonical(req),

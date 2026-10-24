@@ -154,6 +154,7 @@ jobs:
             gui-chromium.png
             gui-chromium-probe.json
             gui-chromium.log
+            gui-resources.json
             gui-chromium-ledger.json
             gui-gtk-ledger.json
             gui-key-events.json

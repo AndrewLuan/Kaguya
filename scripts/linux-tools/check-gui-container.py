@@ -196,6 +196,17 @@ finally:
         print(f"Primary GUI failure: {primary!r}", file=sys.stderr, flush=True)
         Path("gui-failure.txt").write_text("".join(traceback.format_exception(primary)))
     cleanup_errors = []
+    try:
+        if not podman_unresponsive:
+            # 双 GUI 应用、桌面服务与 Cua 的线程共同计入 pids 配额；记录内核计数，
+            # 使 renderer 的 pthread_create EAGAIN 可与该配额的实际命中区分。
+            resources = command("exec", name, "/usr/bin/python3", "-c",
+                "import json,pathlib; p=pathlib.Path('/sys/fs/cgroup'); "
+                "print(json.dumps({n:(p/n).read_text() for n in "
+                "['pids.current','pids.max','pids.events','memory.current','memory.events'] if (p/n).exists()}))", check=False)
+            Path("gui-resources.json").write_bytes(resources.stdout)
+    except Exception as error:
+        cleanup_errors.append(error)
     for source, destination in [("/home/tool/gui-probe.json", "gui-probe.json"),
                                 ("/home/tool/gui-gtk.png", "gui-gtk.png"),
                                 ("/home/tool/gui-desktop.png", "gui-desktop.png"),

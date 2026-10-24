@@ -34,7 +34,8 @@ class FakeBackend:
     def handoff(self, env, generation, mode):
         self.handoffs.append((env["container"], generation, mode))
         return {"helperProtocolVersion": 1, "generation": generation, "mode": mode,
-                "automationIsolated": True}
+                "automationIsolated": True, "humanInputsIsolated": True,
+                "humanSessionId": (env.get("pendingHuman") or {}).get("id")}
 
     def create(self, env):
         self.running.add(env["container"])
@@ -211,6 +212,121 @@ class BrokerTest(unittest.TestCase):
         with self.assertRaisesRegex(BrokerError, "original-operation-not-found"):
             self.broker.execute(other_verify)
         self.assertEqual(self.broker.execute(verify)["status"], "succeeded")
+
+    def test_gui_verify_checks_original_identity_and_preserves_unknown(self):
+        original = {**self.request("gui-source"), "toolName": "gui.act"}
+        self.backend.collect = lambda *_: {"status": "unknown", "result": {"reason": "receipt-lost"}}
+        self.assertEqual(self.broker.execute(original)["status"], "unknown")
+        record_key = next(k for k, value in self.broker.operations.items() if value["operationId"] == "gui-source")
+        saved = json.loads(json.dumps(self.broker.operations[record_key]))
+        verify = {**self.request("gui-verify"), "toolName": "gui.verify", "arguments": {
+            "original": {"operationId": "gui-source", "attemptId": "attempt"}, "contains": "current text"}}
+        for field, value in (("operationId", "missing"), ("attemptId", "wrong")):
+            with self.subTest(field=field), self.assertRaises(BrokerError):
+                self.broker.execute({**verify, "arguments": {**verify["arguments"], "original": {
+                    **verify["arguments"]["original"], field: value}}})
+        # 历史条目的身份由恢复日志提供；逐项污染该边界，验证新请求不能错误关联。
+        for field, value in (("scope", "other"), ("toolName", "browser.act"),
+                             ("environmentId", "other"), ("workspaceId", "other-ws")):
+            changed = json.loads(json.dumps(saved))
+            target = changed["body"]["environment"] if field in ("environmentId", "workspaceId") else changed["body"]
+            target[field] = value
+            self.broker.operations[record_key] = changed
+            try:
+                with self.subTest(field=field), self.assertRaisesRegex(BrokerError, "original-operation-mismatch"):
+                    self.broker.execute(verify)
+            finally:
+                self.broker.operations[record_key] = saved
+        self.assertEqual(self.backend.effects, 1)
+        self.backend.collect = lambda *_: {"status": "succeeded", "result": {"matched": True}}
+        self.assertTrue(self.broker.execute(verify)["result"]["matched"])
+        self.assertEqual(self.broker.operations[record_key], saved)
+        self.assertEqual(saved["outcome"]["status"], "unknown")
+
+    def begin_human(self):
+        control = {"environmentId": "env", "scope": "scope", "generation": 0,
+                   "controlAuthorizationId": "manual", "humanSession": {
+                       "id": "a" * 64, "token": "human-secret-" * 4, "ttlSeconds": 60}}
+        public = self.broker.handoff(control)
+        credential = {"environmentId": "env", "scope": "scope", "generation": 1,
+                      "sessionId": control["humanSession"]["id"], "token": control["humanSession"]["token"]}
+        return control, credential, public
+
+    def human_request(self, credential, operation="human-op"):
+        return {**self.request(operation), **credential, "toolName": "gui.act", "arguments": {"action": "click"}}
+
+    def test_human_session_is_private_idempotent_and_permit_bounded(self):
+        control, credential, public = self.begin_human()
+        self.assertEqual(self.broker.handoff(control), public)
+        self.assertEqual(len(self.backend.handoffs), 1)
+        self.assertNotIn("token", json.dumps(public))
+        self.assertNotIn(credential["token"], "".join(p.read_text() for p in self.broker.journal.path.glob("*.json")))
+        req = self.human_request(credential)
+        self.assertEqual(self.broker.human_execute(req)["status"], "succeeded")
+        sent = self.backend.requests[-1]
+        self.assertEqual(sent["kind"], "human-operation")
+        self.assertEqual(sent["permit"]["humanSessionId"], credential["sessionId"])
+        self.assertEqual(sent["permit"]["expiresAt"], "1970-01-01T00:17:40Z")
+        self.assertEqual(self.broker.human_execute(req)["status"], "succeeded")
+        self.assertEqual(self.backend.effects, 1)
+        self.now += 10
+        self.broker.human_renew({**credential, "ttlSeconds": 300})
+        self.assertEqual(sent["permit"]["expiresAt"], "1970-01-01T00:17:40Z")
+        for change in ({"token": "wrong"}, {"generation": 0}, {"sessionId": "b" * 64}):
+            with self.subTest(change=change), self.assertRaises(BrokerError):
+                self.broker.human_execute({**self.human_request(credential, "denied"), **change})
+        with self.assertRaisesRegex(BrokerError, "human-tool-not-allowed"):
+            self.broker.human_execute({**self.human_request(credential, "shell"), "toolName": "shell.exec"})
+        self.assertEqual(self.backend.effects, 1)
+
+    def test_human_close_expiry_and_resume_revoke_manual_credentials(self):
+        _, credential, _ = self.begin_human()
+        running = set(self.backend.running)
+        self.now += 61
+        with self.assertRaises(BrokerError):
+            self.broker.human_execute(self.human_request(credential))
+        self.broker.expire_humans()
+        env = self.broker.inspect({"environmentId": "env", "scope": "scope"})
+        self.assertEqual((env["state"], env["generation"]), ("human", 2))
+        self.assertEqual(self.broker.human_close(credential), env)
+        self.assertEqual(self.backend.running, running)
+        self.assertNotIn("human", env)
+        with self.assertRaises(BrokerError):
+            self.broker.acquire({"environmentId": "env", "scope": "scope", "workflowId": "flow"})
+        self.broker.resume({"environmentId": "env", "scope": "scope", "generation": 2, "controlAuthorizationId": "resume"})
+        with self.assertRaises(BrokerError):
+            self.broker.human_execute(self.human_request(credential))
+        self.assertEqual(self.backend.effects, 0)
+
+    def test_human_close_failed_ack_stays_draining_and_same_close_recovers(self):
+        _, credential, _ = self.begin_human()
+        handoff = self.backend.handoff
+        self.backend.handoff = lambda *_: {"helperProtocolVersion": 1, "automationIsolated": True,
+                                         "humanInputsIsolated": False, "generation": 2, "mode": "human"}
+        with self.assertRaisesRegex(BrokerError, "human-input-isolation-unconfirmed"):
+            self.broker.human_close(credential)
+        self.assertEqual(self.broker.environments["env"]["state"], "draining")
+        self.assertEqual(self.broker.environments["env"]["generation"], 1)
+        with self.assertRaises(BrokerError):
+            self.broker.human_execute(self.human_request(credential))
+        self.backend.handoff = handoff
+        self.assertEqual(self.broker.human_close(credential)["state"], "human")
+        self.assertEqual(self.backend.effects, 0)
+
+    def test_human_lost_receipt_stops_manual_inputs_and_queries_original_unknown(self):
+        _, credential, _ = self.begin_human()
+        self.backend.fail_after_effect = True
+        req = self.human_request(credential)
+        result = self.broker.human_execute(req)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(self.broker.environments["env"]["state"], "human")
+        self.assertIsNone(self.broker.environments["env"]["humanSession"])
+        query = {"environmentId": "env", "scope": "scope", "operationId": "human-op"}
+        self.assertEqual(self.broker.human_query(query), {"operationId": "human-op", "attemptId": "attempt", "outcome": result})
+        with self.assertRaises(BrokerError):
+            self.broker.human_execute(req)
+        self.assertEqual(self.backend.effects, 1)
+        self.assertIn(self.broker.environments["env"]["container"], self.backend.running)
 
     def test_production_tmpfs_ownership_uses_supported_U_option(self):
         backend = PodmanBackend()

@@ -5,11 +5,48 @@
  * 输入输出与副作用：仅合成页面，截图不缩放；未知结果不补发，finally 停止 Driver。
  */
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { CuaStdio } from "./cua-stdio.mjs";
 const driver = new CuaStdio();
-const evidence = {};
+const evidence = { navigation: [], resources: [] };
+async function resources(stage) {
+  const cgroup = {};
+  for (const name of [
+    "pids.current",
+    "pids.max",
+    "pids.events",
+    "memory.current",
+    "memory.events",
+  ])
+    cgroup[name] = await readFile(`/sys/fs/cgroup/${name}`, "utf8").catch(
+      () => "unavailable",
+    );
+  const processes = [];
+  for (const id of await readdir("/proc")) {
+    if (!/^\d+$/.test(id)) continue;
+    try {
+      const status = await readFile(`/proc/${id}/status`, "utf8");
+      const fields = Object.fromEntries(
+        status
+          .split("\n")
+          .filter((line) => /^(Name|State|PPid|Uid|Threads):/.test(line))
+          .map((line) => {
+            const [key, ...value] = line.split(":");
+            return [key, value.join(":").trim()];
+          }),
+      );
+      processes.push({
+        pid: Number(id),
+        ...fields,
+        exe: await readlink(`/proc/${id}/exe`).catch(() => "unavailable"),
+      });
+    } catch {
+      /* 只读采样时允许进程刚好退出。 */
+    }
+  }
+  evidence.resources.push({ stage, cgroup, processes });
+}
 const pid = Number(process.argv[2]);
 assert.ok(Number.isSafeInteger(pid) && pid > 1);
 const text = (r) =>
@@ -47,6 +84,7 @@ function element(result, name) {
   return `${snapshot}:${index}`;
 }
 try {
+  await resources("before-driver");
   await driver.start();
   evidence.before = await state("Browser increment once");
   const windowId = Number(/window_id=(\d+)/.exec(text(evidence.before))?.[1]);
@@ -88,8 +126,10 @@ try {
       { pid, window_id: windowId, delivery_mode: "foreground", ...args },
       () => {},
     );
+    evidence.navigation.push({ name, args, result });
     assert.notEqual(result.isError, true, JSON.stringify(result));
   };
+  await resources("before-new-tab");
   await browserInput("hotkey", { keys: ["ctrl", "t"] });
   await state("New Tab", (result) =>
     (result.structuredContent?.window_title ?? "").includes("New Tab"),
@@ -125,6 +165,7 @@ try {
   );
 } finally {
   try {
+    await resources("before-driver-stop");
     await writeFile(
       "/home/tool/gui-chromium-probe.json",
       JSON.stringify(evidence),
