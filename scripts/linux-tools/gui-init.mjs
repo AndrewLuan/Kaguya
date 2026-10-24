@@ -5,6 +5,7 @@
  * 输入输出与副作用：显示服务退出即结束入口；SIGTERM 关闭显示，正常 handoff 不调用此关闭路径。
  */
 import { spawn } from "node:child_process";
+import { startService } from "./service.mjs";
 if (process.getuid() !== 1000) throw new Error("gui-control-uid-required");
 const display = spawn(
   "/usr/bin/Xvfb",
@@ -13,4 +14,7 @@ const display = spawn(
 );
 display.once("error", () => process.exit(1));
 display.once("exit", (code) => process.exit(code || 1));
-process.once("SIGTERM", () => display.kill("SIGTERM"));
+const control = await startService();
+process.once("SIGTERM", () => {
+  void control.close().finally(() => display.kill("SIGTERM"));
+});

@@ -27,18 +27,21 @@ os.environ.update(HOME="/home/app/session", DISPLAY=":99", XDG_RUNTIME_DIR="/run
                   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/kaguya-app/session/bus",
                   GTK_MODULES="gail:atk-bridge", NO_AT_BRIDGE="0", GTK_A11Y="always")
 children = []
+critical = []
 
 
-def start(args):
+def start(args, required=True):
     child = subprocess.Popen(args)
     children.append(child)
+    if required:
+        critical.append(child)
     return child
 
 
 def ready(args, seconds=12):
     deadline = time.monotonic() + seconds
     while True:
-        if any(child.poll() is not None for child in children):
+        if any(child.poll() is not None for child in critical):
             raise RuntimeError("gui-session-child-exited")
         result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
         if result.returncode == 0:
@@ -61,10 +64,10 @@ try:
     start(["/usr/libexec/at-spi-bus-launcher", "--launch-immediately"])
     ready(["/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
     start(["/usr/bin/openbox", "--config-file", "/opt/kaguya-tools/gui-openbox.xml"])
-    start(["/usr/bin/xterm", "-title", "Kaguya isolated terminal"])
+    start(["/usr/bin/xterm", "-fa", "monospace", "-fs", "11", "-title", "Kaguya isolated terminal"], required=False)
     while True:
         # 这里是会话存活监视；就绪和测试行为使用上方有界条件，不以休眠猜测完成。
-        for child in children:
+        for child in critical:
             if child.poll() is not None:
                 raise RuntimeError("gui-session-child-exited")
         time.sleep(.2)

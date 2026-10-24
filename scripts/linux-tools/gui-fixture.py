@@ -24,7 +24,18 @@ count = 0
 
 
 def save(*_args):
-    Path("/home/app/session/gui-ledger.json").write_text(json.dumps({"uid": os.getuid(), "pid": os.getpid(), "text": entry.get_text(), "count": count}))
+    path = Path("/home/app/session/gui-ledger.json")
+    pending = path.with_suffix(".pending")
+    with pending.open("w") as stream:
+        json.dump({"uid": os.getuid(), "pid": os.getpid(), "text": entry.get_text(), "count": count}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(pending, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def increment(_button):

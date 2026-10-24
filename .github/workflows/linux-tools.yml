@@ -26,6 +26,7 @@ jobs:
           node --test scripts/linux-tools/check-browser-input.mjs
           node --test scripts/linux-tools/check-browser-freshness.mjs
           python3 -B scripts/linux-tools/check_files.py
+          python3 -B scripts/linux-tools/check_gui_x11.py
       - name: Prepare pinned OCI builder
         run: |
           docker buildx create --name kaguya-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
@@ -139,13 +140,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
+          name: gui-evidence-${{ github.sha }}
+          path: |
+            gui-container-receipt.json
+            gui-probe.json
+            gui-packages.txt
+            gui-gtk.png
+            gui-desktop.png
+          retention-days: 7
+      - name: Preserve GUI image
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
           name: gui-tools-${{ github.sha }}
           path: |
             gui-tools.oci
             gui-tools.oci.sha256
             gui-image.digest
             gui-image-metadata.json
-            gui-container-receipt.json
-            gui-probe.json
-            gui-packages.txt
           retention-days: 7

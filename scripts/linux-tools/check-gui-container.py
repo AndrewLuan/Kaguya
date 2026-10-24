@@ -19,6 +19,7 @@ parser.add_argument("--archive", required=True)
 parser.add_argument("--digest", required=True)
 args = parser.parse_args()
 name = "kaguya-gui-ci-" + uuid.uuid4().hex
+probe_process = None
 
 
 def command(*parts, timeout=30, check=True):
@@ -39,6 +40,17 @@ def until(parts, seconds=15):
         time.sleep(.02)
 
 
+def until_json(parts, predicate, seconds=15):
+    deadline = time.monotonic() + seconds
+    while True:
+        value = json.loads(command(*parts).stdout)
+        if predicate(value):
+            return value
+        if time.monotonic() >= deadline:
+            raise AssertionError({"applicationConditionTimeout": value})
+        time.sleep(.02)
+
+
 info = json.loads(command("info", "--format=json").stdout)
 assert info["host"]["security"]["rootless"] is True
 command("load", "--input", str(Path(args.archive).resolve()), timeout=300)
@@ -53,7 +65,9 @@ try:
             "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
             "--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,mode=1777",
             "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,mode=1777",
-            "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U", image)
+            "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
+            "--env=KAGUYA_ENVIRONMENT_ID=" + name, "--env=KAGUYA_ENVIRONMENT_GENERATION=0",
+            "--env=KAGUYA_HELPER_PROTOCOL_VERSION=1", image)
     container = json.loads(command("inspect", name).stdout)[0]
     oci = json.loads(command("unshare", "/bin/cat", container["OCIConfigPath"]).stdout)
     assert oci["process"]["user"]["uid"] == 1000
@@ -70,9 +84,16 @@ try:
     until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/session/gui-ledger.json"])
     ledger = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
     assert ledger["uid"] == 1001
-    probe = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"]), timeout=120)
-    print(probe.stdout.decode(), flush=True)
-    after = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
+    probe_process = subprocess.Popen(["/usr/bin/podman", "exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    driver = json.loads(until(["exec", name, "/bin/cat", "/home/tool/gui-probe-driver.json"]))
+    isolation = command("exec", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-isolation-probe.py", str(driver["pid"]))
+    print(isolation.stdout.decode(), flush=True)
+    command("exec", name, "/usr/bin/touch", "/home/tool/gui-probe-continue")
+    output, errors = probe_process.communicate(timeout=120)
+    if probe_process.returncode:
+        raise RuntimeError(errors.decode(errors="replace"))
+    print(output.decode(), flush=True)
+    after = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json"], lambda value: value["text"] == "W8 暂存" and value["count"] == 1)
     assert after == {"uid": 1001, "pid": ledger["pid"], "text": "W8 暂存", "count": 1}, after
     print(json.dumps({"independentApplicationLedger": after}), flush=True)
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
@@ -82,6 +103,8 @@ finally:
     primary = sys.exc_info()[1]
     cleanup_errors = []
     for source, destination in [("/home/tool/gui-probe.json", "gui-probe.json"),
+                                ("/home/tool/gui-gtk.png", "gui-gtk.png"),
+                                ("/home/tool/gui-desktop.png", "gui-desktop.png"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
         try:
             value = command("exec", name, "/bin/cat", source, check=False)
@@ -104,5 +127,12 @@ finally:
         command("rm", "--force", "--ignore", name)
     except Exception as error:
         cleanup_errors.append(error)
+    if probe_process is not None:
+        try:
+            if probe_process.poll() is None:
+                probe_process.kill()
+            probe_process.wait(timeout=5)
+        except Exception as error:
+            cleanup_errors.append(error)
     if cleanup_errors:
         raise BaseExceptionGroup("gui fixture cleanup failed", ([primary] if primary else []) + cleanup_errors)

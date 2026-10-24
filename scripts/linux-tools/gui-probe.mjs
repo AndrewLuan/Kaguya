@@ -4,13 +4,27 @@
  * 代码库关系：check-gui-container.py 启动 GTK fixture 后调用；后续动作验收共用此通道。
  * 输入输出与副作用：证据写入可信 HOME，stdout 只含摘要；finally 等待 Driver 进程组消失。
  */
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, stat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { CuaStdio } from "./cua-stdio.mjs";
 await mkdir("/home/tool/runtime", { mode: 0o700, recursive: true });
 const driver = new CuaStdio();
 const evidence = {};
+async function observed(read, predicate, label) {
+  const deadline = Date.now() + 15000;
+  while (true) {
+    const result = await read();
+    assert.notEqual(result.isError, true, `${label}:tool-error`);
+    if (predicate(result)) return result;
+    if (Date.now() >= deadline)
+      throw new Error(
+        `${label}:condition-timeout:${text(result).slice(0, 2000)}`,
+      );
+    await delay(20);
+  }
+}
 const text = (result) =>
   result.content
     ?.filter((c) => c.type === "text")
@@ -33,15 +47,38 @@ try {
   );
   evidence.wishExcluded = true;
   const discovery = (evidence.discovery = await driver.start());
-  const windows = (evidence.windows = await driver.call("list_windows", {}));
+  await writeFile(
+    "/home/tool/gui-probe-driver.json",
+    JSON.stringify(driver.identity()),
+  );
+  const admissionDeadline = Date.now() + 30000;
+  while (true) {
+    try {
+      await stat("/home/tool/gui-probe-continue");
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (Date.now() >= admissionDeadline)
+      throw new Error("isolation-probe-not-completed");
+    await delay(20);
+  }
+  const windows = (evidence.windows = await observed(
+    () => driver.call("list_windows", {}),
+    (result) => text(result).includes("Kaguya GUI acceptance"),
+    "gtk-window-published",
+  ));
   assert.notEqual(windows.isError, true);
   assert.match(JSON.stringify(windows), /Kaguya GUI acceptance/);
   const pid = Number(process.argv[2]);
   assert.ok(Number.isSafeInteger(pid) && pid > 1);
-  const window = (evidence.window = await driver.call("get_window_state", {
-    pid,
-    max_image_dimension: 0,
-  }));
+  const window = (evidence.window = await observed(
+    () => driver.call("get_window_state", { pid, max_image_dimension: 0 }),
+    (result) =>
+      text(result).includes("Unsaved text") &&
+      text(result).includes("Increment once"),
+    "gtk-accessibility-published",
+  ));
   assert.notEqual(window.isError, true);
   assert.match(text(window), /Unsaved text/);
   assert.match(text(window), /Increment once/);
@@ -89,28 +126,32 @@ try {
     () => assert.equal(process.getuid(), 1000),
   ));
   assert.notEqual(typed.isError, true);
-  evidence.after = await driver.call("get_window_state", {
-    pid,
-    window_id: windowId,
-  });
+  evidence.after = await observed(
+    () =>
+      driver.call("get_window_state", {
+        pid,
+        window_id: windowId,
+        max_image_dimension: 0,
+      }),
+    (result) => text(result).includes("W8 暂存"),
+    "gtk-text-delivered",
+  );
   assert.match(text(evidence.after), /W8 暂存/);
+  for (const [name, result] of [
+    ["gui-gtk.png", evidence.after],
+    ["gui-desktop.png", desktop],
+  ]) {
+    const picture = result.content?.find((c) => c.type === "image");
+    assert.equal(picture?.mimeType, "image/png");
+    await writeFile(`/home/tool/${name}`, Buffer.from(picture.data, "base64"));
+  }
   console.log(
     JSON.stringify({
       driver: driver.identity(),
       tools: discovery.discovered.tools.length,
-      windows,
-      desktop: {
-        ...desktop,
-        content: desktop.content?.map((c) =>
-          c.type === "image"
-            ? {
-                type: c.type,
-                mimeType: c.mimeType,
-                bytes: Buffer.from(c.data, "base64").length,
-              }
-            : c,
-        ),
-      },
+      windowText: text(evidence.after),
+      desktopText: text(desktop),
+      screenshots: ["gui-gtk.png", "gui-desktop.png"],
     }),
   );
 } catch (error) {
