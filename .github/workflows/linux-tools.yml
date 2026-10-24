@@ -23,6 +23,8 @@ jobs:
       - name: Real subprocess helper contracts
         run: |
           node --test scripts/linux-tools/check-shell.mjs
+          node --test scripts/linux-tools/check-browser-input.mjs
+          node --test scripts/linux-tools/check-browser-freshness.mjs
           python3 -B scripts/linux-tools/check_files.py
       - name: Prepare pinned OCI builder
         run: |
@@ -59,4 +61,46 @@ jobs:
             shell-image.digest
             shell-image-metadata.json
             shell-container-receipt.json
+          retention-days: 7
+  chromium:
+    name: Chromium image and rootless sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare pinned OCI builder
+        run: |
+          docker buildx create --name kaguya-browser-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
+          docker buildx inspect --bootstrap
+      - name: Build fixed Chromium Linux amd64 OCI image
+        run: >-
+          docker buildx build --platform linux/amd64
+          --provenance=false --sbom=false
+          --file scripts/linux-tools/Dockerfile.chromium
+          --tag localhost/kaguya-chromium:ci
+          --output type=oci,dest=chromium-tools.oci
+          --metadata-file chromium-image-metadata.json .
+      - name: Record archive and image identities
+        run: |
+          sha256sum chromium-tools.oci > chromium-tools.oci.sha256
+          node -e "const f=require('fs');const m=JSON.parse(f.readFileSync('chromium-image-metadata.json'));f.writeFileSync('chromium-image.digest',m['containerimage.digest']+'\\n')"
+      - name: Verify Chromium sandbox with production W6 parameters
+        run: >-
+          python3 -B scripts/linux-tools/check-browser-container.py
+          --archive chromium-tools.oci --digest "$(cat chromium-image.digest)"
+          > chromium-container-receipt.json
+      - name: Show actual Chromium diagnostics
+        if: always()
+        run: test ! -f chromium-container-receipt.json || cat chromium-container-receipt.json
+      - name: Preserve Chromium OCI image and sandbox receipt
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: chromium-tools-${{ github.sha }}
+          path: |
+            chromium-tools.oci
+            chromium-tools.oci.sha256
+            chromium-image.digest
+            chromium-image-metadata.json
+            chromium-container-receipt.json
           retention-days: 7

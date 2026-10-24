@@ -1,6 +1,7 @@
 """功能概述：Linux 工具环境的唯一租约/代次权威，持久保存操作事实而不重试未知副作用。
 主要职责：Journal 原子追加 fsync 事件；Broker 管理 acquire/renew/release/takeover、
 实际入口 fencing、取消 tombstone、历史核对及内容寻址产物；PodmanBackend 固定容器参数。
+可信 Chromium 桌面可显式选择固定 seccomp profile，仅调整内层 sandbox 所需 chroot。
 代码库关系：server.py 验 SO_PEERCRED 后调用；TypeScript provider 消费 ActionExecution。
 shell_jobs/job_runner 在宿主监督独立命令容器；GUI/browser helper 从不执行任意 shell。
 输入输出与副作用：按环境锁串行 admission/启动，外部完成等待不占全局锁；接管先隔离容器。
@@ -23,6 +24,25 @@ import subprocess
 import threading
 import time
 import uuid
+
+CHROMIUM_POLICIES = {
+    # runtime 版本与发行包默认 profile 必须同时匹配；未知组合不能回退到旧策略。
+    ("4.9.3", "cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c"):
+        ("chromium-seccomp.json", "8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f"),
+    ("5.7.0", "886ae167646b7e5db381ecf7c31e6de720a8e8da15cf3202fe1f67f424af2b75"):
+        ("chromium-seccomp-podman5.json", "4b6639b4c07a385384148acfbb74d950c69137075e10675092a3d689d93ce1c3"),
+}
+
+
+def chromium_profile(version, default_sha256):
+    selected = CHROMIUM_POLICIES.get((version, default_sha256))
+    if selected is None:
+        raise BrokerError("chromium-runtime-policy-unreviewed")
+    name, sha256 = selected
+    profile = Path(__file__).resolve().with_name(name)
+    if profile.is_symlink() or hashlib.sha256(profile.read_bytes()).hexdigest() != sha256:
+        raise BrokerError("chromium-seccomp-integrity")
+    return profile
 
 
 class BrokerError(Exception):
@@ -240,6 +260,8 @@ class Broker:
             raise BrokerError("immutable-image-required")
         if req.get("network", "none") not in ("none", "public-web"):
             raise BrokerError("network-policy-not-allowed")
+        if req.get("sandboxPolicy", "default") not in ("default", "chromium-v1"):
+            raise BrokerError("sandbox-policy-not-allowed")
         resources = req["resourceIds"]
         if not isinstance(resources, list) or not 0 < len(resources) <= 16 or len(set(resources)) != len(resources):
             raise BrokerError("invalid-resources")
@@ -259,6 +281,7 @@ class Broker:
                     raise BrokerError("resource-already-owned")
                 env = {"environmentId": env_id, "scope": text(req["scope"]), "workspaceId": workspace,
                        "resourceIds": resources, "image": image, "network": req.get("network", "none"),
+                       "sandboxPolicy": req.get("sandboxPolicy", "default"),
                        "generation": 0, "fencing": "0", "lease": None, "state": "preparing",
                        "container": "kaguya-" + digest(env_id)[:20] + "-0"}
                 self._save_env(env)
@@ -443,7 +466,7 @@ class Broker:
             key, old, body = self._operation(req)
             if old:
                 return old.get("outcome", outcome())
-            if req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify":
+            if (req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify") or req["toolName"] == "browser.verify":
                 original = req["arguments"].get("original")
                 if not isinstance(original, dict):
                     raise BrokerError("original-operation-required")
@@ -452,6 +475,8 @@ class Broker:
                 if previous is None:
                     raise BrokerError("original-operation-not-found")
                 source = previous["body"]
+                if req["toolName"] == "browser.verify" and source["toolName"] != "browser.act":
+                    raise BrokerError("original-operation-mismatch")
                 if (source["scope"] != req["scope"] or source["attemptId"] != attempt or
                         source["environment"]["environmentId"] != env_id or
                         source["environment"]["workspaceId"] != env["workspaceId"]):
@@ -695,8 +720,11 @@ class PodmanBackend:
         volume = "kaguya-workspace-" + digest(env["workspaceId"])[:24]
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
         member_args = []
+        if env.get("sandboxPolicy") == "chromium-v1":
+            profile = self.chromium_profile()
+            member_args += ["--security-opt=seccomp=" + str(profile), "--env=KAGUYA_BROWSER_ENABLED=1"]
         if self.shell is not None:
-            member_args = ["--cgroup-parent=" + self.shell.configure_environment(env),
+            member_args += ["--cgroup-parent=" + self.shell.configure_environment(env),
                            "--label=kaguya.role=desktop", "--volume",
                            "kaguya-private-" + digest(env["environmentId"])[:24] + ":/private:rw"]
         self.command("run", "--detach", "--pull=never", "--name", env["container"],
@@ -721,6 +749,14 @@ class PodmanBackend:
         if (ready.get("helperProtocolVersion") != 1 or ready.get("ready") is not True or
                 ready.get("generation") != env["generation"]):
             raise BrokerError("helper-not-ready")
+
+    def chromium_profile(self):
+        info = json.loads(self.command("info", "--format=json"))
+        security = info["host"]["security"]
+        default = Path(security["seccompProfilePath"])
+        if not security["rootless"] or not security["seccompEnabled"] or default.is_symlink():
+            raise BrokerError("chromium-runtime-policy-unreviewed")
+        return chromium_profile(info["version"]["Version"], hashlib.sha256(default.read_bytes()).hexdigest())
 
     def handoff(self, env, generation, mode):
         if self.shell is not None:

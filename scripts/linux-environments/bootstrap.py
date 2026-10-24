@@ -2,7 +2,7 @@
 """功能概述：由用户在 Linux 本机执行的一次管理员安装入口，不从聊天代理执行 sudo。
 主要职责：check 只读预检；apply 安装 rootless 前置、专用账户、UID 网络策略与用户 broker；
 rollback 只停用本安装的服务和规则，保留账户、subid、操作日志、工作区与产物。
-代码库关系：将同目录 server.py/broker.py/shell_jobs.py/job_runner.py 安装为 root 拥有的代码；runtime/environment.ts
+代码库关系：将同目录 broker、supervisor 与固定 Chromium seccomp 安装为 root 拥有的文件；runtime/environment.ts
 通过固定 Unix socket 调用。安装不拉取镜像、不创建任务、不接触 Kaguya/QQ/PostgreSQL。
 输入输出与副作用：固定系统路径，显式受信用户名；拒绝符号链接、冲突账户和现存异构配置。
 """
@@ -30,7 +30,7 @@ STATE = Path("/var/lib/kaguya-tools")
 CODE = Path("/usr/local/lib/kaguya-tools")
 CONFIG = Path("/etc/kaguya-tools")
 STORAGE = Path("/var/lib/kaguya-tools-storage")
-PACKAGES = ["podman", "uidmap", "passt", "crun", "fuse-overlayfs", "python3",
+PACKAGES = ["podman", "golang-github-containers-common", "uidmap", "passt", "crun", "fuse-overlayfs", "python3",
             "dbus-user-session", "libpam-systemd", "ca-certificates", "acl", "nftables", "e2fsprogs", "util-linux"]
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 
@@ -216,7 +216,7 @@ WantedBy=multi-user.target
 def install_packages(source):
     manifest = json.loads((source / "packages.lock.json").read_text())
     pins = manifest["executionPackages"]
-    if set(pins) != {"podman", "uidmap", "passt", "crun", "fuse-overlayfs"} or manifest["source"] != "https://mirrors.ustc.edu.cn/ubuntu":
+    if set(pins) != {"podman", "golang-github-containers-common", "uidmap", "passt", "crun", "fuse-overlayfs"} or manifest["source"] != "https://mirrors.ustc.edu.cn/ubuntu":
         raise RuntimeError("invalid-package-manifest")
     # 本次进程使用独立源和签名索引，避免同版本包被其他配置源抢选；不修改系统 APT 源。
     with tempfile.TemporaryDirectory(prefix="kaguya-tools-apt-") as directory:
@@ -310,7 +310,7 @@ def apply(user):
         raise RuntimeError("administrator-required")
     source = Path(__file__).resolve().parent
     # 先检查完整交付物，避免仅安装半套 broker 后开放入口。
-    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "packages.lock.json"):
+    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json", "packages.lock.json"):
         if not (source / name).is_file() or (source / name).is_symlink():
             raise RuntimeError("missing-reviewed-broker-payload")
     try:
@@ -350,7 +350,7 @@ def apply(user):
     os.chmod(STATE, 0o700)
     os.chown(STATE, account.pw_uid, account.pw_gid)
     mounts = provision_storage(account, trusted)
-    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py"):
+    for name in ("server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json"):
         write_root(CODE / name, (source / name).read_text())
     config = {"installation": "kaguya-linux-environments-v1", "trustedUid": trusted.pw_uid, "serviceUid": account.pw_uid,
               "state": str(STORAGE / "state/broker"), "socket": "/run/kaguya-tools/broker.sock",
@@ -419,7 +419,7 @@ WantedBy=default.target
     receipt = {"serviceUid": account.pw_uid, "trustedUid": trusted.pw_uid,
                "packages": actual_versions,
                "sourceHashes": {n: hashlib.sha256((source / n).read_bytes()).hexdigest()
-                                for n in ("bootstrap.py", "server.py", "broker.py", "shell_jobs.py", "job_runner.py", "packages.lock.json")}}
+                                for n in ("bootstrap.py", "server.py", "broker.py", "shell_jobs.py", "job_runner.py", "chromium-seccomp.json", "chromium-seccomp-podman5.json", "packages.lock.json")}}
     write_root(CONFIG / "installation.json", json.dumps(receipt, indent=2) + "\n")
     print(json.dumps({"installed": True, "serviceUid": account.pw_uid,
                       "trustedUid": trusted.pw_uid, "tasksStarted": 0}))

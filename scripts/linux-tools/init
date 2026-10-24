@@ -3,4 +3,9 @@
  * 代码库关系：broker 的 ready/control/operation 通过 helper 接入 service.mjs；不连接模型或宿主桌面。 */
 import { startService } from './service.mjs';
 if (process.env.KAGUYA_HELPER_PROTOCOL_VERSION !== '1') throw new Error('helper-protocol-mismatch');
-await startService();
+const components = [];
+if (process.env.KAGUYA_BROWSER_ENABLED === '1') {
+  const { BrowserComponent } = await import('./browser.mjs');
+  components.push(new BrowserComponent());
+}
+await startService({ components });

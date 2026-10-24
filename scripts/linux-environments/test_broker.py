@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from broker import Broker, BrokerError, PodmanBackend
+from broker import Broker, BrokerError, PodmanBackend, chromium_profile, CHROMIUM_POLICIES
 
 
 class FakeBackend:
@@ -226,6 +226,36 @@ class BrokerTest(unittest.TestCase):
         self.assertIn("--read-only", args)
         self.assertIn("--cap-drop=ALL", args)
         self.assertIn("--security-opt=no-new-privileges", args)
+
+    def test_chromium_profile_is_explicit_and_keeps_outer_isolation(self):
+        backend = PodmanBackend()
+        calls = []
+        def command(*args, **_kwargs):
+            calls.append(args)
+            return b'[{"State":{"Running":true}}]' if args[0] == "inspect" else b""
+        with patch.object(backend, "chromium_profile", return_value=Path(__file__).with_name("chromium-seccomp.json")), patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0}):
+            backend.create({**self.env, "container": "controlled", "network": "none", "sandboxPolicy": "chromium-v1"})
+        args = calls[0]
+        profile_arg = next(a for a in args if a.startswith("--security-opt=seccomp="))
+        profile = json.loads(Path(profile_arg.split("=", 2)[2]).read_text())
+        self.assertEqual(profile["defaultAction"], "SCMP_ACT_ERRNO")
+        self.assertEqual([r for r in profile["syscalls"] if "chroot" in r["names"]], [{
+            "names": ["chroot"], "action": "SCMP_ACT_ALLOW", "args": [],
+            "comment": "Chromium sandbox chroot inside its own user namespace; outer container capabilities remain empty.",
+            "includes": {}, "excludes": {}}])
+        self.assertTrue(any(r["action"] == "SCMP_ACT_ERRNO" and "bpf" in r["names"] for r in profile["syscalls"]))
+        for option in ("--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--user=1000:1000", "--pid=private", "--ipc=private"):
+            self.assertIn(option, args)
+        with self.assertRaisesRegex(BrokerError, "sandbox-policy-not-allowed"):
+            self.broker.create({"environmentId": "bad", "image": "example.org/tools@sha256:" + "1" * 64, "sandboxPolicy": "unconfined"})
+
+    def test_chromium_runtime_and_distribution_profile_are_both_required(self):
+        for (version, sha), (name, _) in CHROMIUM_POLICIES.items():
+            self.assertEqual(chromium_profile(version, sha).name, name)
+            with self.assertRaisesRegex(BrokerError, "runtime-policy-unreviewed"):
+                chromium_profile(version, "0" * 64)
+        with self.assertRaisesRegex(BrokerError, "runtime-policy-unreviewed"):
+            chromium_profile("5.7.0", next(sha for version, sha in CHROMIUM_POLICIES if version == "4.9.3"))
 
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()
