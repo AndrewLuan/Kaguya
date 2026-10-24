@@ -431,6 +431,19 @@ class Broker:
             key, old, body = self._operation(req)
             if old:
                 return old.get("outcome", outcome())
+            if req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify":
+                original = req["arguments"].get("original")
+                if not isinstance(original, dict):
+                    raise BrokerError("original-operation-required")
+                original_id, attempt = text(original.get("operationId")), text(original.get("attemptId"))
+                previous = self.operations.get(digest([env_id, original_id]))
+                if previous is None:
+                    raise BrokerError("original-operation-not-found")
+                source = previous["body"]
+                if (source["scope"] != req["scope"] or source["attemptId"] != attempt or
+                        source["environment"]["environmentId"] != env_id or
+                        source["environment"]["workspaceId"] != env["workspaceId"]):
+                    raise BrokerError("original-operation-mismatch")
             if shutil.disk_usage(self.root).free < 64 * 1024 ** 2:
                 raise BrokerError("journal-reserve-required")
             if any(o["body"]["environment"]["environmentId"] == env_id and
@@ -679,8 +692,8 @@ class PodmanBackend:
                      "--label", "kaguya.environment=" + env["environmentId"],
                      "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges", "--read-only", "--network=" + network,
-                     "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=2", "--memory=4g",
-                     "--memory-swap=4g", "--pids-limit=512", "--shm-size=512m", "--init",
+                     "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
+                     "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
                      "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
                      "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
                      "--volume", volume + ":/workspace:rw", "--env=HOME=/home/tool",

@@ -31,6 +31,13 @@ MIMES = {"image/png", "image/jpeg", "image/webp", "text/plain", "text/csv", "app
 TERMINAL = {"exited", "stopped", "unknown"}
 
 
+class SystemCommandError(BrokerError):
+    def __init__(self, args, result):
+        super().__init__("systemd-job-command-failed")
+        self.diagnostic = {"command": args, "exitCode": result.returncode,
+                           "stderr": result.stderr.decode(errors="replace")[:4096]}
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -118,7 +125,7 @@ class ShellJobs:
         result = subprocess.run(args, env=self.backend.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         if check and result.returncode:
-            raise BrokerError("systemd-job-command-failed")
+            raise SystemCommandError(args, result)
         return result
 
     def properties(self, unit):
@@ -133,14 +140,23 @@ class ShellJobs:
     def configure_environment(self, env):
         # 动态 slice 的限制覆盖桌面、全部 job 以及各自 conmon，而非每个容器重复领取总额。
         name = self.slice(env)
+        self.system("/usr/bin/systemctl", "--user", "set-property", "--runtime", "kaguya.slice",
+                    "CPUQuota=400%", "MemoryMax=10G", "MemorySwapMax=0", "TasksMax=1200")
         self.system("/usr/bin/systemctl", "--user", "set-property", "--runtime", name,
                     "CPUQuota=200%", "MemoryMax=4G", "MemorySwapMax=0", "TasksMax=512")
         self.system("/usr/bin/systemctl", "--user", "start", name)
+        self.system("/usr/bin/systemctl", "--user", "set-property", "--runtime", self.job_slice(env),
+                    "CPUQuota=100%", "MemoryMax=2G", "MemorySwapMax=0", "TasksMax=256")
+        self.system("/usr/bin/systemctl", "--user", "start", self.job_slice(env))
         return name
 
     @staticmethod
     def slice(env):
         return "kaguya-e" + digest(env["environmentId"])[:24] + ".slice"
+
+    @classmethod
+    def job_slice(cls, env):
+        return cls.slice(env).removesuffix(".slice") + "-jobs.slice"
 
     def records(self, env=None):
         for path in sorted(self.root.glob("*/manifest.json")):
@@ -202,7 +218,8 @@ class ShellJobs:
                     raise BrokerError("original-operation-mismatch")
                 return success({"original": original, "checkedAt": now_iso(), "job": self.view(path, record)})
             result = self.workspace_read(env, a.get("path"), expires)
-            return success({"original": original, "checkedAt": now_iso(), "path": a["path"], **result})
+            return success({"original": original, "checkedAt": now_iso(), "verificationKind": "current-file-state",
+                            "path": a["path"], **result})
         if a.get("mode") == "export":
             root, path = None, a.get("path")
             if a.get("jobId"):
@@ -290,7 +307,7 @@ class ShellJobs:
                   "bootDeadline": time.clock_gettime(time.CLOCK_BOOTTIME) + left, "bootId": boot_id(),
                   "startedAt": now_iso(), "uid": 1000, "gid": 1000, "exitCode": None, "signal": None,
                   "unit": "kaguya-job-" + job_id + ".service", "container": "kaguya-job-" + job_id,
-                  "slice": self.slice(env), "image": env["image"], "network": env["network"],
+                  "slice": self.job_slice(env), "image": env["image"], "network": env["network"],
                   "volume": "kaguya-workspace-" + digest(env["workspaceId"])[:24],
                   "argv": argv, "env": variables, "hostEnv": self.backend.env}
         write_json(path / "manifest.json", record, exclusive=True)

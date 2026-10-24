@@ -386,6 +386,7 @@ ConditionUser={ACCOUNT}
 [Service]
 ExecStart=/usr/bin/python3 -I {CODE}/server.py {CONFIG}/config.json
 UMask=0077
+Slice=kaguya.slice
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=30

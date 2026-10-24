@@ -75,7 +75,7 @@ def run(path):
                "--label=kaguya.generation=" + str(record["generation"]), "--cgroups=split",
                "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--read-only", "--ipc=private", "--pid=private",
-               "--cgroupns=private", "--cpus=2", "--memory=4g", "--memory-swap=4g", "--pids-limit=512",
+               "--cgroupns=private", "--cpus=1", "--memory=2g", "--memory-swap=2g", "--pids-limit=256",
                "--shm-size=512m", "--init", "--log-driver=none", "--restart=no",
                "--network=" + ("none" if record["network"] == "none" else "pasta:--no-map-gw"),
                "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
@@ -176,4 +176,6 @@ if __name__ == "__main__":
         run(Path(sys.argv[1]))
     except Exception as error:
         print(type(error).__name__ + ": " + str(error), file=sys.stderr)
+        if hasattr(error, "diagnostic"):
+            print(json.dumps(error.diagnostic), file=sys.stderr)
         sys.exit(1)

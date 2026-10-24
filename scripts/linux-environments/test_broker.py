@@ -134,6 +134,25 @@ class BrokerTest(unittest.TestCase):
             self.backend.fail_stop = False
         self.assertEqual(self.broker.release(self.request())["state"], "quarantined")
 
+    def test_file_verify_requires_existing_same_environment_scope_and_attempt(self):
+        original = self.request("source")
+        self.broker.execute(original)
+        verify = {**self.request("verify"), "arguments": {"mode": "verify", "path": "file",
+                  "original": {"operationId": "source", "attemptId": "attempt"}}}
+        for reference in ({"operationId": "unknown", "attemptId": "attempt"},
+                          {"operationId": "source", "attemptId": "wrong"}):
+            with self.subTest(reference=reference), self.assertRaises(BrokerError):
+                self.broker.execute({**verify, "arguments": {**verify["arguments"], "original": reference}})
+        self.assertEqual(len(self.backend.requests), 1)
+        self.broker.create({"environmentId": "other", "scope": "scope", "workspaceId": "other-ws",
+                           "resourceIds": ["other"], "image": "example.org/tools@sha256:" + "1" * 64,
+                           "network": "none"})
+        other = self.broker.acquire({"environmentId": "other", "scope": "scope", "workflowId": "flow", "ttlSeconds": 60})
+        other_verify = {**verify, "environment": other["environment"], "token": other["token"]}
+        with self.assertRaisesRegex(BrokerError, "original-operation-not-found"):
+            self.broker.execute(other_verify)
+        self.assertEqual(self.broker.execute(verify)["status"], "succeeded")
+
     def test_production_tmpfs_ownership_uses_supported_U_option(self):
         backend = PodmanBackend()
         calls = []
