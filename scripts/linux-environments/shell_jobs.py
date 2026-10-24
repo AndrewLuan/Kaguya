@@ -16,8 +16,11 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import time
 
+# -I 的宿主只读辅助进程只恢复 root 拥有的安装目录。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from broker import BrokerError, atomic, canonical, digest
 
 LIMIT = 16 * 1024 ** 2
@@ -150,6 +153,19 @@ class ShellJobs:
         info = json.loads(self.backend.command("volume", "inspect", volume))[0]
         return info["Mountpoint"]
 
+    def workspace_read(self, env, path, expires, *, directory=False, offset=0, length=0, expected=None):
+        parts(path, directory)
+        # keep-id 的 storage 元数据可能由 subordinate UID 拥有。只读程序在 Podman
+        # 自己的 rootless userns 中保留逐级 FD；不放宽宿主目录权限，不执行 workspace 代码。
+        args = {"root": self.workspace(env), "path": path, "directory": directory,
+                "offset": offset, "length": length, "expected": expected, "deadline": min(expires, time.time() + 20)}
+        result = subprocess.run(["/usr/bin/podman", "unshare", "/usr/bin/python3", "-I", str(Path(__file__).resolve()), canonical(args)],
+                                env=self.backend.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=max(0.1, args["deadline"] - time.time() + 1))
+        if result.returncode:
+            raise BrokerError("unsafe-workspace-read")
+        return json.loads(result.stdout)
+
     def check(self, env, req):
         p, e = req["permit"], req["environment"]
         for key in ("environmentId", "generation", "fencing", "leaseId", "workflowId"):
@@ -185,10 +201,10 @@ class ShellJobs:
                 if any(record[k] != original[k] for k in ("operationId", "attemptId")):
                     raise BrokerError("original-operation-mismatch")
                 return success({"original": original, "checkedAt": now_iso(), "job": self.view(path, record)})
-            result = file_result(self.workspace(env), a.get("path"), deadline=expires)
+            result = self.workspace_read(env, a.get("path"), expires)
             return success({"original": original, "checkedAt": now_iso(), "path": a["path"], **result})
         if a.get("mode") == "export":
-            root, path = self.workspace(env), a.get("path")
+            root, path = None, a.get("path")
             if a.get("jobId"):
                 root, record = self.owned(env, req, a["jobId"])
                 self.view(root, record)
@@ -198,7 +214,11 @@ class ShellJobs:
             mime = a.get("mime", "application/octet-stream")
             if mime not in MIMES:
                 raise BrokerError("invalid-export-mime")
-            result = file_result(root, path, a.get("offset", 0), a.get("maxBytes", LIMIT), a.get("sha256"), expires)
+            if root is None:
+                result = self.workspace_read(env, path, expires, offset=a.get("offset", 0),
+                                             length=a.get("maxBytes", LIMIT), expected=a.get("sha256"))
+            else:
+                result = file_result(root, path, a.get("offset", 0), a.get("maxBytes", LIMIT), a.get("sha256"), expires)
             data = result.pop("dataBase64", "")
             return success({"exports": [{"path": a.get("path"), "jobId": a.get("jobId"),
                                          "stream": a.get("stream"), **result}]},
@@ -234,8 +254,7 @@ class ShellJobs:
                 any(not isinstance(v, str) or len(v) > 32768 or "\0" in v for v in argv) or not argv[0].startswith("/")):
             raise BrokerError("invalid-argv")
         cwd = a.get("cwd", ".")
-        fd = open_beneath(self.workspace(env), cwd, directory=True)
-        os.close(fd)
+        self.workspace_read(env, cwd, expires, directory=True)
         variables = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": "/home/tool", "TMPDIR": "/tmp"}
         if not isinstance(a.get("env", {}), dict):
             raise BrokerError("invalid-job-environment")
@@ -375,4 +394,15 @@ class ShellJobs:
                         raise BrokerError("unknown-shell-member")
                     self.system("/usr/bin/systemctl", "--user", "stop", name + ".service", check=False)
                     self.backend.stop_container(name)
+
+
+if __name__ == "__main__":
+    request = json.loads(sys.argv[1])
+    if request["directory"]:
+        fd = open_beneath(request["root"], request["path"], directory=True)
+        os.close(fd)
+        print("{}")
+    else:
+        print(canonical(file_result(request["root"], request["path"], request["offset"], request["length"],
+                                    request["expected"], request["deadline"])))
 
