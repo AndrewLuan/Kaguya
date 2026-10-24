@@ -9,6 +9,7 @@
 import base64
 from datetime import datetime, timezone
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -118,9 +119,13 @@ class ShellJobs:
         return result
 
     def properties(self, unit):
-        raw = self.system("/usr/bin/systemctl", "--user", "show", unit,
-                          "--property=ActiveState,SubState,ControlGroup,MainPID,Result,ActiveEnterTimestampMonotonic,RuntimeMaxUSec").stdout
-        return dict(line.split("=", 1) for line in raw.decode().splitlines() if "=" in line)
+        result = self.system("/usr/bin/systemctl", "--user", "show", unit,
+                             "--property=LoadState,ActiveState,SubState,ControlGroup,MainPID,Result,ActiveEnterTimestampMonotonic,RuntimeMaxUSec",
+                             check=False)
+        props = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
+        if result.returncode and props.get("LoadState") != "not-found":
+            raise BrokerError("systemd-state-unconfirmed")
+        return props
 
     def configure_environment(self, env):
         # 动态 slice 的限制覆盖桌面、全部 job 以及各自 conmon，而非每个容器重复领取总额。
@@ -213,6 +218,16 @@ class ShellJobs:
         return path, record
 
     def start(self, env, req, expires):
+        # 不同 environment 的线程共用日志总额；锁覆盖预留和 manifest 发布，而非执行等待。
+        with open(self.root / "admission.lock", "a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path, record, existing = self.prepare(env, req, expires)
+        if existing:
+            view = self.view(path, record)
+            return success({"accepted": view["state"] != "prepared", **view})
+        return self.launch(path, record)
+
+    def prepare(self, env, req, expires):
         a = req["arguments"]
         argv = a.get("argv")
         if (not isinstance(argv, list) or not 1 <= len(argv) <= 128 or
@@ -236,8 +251,7 @@ class ShellJobs:
             record = read_json(path / "manifest.json")
             if record["requestHash"] != request_hash:
                 raise BrokerError("job-operation-conflict")
-            view = self.view(path, record)
-            return success({"accepted": view["state"] != "prepared", **view})
+            return path, record, True
         reserved = sum(LOG_RESERVATION if not (p / "receipt.json").exists() else
                        sum((p / stream).stat().st_size for stream in ("stdout", "stderr") if (p / stream).exists())
                        for p, _ in self.records())
@@ -261,6 +275,13 @@ class ShellJobs:
                   "volume": "kaguya-workspace-" + digest(env["workspaceId"])[:24],
                   "argv": argv, "env": variables, "hostEnv": self.backend.env}
         write_json(path / "manifest.json", record, exclusive=True)
+        return path, record, False
+
+    def launch(self, path, record):
+        expires = record["expires"]
+        left = min(expires - time.time(), record["monotonicDeadline"] - time.monotonic())
+        if left <= 0:
+            raise BrokerError("permit-expired")
         runner = str(Path(__file__).with_name("job_runner.py"))
         command = ["/usr/bin/systemd-run", "--user", "--quiet", "--unit=" + record["unit"],
                    "--slice=" + record["slice"], "--service-type=exec", "--property=Delegate=yes",
@@ -283,10 +304,13 @@ class ShellJobs:
 
     def stopped(self, record):
         props = self.properties(record["unit"])
-        group = props.get("ControlGroup")
         if props.get("ActiveState") not in ("inactive", "failed"):
             return False
-        if group:
+        groups = [props.get("ControlGroup")]
+        running = self.root / record["jobId"] / "running.json"
+        if running.exists() and record["bootId"] == boot_id():
+            groups.append(read_json(running)["unitGroup"])
+        for group in filter(None, groups):
             events = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.events"
             if events.exists() and "populated 1" in events.read_text():
                 return False
@@ -308,6 +332,8 @@ class ShellJobs:
             if time.monotonic() >= end:
                 raise BrokerError("job-isolation-unconfirmed")
             time.sleep(0.02)
+        self.system("/usr/bin/systemctl", "--user", "stop",
+                    record["unit"].removesuffix(".service") + "-expiry.timer", check=False)
         if not (path / "receipt.json").exists():
             self.finalize(path, record, "stopped", reason)
 
@@ -334,6 +360,19 @@ class ShellJobs:
         return view
 
     def isolate(self, env, reason="environment-fenced"):
+        known = set()
         for path, record in self.records(env):
+            known.add(record["container"])
             self.stop(path, record, reason)
+        members = json.loads(self.backend.command("ps", "--all", "--filter",
+                             "label=kaguya.environment=" + env["environmentId"],
+                             "--filter", "label=kaguya.role=shell", "--format=json"))
+        for member in members:
+            names = member.get("Names", [])
+            for name in names:
+                if name not in known:
+                    if not re.fullmatch("kaguya-job-[a-f0-9]{64}", name):
+                        raise BrokerError("unknown-shell-member")
+                    self.system("/usr/bin/systemctl", "--user", "stop", name + ".service", check=False)
+                    self.backend.stop_container(name)
 

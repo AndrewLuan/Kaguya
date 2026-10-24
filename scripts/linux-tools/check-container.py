@@ -74,7 +74,7 @@ def main():
         try:
             backend.create(env)
             desktop = json.loads(command("inspect", env["container"]))[0]
-            oci = json.loads(Path(desktop["OCIConfigPath"]).read_text())
+            oci = json.loads(command("unshare", "/bin/cat", desktop["OCIConfigPath"]))
             print(json.dumps({"desktopPolicy": oci["linux"], "desktopProcess": oci["process"]}), flush=True)
             assert command("exec", env["container"], "stat", "-c", "%u:%g:%a", "/home/tool").strip() == b"1000:1000:700"
             start = operation("start", argv=["/usr/local/bin/node", "-e", "require('fs').writeFileSync('marker','actual-container');console.log('actual-output')"], cwd=".", env={})["result"]
