@@ -1,7 +1,20 @@
+import {
+  lifecycleStartupCapability,
+  lifecycleStartedInformationKind,
+} from "@kaguya/modules";
 /**
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
- * 模型审批覆盖 Heartflow Planner 与 Expression 的 light，以及 Composer 的 heavy，恢复屏障仍由 Runtime 统一管理。
- * 测试显式注入统一文件模板，避免 Planner 或 Expression 绕过 default/local 选择。
+ * 模型审批覆盖 Router Light 与 Expression 的 light，以及 Heavy 的 heavy，恢复屏障仍由 Runtime 统一管理。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
+ * 功能概述：验证 Runtime 生命周期与 durable one-shot scheduler 的装配边界。
+ * 主要职责：覆盖启动恢复阻塞、关闭顺序和 synthetic debounce/wait 恢复的回归场景。
+ * 代码库关系：直接消费 runtime 公共入口和 scheduler 公共能力；不依赖 apps composition。
+ * 输入输出与副作用：测试数据库、clock 与 runtime 进程生命周期，不模拟模块层 agent。
+ */
+/**
+ * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
+ * 模型审批覆盖 Router Light 与 Expression 的 light，以及 Heavy 的 heavy，恢复屏障仍由 Runtime 统一管理。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
  * 功能概述：验证 Runtime 生命周期与 durable one-shot scheduler 的装配边界。
  * 主要职责：覆盖启动恢复阻塞、关闭顺序和 synthetic debounce/wait 恢复的回归场景。
  * 代码库关系：直接消费 runtime 公共入口和 scheduler 公共能力；不依赖 apps composition。
@@ -11,6 +24,7 @@ import { loadFirstPartyPromptTemplates } from "@kaguya/modules/prompt-templates/
 const testPrompts = loadFirstPartyPromptTemplates();
 import { createTestingDatabase } from "@kaguya/database/testing";
 import { KaguyaLlmClient } from "@kaguya/llm/client";
+import { rawContextCapability } from "@kaguya/memory";
 import {
   createFirstPartyModuleCatalog,
   createFirstPartyModuleActivations,
@@ -39,16 +53,12 @@ const testIdentity = {
   timeZone: "Asia/Shanghai",
 };
 const testMessageTemplates = {
-  ...testPrompts.messageComposer,
-  main: "{{scene}}{{history}}{{memory}}{{turn}}",
-  history: "{{#each messages}}{{> history-inbound}}{{/each}}",
+  ...testPrompts.heavy,
+  main: "{{scene}}{{global_context}}{{scope_context}}{{memory}}",
   historyInbound: "{{content}}",
   historyAssistant: "{{content}}",
   memory: "{{#each items}}{{> memory-item}}{{/each}}",
   memoryItem: "{{content}}",
-  quoted: "{{message}}",
-  turn: "{{#each messages}}{{> history-inbound}}{{/each}}",
-  plan: "{{topic}} {{reply_act}}",
 };
 
 import {
@@ -85,6 +95,7 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
     const runtime = new KaguyaRuntime({
       database,
       catalog: createFirstPartyModuleCatalog({
+        rawContextCapability,
         modelTaskCapability,
         modelTaskCompletedInformationKind,
         modelTaskFailedInformationKind,
@@ -93,10 +104,10 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
         deliveryFailedInformationKind,
         executionExhaustedInformationKind,
         promptTemplates: testMessageTemplates,
-        plannerTemplate: testPrompts.planner,
-        plannerBootstrapPolicy: testPrompts.plannerBootstrapPolicy,
-        memoryEnabled: false,
-        expressionTemplates: testPrompts.expression,
+        lightTemplate: testPrompts.light,
+        lightBootstrapPolicy: testPrompts.lightBootstrapPolicy,
+
+        nativeMemoryTemplate: testPrompts.nativeMemory,
         qqExpressionTemplates: testPrompts.qqExpression,
         agentIdentity: testIdentity,
       }),
@@ -145,6 +156,7 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
     const recovery = deferred<void>();
     const model = createRepeatingDeterministicModel({ text: "done" });
     const catalog = createFirstPartyModuleCatalog({
+      rawContextCapability,
       modelTaskCapability,
       modelTaskCompletedInformationKind,
       modelTaskFailedInformationKind,
@@ -153,10 +165,10 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
       deliveryFailedInformationKind,
       executionExhaustedInformationKind,
       promptTemplates: testMessageTemplates,
-      plannerTemplate: testPrompts.planner,
-      plannerBootstrapPolicy: testPrompts.plannerBootstrapPolicy,
-      memoryEnabled: false,
-      expressionTemplates: testPrompts.expression,
+      lightTemplate: testPrompts.light,
+      lightBootstrapPolicy: testPrompts.lightBootstrapPolicy,
+
+      nativeMemoryTemplate: testPrompts.nativeMemory,
       qqExpressionTemplates: testPrompts.qqExpression,
       agentIdentity: testIdentity,
     });
@@ -178,22 +190,22 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
           },
           {
             activation: {
-              instanceId: "memory.expression.default",
-              definitionId: "memory.expression",
+              instanceId: "router.default",
+              definitionId: "agent.router",
             },
             selectionPolicy: { tier: "light" },
           },
           {
             activation: {
-              instanceId: "heartflow.default",
-              definitionId: "agent.heartflow.online",
+              instanceId: "router.default.situation",
+              definitionId: "agent.situation",
             },
             selectionPolicy: { tier: "light" },
           },
           {
             activation: {
-              instanceId: "message-composer.default",
-              definitionId: "agent.message-composer",
+              instanceId: "heavy.default",
+              definitionId: "agent.heavy",
             },
             selectionPolicy: { tier: "heavy" },
           },
@@ -205,8 +217,25 @@ describe("KaguyaRuntime one-shot scheduler lifecycle", () => {
         }),
       },
       oneShotRecoveryGate: recovery.promise,
-      capabilities: ({ oneShotSchedule }: RuntimeCapabilityContext) => [
+      capabilities: ({
+        oneShotSchedule,
+        core,
+        now,
+      }: RuntimeCapabilityContext) => [
         { capability: oneShotScheduleCapability, value: oneShotSchedule },
+        {
+          capability: lifecycleStartupCapability,
+          value: {
+            start: async (instanceId: string) => {
+              await core.register(lifecycleStartedInformationKind, {
+                source: `module:${instanceId}`,
+                occurredAt: now().toISOString(),
+                payload: { instanceId, at: now().toISOString() },
+                references: [],
+              });
+            },
+          },
+        },
       ],
     } as never);
     cleanups.push(() => runtime.close());

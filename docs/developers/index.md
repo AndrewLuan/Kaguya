@@ -7,6 +7,8 @@ description: Kaguya 架构、包职责和贡献流程入口。
 
 Kaguya 采用 pnpm workspace 和 TypeScript project references。应用负责装配；基础包通过公开入口提供信息原子、Kind、模块、数据、模型与配置能力。运行期事实通过 `informationId` 和显式引用组织，不使用事件身份或隐式 session。
 
+当前格式的产品承诺、历史兼容代码与各层测试的职责见[测试与兼容边界](./testing-compatibility)。
+
 ## 仓库结构
 
 **`packages/composition`** — Server 与 Demo 共用的 Runtime 业务装配，统一接入 Catalog、activations、模型审批与宿主能力。
@@ -43,7 +45,7 @@ Kaguya 采用 pnpm workspace 和 TypeScript project references。应用负责装
 
 **`packages/scheduler`** — 可恢复的 Durable Cadence 与绝对时间 One-Shot 调度原语。
 
-当前 Runtime 使用 PostgreSQL Information Ledger。Memory 文档与 2-gram 倒排项保存在独立表中，不写成 Information atom；selected Profile 的 `memory.enabled` 默认关闭，关闭时只保留 association/Prompt 形状而不读取或返回实际信息。显式开启后，召回命中仍以来源 `informationId` 回到不可变账本。one-shot scheduler 通过同一数据库保存 requested atom 与 arm projection，Runtime 启动时恢复 open arm。原始消息写回已实现；向量索引和 Mem0 认知在配置对应服务后按需启用，具体范围见[Memory 认知层](./memory)。
+当前 Runtime 使用 PostgreSQL Information Ledger。`memory.native` 统一处理形成、整理、索引、召回和上下文冻结。原始事件由账本与 Raw 投影保存。当前聊天从常开的原始 Memory 冻结全面背景与当前 scope 上下文；模块边界见 [Memory 文档](./memory)。one-shot scheduler 通过同一数据库保存 requested atom 与 arm projection，Runtime 启动时恢复 open arm。
 
 ## 依赖方向
 
@@ -72,6 +74,8 @@ flowchart LR
 
 ### 理解项目故事与领域语言
 
+先阅读[情境—行动上下文模型](./situation-model/)，了解如何频繁替换总背景和当前情境，同时保留整个 Agent 的行动连续性。该组文档独立说明模型，再映射 Kaguya 与 DSH 的实现。
+
 阅读[持续 Agent 设计原则](./continuous-agent)，了解为什么 Information 到达是唤醒 tick 而不是 turn，以及模块为什么需要区分订阅触发和完整语义输入。
 
 需要追溯这套故事与连续互动、前后台协作和群聊 Agent 的外部参照时，阅读[外部设计参考](./design-references)。该页只记录可借鉴问题与适用边界，不作为现有能力清单。
@@ -85,6 +89,8 @@ flowchart LR
 ### 编写模块
 
 阅读[信息模块 SDK](./information-modules)，使用 `onInformation` 消费输入并以 `context.register()` 派生下一原子。
+
+需要查看 Light、Heavy 实际使用的 Prompt 模板原文和变量装配时，阅读 [LLM Prompt 装配与原文](./prompt-assembly)。页面直接嵌入仓库中的 `.hbs` 文件，模板修改后随文档构建更新。
 
 ### 理解启动配置
 

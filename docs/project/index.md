@@ -11,13 +11,15 @@ description: Kaguya 当前已实现能力、明确边界和后续演进方向。
 
 项目以“持续感知、自然互动”为统一故事：相关 Information 到达可以唤醒 Agent，但 tick 不自动等于 turn；模块的订阅单位也不自动等于完整语义输入。完整约束见[持续 Agent 设计原则](../developers/continuous-agent)。
 
-**已经对齐** — InformationAtom 已作为不可变证据保存；Heartbeat candidate 只携带通知与水位；Arousal 将被唤醒与完成观察分开；Heartflow 在 `observe` 后冻结多条输入；Planner 明确支持 `message | wait | silent`；Expression 使用多来源批次学习。
+**已经对齐** — InformationAtom 已作为不可变证据保存；Heartbeat candidate 只携带通知与水位；Arousal 将被唤醒与完成观察分开；Router 在 `observe` 后冻结多条输入；Light 明确支持 `message | wait | silent`；Expression 使用多来源批次学习。
 
-**部分对齐** — 当前 `agent.turn.*` 同时承载调度、观察和决策生命周期，名称仍容易被理解成逐消息问答；Heartflow 的多输入 turn context 接近 observation，但协议尚未采用这套领域术语。输入与输出按各自节奏推进目前是设计哲学，不是统一并发协议。
+**部分对齐** — 当前 `agent.router.turn.*` 同时承载调度、观察和决策生命周期，名称仍容易被理解成逐消息问答；Router 的多输入 turn context 接近 observation，但协议尚未采用这套领域术语。输入与输出按各自节奏推进目前是设计哲学，不是统一并发协议。
 
 **领域设计已形成、实现待完成** — [持续情境契约](../developers/continuous/)承接 #241–#244，提出 scene 映射、冻结快照、独立消费进度、可修订经历与按能力划分的行动生命周期。设计方向已经人工确认，三个专题已给出共同契约、当前协议映射、取舍与验收时序，已由 [PR #251](https://github.com/posanbu/Kaguya/pull/251) 合入；#251 只增加设计文档，没有新增 Kind、数据库结构或运行行为。经历分段策略、协议字段和迁移细节由后续实现任务验证；不宣称已有统一取消、全双工语音或跨 tick 经历形成能力。
 
 ## 当前已实现
+
+**情境—行动模型的库级入口** — 新增[独立模型说明](../developers/situation-model/)、版本化 Schema、共同样例和纯装配函数。默认 Router 尚未接入 Agent 级行动账本与检查点。独立 DSH 实现和本项目分别验收，不能把插件的测试结果视为 Kaguya 默认运行链的完成状态。
 
 ::: timeline 统一运行入口
 
@@ -64,7 +66,7 @@ description: Kaguya 当前已实现能力、明确边界和后续演进方向。
 
 **Web 回复读取通道** — `POST /api/v1/messages` 的 `202 accepted` 仅表示已接收；`GET /api/v1/messages` 按 `conversationId` 与游标读取持久消息和成功投递的回复。尚未成功投递的生成文本不会作为已送达回复展示；协议见 [HTTP API](../reference/http-api#公共路由)。
 
-**旧数据自动迁移** — 旧 SQLite 与旧配置索引会被拒绝，不会自动删除或转换。
+**旧数据自动迁移** — 旧 SQLite 与旧配置索引会被拒绝，不会自动删除或转换。当前数据库内部仍有受限的 Web Memory 约束调整和 lifecycle 投影回填；支持边界与现状见[测试与兼容边界](../developers/testing-compatibility)。
 
 ## 后续实施顺序
 
@@ -80,11 +82,19 @@ InformationLedger 已改为异步端口；PostgreSQL 17 实现追加式存储、
 
 ## 后续方向
 
+### 下一次 PR：启动恢复与回复时效性（规划中）
+
+启动恢复未完成任务时，旧回复可能在话题结束后继续发送。下一次 PR 将在恢复处理和实际发送前核对回复是否仍然适用。本项尚未实现。
+
+**判断依据** — 保留原始消息、生成结果和计划发送时间，不因重启重置回复年龄。结合经过时间、后续消息、话题变化、明确撤回及已完成的交流判断是否继续。闲聊接话与仍未解决的明确请求应分别处理，不对全部回复使用同一过期规则。具体时间阈值和重新判断方式在该 PR 中确定。
+
+**处理范围** — 覆盖旧模型结果、待发正文、延迟发送和接续段的恢复路径。过时内容应留下可追溯的取消或过期原因，并结束对应待处理状态。确有必要继续的请求应结合当前情境重新判断，避免直接补发旧正文。已发送但回执不明的情况先核对投递状态，避免重复发送。
+
+**验收场景** — 长时间停机后的闲聊回复不补发。短暂停机后仍有效的请求可以继续。后续消息已解决、改变或取消原请求时不发送旧正文。接续段不在话题失效后突然续说。重复重启不重置时效，也不重复投递。测试同时检查终态、消费进度和检查界面的原因展示。
+
 ### Memory 底座与后续分层
 
-独立消息 Memory、Unicode 2-gram 稀疏召回和 first-party Prompt 接入已由 #74 实现。Memory 行不属于 Information Ledger；检索命中会重新加载原始 inbound atom，使 provenance 保持为不可变消息。在线回合按冻结聊天范围召回，并排除当前消息和未来消息。
-
-可靠逐消息写回、pgvector 可恢复回填与混合召回、可替换 Mem0 REST 认知层已接入。它们在 Profile 中显式启用，后台链不等待 reply，也不构造回合。认知以有界证据窗口产生快照，Kaguya 不自写演化启发式；部署及验收边界见 [Memory 认知层](../developers/memory.md)。周期调度与日志投影维护继续独立运行。
+原始消息由事件账本与 Raw 投影保存。身份模块维护实体与账号绑定，`memory.native` 统一维护人物关系、经历、会话、自身和表达记忆。在线回合读取固定摘要并执行混合召回。具体边界见 [Memory 模块文档](../developers/memory.md)。
 
 ### PostgreSQL 运维演进
 

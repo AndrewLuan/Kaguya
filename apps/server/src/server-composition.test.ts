@@ -1,7 +1,29 @@
 /**
  * Web 入站 DAG 同样产生当前会话背景投影，保持 Composition 与 Runtime 的事实集合断言同步。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
- * 默认 DAG 验证 eligible turn 先调用 Planner，再由 Composer 生成消息。
+ * 默认 DAG 验证 eligible turn 先调用 Light，再由 Heavy 生成消息。
+ * tier 配置回归同时覆盖 generation.timeoutMs、思考与推荐时长参数传递；
+ * 结构化输出仅在对应 Provider 明确声明支持时选择 schema，缺省或 false 均选择 json。
+ * 功能概述：验证 Server 作为唯一 composition root 组合 PostgreSQL information
+ * database、Runtime、Web/NapCat ingress、HTTP 与启动期选定的全局 Profile。
+ * 主要职责：用真实 PGlite 覆盖 Web 到 information DAG，验证 HTTP/Web UI/Vite
+ * 组合和启动失败关闭；并区分数据库初始化与模块/Runtime 生命周期失败的固定错误分类，
+ * 覆盖未知字母数字类名和抛出型 constructor/name getter；
+ * `createRuntimeModelSelectionResolver` 用例保证 selected Profile
+ * 在启动时冻结、保留 provider/model 复合身份、light/heavy 共用一个 tier-only resolver，
+ * 且模块不能传 `profileId`；同名 model 的跨 provider 并发调用不得串线。
+ * 代码库关系：Runtime 业务装配统一来自 @kaguya/composition；直接驱动 `server.ts`、`app.ts`、`web-gateway.ts` 与 `web.ts`；
+ * 真实配置 Registry 来自 `@kaguya/config`，信息账本来自 `@kaguya/database/testing`，
+ * provider client 创建由 `@ai-sdk/openai-compatible` mock 观察。
+ * 输入输出与副作用：每个用例使用独立临时配置目录或内存 PGlite；
+ * Web DAG fixture 对入站提交及持久订阅收敛统一使用 8 秒/20 毫秒预算；
+ * afterEach 在断言或启动失败后也按 HTTP、Runtime、数据库和 logger 顺序释放资源，避免污染后续用例。
+ * 启动错误用人工包含密码的连接异常验证返回值与日志均已脱敏。
+ */
+/**
+ * Web 入站 DAG 同样产生当前会话背景投影，保持 Composition 与 Runtime 的事实集合断言同步。
+ * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
+ * 默认 DAG 验证 eligible turn 先调用 Light，再由 Heavy 生成消息。
  * tier 配置回归同时覆盖 generation.timeoutMs、思考与推荐时长参数传递；
  * 结构化输出仅在对应 Provider 明确声明支持时选择 schema，缺省或 false 均选择 json。
  * 功能概述：验证 Server 作为唯一 composition root 组合 PostgreSQL information
@@ -24,7 +46,14 @@ import {
   createMessageComposition,
   type RuntimeModelSelectionResolver,
 } from "@kaguya/composition";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,8 +64,13 @@ import {
   UnsupportedDatabaseSchemaError,
 } from "@kaguya/database";
 import { createTestingDatabase } from "@kaguya/database/testing";
-import { FileUserConfigManager } from "@kaguya/config";
-import { closeLogger, createLogger, createModuleLogger } from "@kaguya/logger";
+import {
+  FileUserConfigManager,
+  loadModuleInstanceConfigs,
+  writeCordisModuleEnabled,
+  writeModuleInstanceConfig,
+} from "@kaguya/config";
+import { closeLogger, createLogger } from "@kaguya/logger";
 import { createRepeatingDeterministicModel } from "@kaguya/llm/testing";
 import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
 import { KaguyaRuntime } from "@kaguya/runtime";
@@ -46,6 +80,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
 import { createHttpApplication } from "./app.js";
+import { createInspectionService } from "./inspection.js";
+import { situationViewSchema } from "@kaguya/schema";
 import type { ServerConfig } from "./config.js";
 import {
   createRuntimeModelSelectionResolver,
@@ -55,7 +91,7 @@ import {
 } from "./server.js";
 import { createWebMessageGateway } from "./web-gateway.js";
 import { registerWebUi } from "./web.js";
-import { messageComposerSettingsSchema } from "@kaguya/modules";
+import { heavySettingsSchema } from "@kaguya/modules";
 
 const chatModel = vi.fn((modelId: string) => ({ modelId }));
 
@@ -102,6 +138,33 @@ function tempWorkspaceRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "kaguya-server-composition-"));
   roots.push(root);
   return root;
+}
+
+async function bootstrapWithModules(
+  rootDir: string,
+): Promise<FileUserConfigManager> {
+  const manager = await FileUserConfigManager.bootstrap({ rootDir });
+  await loadModuleInstanceConfigs({
+    rootDir,
+    defaults: createFirstPartyModuleConfigDefaults(),
+  });
+  return manager;
+}
+
+async function enableNapCat(
+  rootDir: string,
+  settings: Record<string, unknown> = {},
+): Promise<void> {
+  const defaults = createFirstPartyModuleConfigDefaults();
+  const configs = await loadModuleInstanceConfigs({ rootDir, defaults });
+  const current = configs.find(
+    (item) => item.definitionId === "adapter.napcat",
+  )!;
+  await writeModuleInstanceConfig(rootDir, {
+    ...current,
+    settings: { reconnectMs: 3000, ...settings },
+  });
+  await writeCordisModuleEnabled(rootDir, defaults, current.instanceId, true);
 }
 
 function config(workspaceRoot: string): ServerConfig {
@@ -212,6 +275,12 @@ describe("unified server composition", () => {
     const app = await createHttpApplication({
       config: config(workspaceRoot),
       webGateway,
+      inspection: createInspectionService({
+        ledger: database.information,
+        database,
+        modules: () => runtime.inspectModules(),
+        secrets: { gatewayToken },
+      }),
     });
     resources.app = app;
 
@@ -257,39 +326,38 @@ describe("unified server composition", () => {
     });
     expect(new Set(graph.map(({ kind }) => kind))).toEqual(
       new Set([
-        "memory.association.completed",
-        "memory.association.query",
-        "memory.association.requested",
         "agent.attention.arousal.activity",
+        "agent.lifecycle.state.recorded",
         "memory.identity.chat.scope.binding",
         "memory.identity.chat.scope.entity",
         "memory.identity.person.context.completed",
         "agent.attention.arousal.completed",
         "agent.attention.arousal.state.recorded",
-        "agent.turn.candidate",
-        "agent.turn.claimed",
-        "agent.turn.completed",
-        "agent.turn.context.completed",
-        "agent.conversation.context.frozen",
-        "agent.turn.plan.completed",
-        "agent.turn.started",
+        "agent.heartbeat.candidate",
+        "agent.router.turn.claimed",
+        "agent.router.turn.completed",
+        "agent.router.turn.context.completed",
+        "agent.router.conversation.context.frozen",
+        "agent.router.memory.context.frozen",
+        "agent.light.decision.completed",
+        "agent.router.turn.started",
         "memory.identity.person.resolution",
         "core.message.inbound.text",
-        "agent.message.intent.requested",
-        "memory.expression.selection.requested",
-        "memory.expression.selection.completed",
+        "agent.router.message.intent.requested",
         "core.model.task.requested",
         "core.model.task.completed",
         "core.message.assistant.text",
         "core.delivery.requested",
         "core.delivery.delivered",
+        "core.delivery.started",
+        "agent.situation.frozen",
       ]),
     );
     expect(
       graph.find(
         ({ kind, payload }) =>
           kind === "core.model.task.requested" &&
-          payload.taskId === "agent.message.compose",
+          payload.taskId === "agent.heavy.respond",
       )?.payload,
     ).toMatchObject({
       resolvedModel: {
@@ -297,7 +365,62 @@ describe("unified server composition", () => {
         modelId: "deterministic-heavy",
       },
     });
-    expect(JSON.stringify(graph)).not.toMatch(/traceId|raw/u);
+    const situationResponse = await app.inject({
+      method: "GET",
+      url: "/api/v1/inspection/situation",
+      headers: { authorization: `Bearer ${gatewayToken}` },
+    });
+    expect(situationResponse.statusCode).toBe(200);
+    const situation = situationViewSchema.parse(situationResponse.json().data);
+    expect(situation.frames).toHaveLength(1);
+    expect(
+      situation.frames[0]!.current.evidence.map((item) => item.id),
+    ).toContain(inbound!.informationId);
+    expect(new Set(situation.steps.map((step) => step.tier))).toEqual(
+      new Set(["light", "heavy"]),
+    );
+    for (const step of situation.steps) {
+      expect(step).toMatchObject({
+        frameId: situation.frames[0]!.id,
+        sceneId: situation.frames[0]!.current.sceneId,
+        phase: "completed",
+        nativeAvailable: true,
+      });
+      const result = graph.find(
+        (atom) =>
+          atom.kind === "core.model.task.completed" &&
+          atom.references.some(
+            (ref) =>
+              ref.relation === "core:status-of" &&
+              ref.informationId === step.id,
+          ),
+      );
+      expect(result?.payload.native).toMatchObject({ version: 1 });
+      const request = graph.find((atom) => atom.informationId === step.id)!;
+      if (step.tier === "heavy") {
+        expect(
+          (request.payload.messages as { role: string; content: string }[]).at(
+            -1,
+          ),
+        ).toEqual({
+          role: "user",
+          content: (request.payload.prompt as { text: string }).text,
+        });
+      }
+    }
+    const frozenBeforeRead = graph.find(
+      (atom) => atom.kind === "agent.situation.frozen",
+    )!;
+    expect(
+      await database.information.get(frozenBeforeRead.informationId),
+    ).toEqual(frozenBeforeRead);
+    expect(JSON.stringify(graph)).not.toMatch(/traceId/u);
+    // rawInformationId is a provenance link, not an adapter's raw payload.
+    for (const atom of graph) {
+      expect(atom.payload).not.toHaveProperty("raw");
+      if (atom.payload.source)
+        expect(atom.payload.source).not.toHaveProperty("raw");
+    }
     // 数据库初始化和两次持久化等待有独立预算；资源清理由 afterEach 覆盖所有失败路径。
   }, 30_000);
 
@@ -380,10 +503,9 @@ describe("unified server composition", () => {
     const workspaceRoot = tempWorkspaceRoot();
     const configRoot = join(workspaceRoot, "config");
     mkdirSync(configRoot, { recursive: true });
-    writeFileSync(
-      join(configRoot, "index.json"),
-      JSON.stringify({ version: 2 }),
-    );
+    const indexPath = join(configRoot, "index.json");
+    const invalidIndex = JSON.stringify({ version: 2 });
+    writeFileSync(indexPath, invalidIndex);
 
     const stream = new LogStream();
     const rootLogger = createLogger({ service: "kaguya-server-test", stream });
@@ -402,6 +524,8 @@ describe("unified server composition", () => {
     }).catch((thrown: unknown) => thrown);
 
     expect(error).toMatchObject({ code: "CONFIG_CORRUPT_STORE" });
+    expect(readFileSync(indexPath, "utf8")).toBe(invalidIndex);
+    expect(readdirSync(configRoot)).toEqual(["index.json"]);
     expect(createLoggerSpy).toHaveBeenCalledTimes(1);
     expect(closeLoggerSpy).toHaveBeenCalledWith(rootLogger);
     expect(stream.logs()).toEqual(
@@ -426,7 +550,7 @@ describe("unified server composition", () => {
   it("connects the information database once and redacts credentials from startup errors", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-database-startup-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     const selectedProfileId = manager.getSelectedProfileId();
     await manager.replaceProfile(
       selectedProfileId,
@@ -481,7 +605,7 @@ describe("unified server composition", () => {
   it("redacts credentials when the first database I/O fails during Runtime startup", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-database-prepare-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     const selectedProfileId = manager.getSelectedProfileId();
     await manager.replaceProfile(
       selectedProfileId,
@@ -536,7 +660,7 @@ describe("unified server composition", () => {
 
   it("treats an incompatible database schema as fatal before listening", async () => {
     const root = tempWorkspaceRoot();
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       manager.getSelectedProfileId(),
       readyProfileReplacement(
@@ -564,7 +688,7 @@ describe("unified server composition", () => {
   it("classifies non-database Runtime startup failures without leaking their details", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-runtime-startup-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     const selectedProfileId = manager.getSelectedProfileId();
     await manager.replaceProfile(
       selectedProfileId,
@@ -614,7 +738,7 @@ describe("unified server composition", () => {
       join(tmpdir(), "kaguya-selected-profile-startup-"),
     );
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     const selectedProfileId = manager.getSelectedProfileId();
     await manager.replaceProfile(
       selectedProfileId,
@@ -656,7 +780,7 @@ describe("unified server composition", () => {
     "checks the database independently when AI is incomplete (database failure: %s)",
     async (databaseFails) => {
       const root = tempWorkspaceRoot();
-      await FileUserConfigManager.bootstrap({ rootDir: root });
+      await bootstrapWithModules(root);
       const webDistPath = join(root, "web");
       mkdirSync(webDistPath, { recursive: true });
       writeFileSync(join(webDistPath, "index.html"), "<main>Kaguya</main>");
@@ -672,17 +796,13 @@ describe("unified server composition", () => {
       const startAdapter = vi
         .spyOn(NapCatConnectionSupervisor.prototype, "start")
         .mockResolvedValue();
+      await enableNapCat(root, { wsUrl: "ws://localhost:3001" });
       const serverConfig = config(root);
       const server = await startKaguyaServer({
         ...serverConfig,
         configRoot: root,
         webDistPath,
         port: 0,
-        napcat: {
-          ...serverConfig.napcat,
-          enabled: true,
-          wsUrl: "ws://localhost:3001",
-        },
       });
       try {
         expect(connect).toHaveBeenCalledOnce();
@@ -710,7 +830,7 @@ describe("unified server composition", () => {
 
   it("keeps Runtime and Web running with invalid NapCat configuration and drains after stopping ingress", async () => {
     const root = tempWorkspaceRoot();
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       "default",
       readyProfileReplacement(
@@ -723,17 +843,13 @@ describe("unified server composition", () => {
     writeFileSync(join(webDistPath, "index.html"), "<main>Kaguya</main>");
     const database = await createTestingDatabase();
     vi.spyOn(KaguyaDatabase, "connect").mockResolvedValueOnce(database);
+    await enableNapCat(root);
     const serverConfig = config(root);
     const server = await startKaguyaServer({
       ...serverConfig,
       configRoot: root,
       webDistPath,
       port: 0,
-      napcat: {
-        ...serverConfig.napcat,
-        enabled: true,
-        configurationError: "configuration_invalid",
-      },
     });
     expect(server.runtime).toBeDefined();
     expect(server.adapterHost.status().adapters).toEqual(
@@ -768,7 +884,7 @@ describe("unified server composition", () => {
 
   it("retains failed cleanup resources for the final shutdown attempt", async () => {
     const root = tempWorkspaceRoot();
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       "default",
       readyProfileReplacement(
@@ -877,16 +993,14 @@ describe("unified server composition", () => {
       rootLogger,
     );
     const serverConfig = config(root);
+    await enableNapCat(serverConfig.configRoot, {
+      wsUrl: "ws://127.0.0.1:3001",
+    });
 
     const server = await startKaguyaServer({
       ...serverConfig,
       webDistPath,
       port: 0,
-      napcat: {
-        ...serverConfig.napcat,
-        enabled: true,
-        wsUrl: "ws://127.0.0.1:3001",
-      },
     });
     expect(server.adapterHost.status().adapters).toEqual(
       expect.arrayContaining([
@@ -906,7 +1020,7 @@ describe("unified server composition", () => {
   it("creates a heavy/light resolver from frozen profile configuration", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-profile-resolver-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       manager.getSelectedProfileId(),
       readyProfileReplacement(
@@ -943,7 +1057,7 @@ describe("unified server composition", () => {
   it("freezes the selected profile even if the registry selection changes later", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-profile-resolver-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       manager.getSelectedProfileId(),
       readyProfileReplacement(
@@ -996,7 +1110,7 @@ describe("unified server composition", () => {
     async ({ supportsStructuredOutputs, structuredOutputMode }) => {
       const root = mkdtempSync(join(tmpdir(), "kaguya-profile-resolver-"));
       roots.push(root);
-      const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+      const manager = await bootstrapWithModules(root);
       await manager.replaceProfile(manager.getSelectedProfileId(), {
         name: "default",
         acknowledgedWarnings: [],
@@ -1076,7 +1190,7 @@ describe("unified server composition", () => {
 
   it("uses the selected tier provider capability without inheriting the default provider capability", async () => {
     const root = tempWorkspaceRoot();
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     const settings = readyProfileSettings("light-model", "heavy-model");
     await manager.replaceProfile(manager.getSelectedProfileId(), {
       ...readyProfileReplacement("default", settings),
@@ -1120,7 +1234,7 @@ describe("unified server composition", () => {
   it("rejects an incomplete selected profile before creating provider clients", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-incomplete-profile-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     vi.mocked(createOpenAICompatible).mockClear();
     const profile = await manager.getProfile(manager.getSelectedProfileId());
 
@@ -1133,7 +1247,7 @@ describe("unified server composition", () => {
   it("rejects profile overrides at the module boundary and resolver call site", async () => {
     const root = mkdtempSync(join(tmpdir(), "kaguya-profile-resolver-"));
     roots.push(root);
-    const manager = await FileUserConfigManager.bootstrap({ rootDir: root });
+    const manager = await bootstrapWithModules(root);
     await manager.replaceProfile(
       manager.getSelectedProfileId(),
       readyProfileReplacement(
@@ -1149,7 +1263,7 @@ describe("unified server composition", () => {
       createRuntimeModelSelectionResolver(await selectedProfile(manager));
 
     expect(
-      messageComposerSettingsSchema.safeParse({
+      heavySettingsSchema.safeParse({
         profileId: "profile-override",
         modelTier: "light",
       }).success,
@@ -1225,15 +1339,19 @@ describe("unified server composition", () => {
     expect(
       createMessageComposition(undefined, {
         memoryEnabled: false,
-        moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+        moduleConfigs: createFirstPartyModuleConfigDefaults("test").map((c) =>
+          c.definitionId === "memory.native" ? { ...c, enabled: true } : c,
+        ),
       }).memory,
-    ).toEqual({ enabled: false });
+    ).toEqual({ enabled: false, embeddings: [] });
     expect(
       createMessageComposition(undefined, {
         memoryEnabled: true,
-        moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+        moduleConfigs: createFirstPartyModuleConfigDefaults("test").map((c) =>
+          c.definitionId === "memory.native" ? { ...c, enabled: true } : c,
+        ),
       }).memory,
-    ).toEqual({ enabled: true });
+    ).toEqual({ enabled: true, embeddings: [] });
   });
 });
 

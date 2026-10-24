@@ -1,5 +1,5 @@
 /**
- * 自动跨会话 intent 的因果来源包含获胜 Planner，目标授权与 claim/candidate 引用仍必需校验。
+ * 自动跨会话 intent 的因果来源包含获胜 Light，目标授权与 claim/candidate 引用仍必需校验。
  * 跨会话授权事实是 intent 的合法原因和隔离上下文；payload 不扩展原始字符串目的地址入口。
  * 功能概述：校验第一方持久化消息协议的严格边界，防止旧 reply 数据混入消息意图。
  * 主要职责：覆盖 intent 必填字段及嵌套对象、独立 inbound 来源、assistant 目标元数据、
@@ -14,8 +14,6 @@ import {
   inboundTextInformationKind,
   messageIntentRequestedInformationKind,
   messageIntentRequestedInformationPayloadSchema,
-  associationRequestedInformationKind,
-  associationCompletedInformationPayloadSchema,
   deliveryRequestedInformationKind,
   waitRequestedInformationKind,
   turnBootstrapProjectionSchema,
@@ -24,15 +22,10 @@ import {
 describe("persistent first-party information payloads", () => {
   it("validates a strict versioned bootstrap projection", () => {
     const projection = {
-      version: 1 as const,
-      mode: "cold-start" as const,
-      memory: {
-        state: "no-authorized-evidence" as const,
-        selectedCount: 0,
-      },
-      conversation: { state: "first-seen" as const },
+      version: 2 as const,
+      conversation: { scopeMode: "canonical" as const, registration: null },
       participants: [
-        { inputInformationId: "input-1", state: "first-seen" as const },
+        { inputInformationId: "input-1", ownerId: null, registration: null },
       ],
     };
     expect(turnBootstrapProjectionSchema.parse(projection)).toEqual(projection);
@@ -56,7 +49,7 @@ describe("persistent first-party information payloads", () => {
         platform: "web",
         destination: { kind: "web" },
       },
-      originatingModuleInstanceId: "message-composer.default",
+      originatingModuleInstanceId: "heavy.default",
     };
     expect(
       assistantTextInformationKind.payloadSchema.safeParse({
@@ -116,11 +109,6 @@ function intentPayload() {
       contextInformationId: "context",
     },
     memoryInformationIds: [],
-    composition: {
-      focusInformationIds: ["input"],
-      topic: "测试话题",
-      replyAct: "回应",
-    },
   };
 }
 
@@ -128,11 +116,21 @@ describe("message intent protocol", () => {
   it("requires the complete strict payload, including an explicit empty memory list", () => {
     const payload = intentPayload();
     expect(messageIntentRequestedInformationKind.kind).toBe(
-      "agent.message.intent.requested",
+      "agent.router.message.intent.requested",
     );
     expect(
       messageIntentRequestedInformationPayloadSchema.parse(payload),
     ).toEqual(payload);
+    expect(
+      messageIntentRequestedInformationPayloadSchema.safeParse({
+        ...payload,
+        composition: {
+          focusInformationIds: ["input"],
+          topic: "旧话题",
+          replyAct: "回应",
+        },
+      }).success,
+    ).toBe(false);
     for (const key of Object.keys(payload)) {
       const incomplete = { ...payload } as Record<string, unknown>;
       delete incomplete[key];
@@ -242,47 +240,10 @@ describe("message intent protocol", () => {
     ).toBe(false);
   });
 
-  it("requires claim and candidate references and moves association to the message route", () => {
+  it("requires claim and candidate references on message intent", () => {
     expect(messageIntentRequestedInformationKind.references).toMatchObject({
-      "core:caused-by": {
-        required: true,
-        targetKinds: [
-          "agent.turn.plan.completed",
-          "agent.message.target.authorized",
-        ],
-      },
-      "core:uses-context": {
-        required: true,
-        targetKinds: [
-          "agent.turn.context.completed",
-          "agent.message.target.authorized",
-        ],
-      },
       "agent:turn-claim": { required: true },
       "agent:turn-candidate": { required: true },
     });
-    expect(
-      associationRequestedInformationKind.references["core:caused-by"]!
-        .targetKinds,
-    ).toEqual([messageIntentRequestedInformationKind.kind]);
-    const payload = {
-      requestInformationId: "request",
-      queryInformationId: "query",
-      sourceInformationId: "intent",
-      route: "message",
-      method: "sparse-2gram",
-      status: "empty",
-      candidateCount: 0,
-      reasonCodes: ["empty"],
-    };
-    expect(
-      associationCompletedInformationPayloadSchema.safeParse(payload).success,
-    ).toBe(true);
-    expect(
-      associationCompletedInformationPayloadSchema.safeParse({
-        ...payload,
-        route: "reply",
-      }).success,
-    ).toBe(false);
   });
 });

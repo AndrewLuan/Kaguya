@@ -8,6 +8,16 @@
  * 不调用外部模型或真实网络，每次测试关闭 Fastify、Runtime 与内存数据库。
  * 输入输出与副作用：仅隔离测试数据库 I/O；对比请求前后原子数量确保检查接口不追加事实。
  */
+/**
+ * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
+ * 功能概述：验证开发者 API 在真实 PGlite 账本上的认证、脱敏、游标分页、详情和有界 Flow。
+ * 主要职责：fixture 创建两个独立 context 与跨 context 引用；通过 Fastify inject 检查
+ * 无认证先拒绝、同时间分页不丢消息、过滤绑定、完整 Prompt 保留及秘密移除、只读与错误隔离。
+ * 注意力观察只投影唤醒状态、非语义信号、水位、未读数量和 Focus 快照，不读取正文。
+ * 代码库关系：Runtime 业务装配统一来自 @kaguya/composition；组合 app.ts、inspection.ts、真实 Runtime Manifest 和 database/testing；
+ * 不调用外部模型或真实网络，每次测试关闭 Fastify、Runtime 与内存数据库。
+ * 输入输出与副作用：仅隔离测试数据库 I/O；对比请求前后原子数量确保检查接口不追加事实。
+ */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import { KaguyaRuntime } from "@kaguya/runtime";
@@ -49,6 +59,7 @@ describe("developer inspection", () => {
     database = await createTestingDatabase();
     runtime = new KaguyaRuntime({
       database,
+      now: () => new Date(time),
       ...createMessageComposition(undefined, {
         moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
       }),
@@ -110,6 +121,7 @@ describe("developer inspection", () => {
       informationId: string,
       kind: string,
       payload: InformationAtom["payload"],
+      references: InformationAtom["references"] = [],
     ) =>
       database.information.append(
         freezeInformationAtom({
@@ -118,13 +130,33 @@ describe("developer inspection", () => {
           occurredAt: identityTime,
           source: "module:memory.identity.default",
           payload,
-          references: [],
+          references,
         }),
-        [],
+        [...new Set(references.map((reference) => reference.relation))].map(
+          (relation) => ({
+            relation,
+            required: false,
+            multiple: true,
+          }),
+        ),
       );
-    await appendIdentity("person-ada", "memory.identity.person.entity", {
-      accountId: "10001",
+    await appendIdentity("inbound-ada", "core.message.inbound.text", {
+      source: {
+        platform: "qq",
+        adapterId: "napcat",
+        senderId: "10001",
+        sender: { nickname: "Ada", card: "Ada · 研究组" },
+        destination: { kind: "group", id: "20002" },
+      },
     });
+    await appendIdentity(
+      "person-ada",
+      "memory.identity.person.entity",
+      {
+        initialName: "Ada",
+      },
+      [{ relation: "core:caused-by", informationId: "inbound-ada" }],
+    );
     await appendIdentity(
       "account-ada",
       "memory.identity.platform.account.entity",
@@ -134,12 +166,99 @@ describe("developer inspection", () => {
         accountId: "10001",
       },
     );
-    await appendIdentity("observed-ada", "memory.identity.person.observed", {
+    await appendIdentity(
+      "observed-ada",
+      "memory.identity.person.observed",
+      {
+        nickname: "Ada",
+        card: "Ada · 研究组",
+        observedAt: identityTime,
+      },
+      [
+        { relation: "core:caused-by", informationId: "inbound-ada" },
+        { relation: "core:observes", informationId: "account-ada" },
+      ],
+    );
+    await appendIdentity(
+      "binding-ada",
+      "memory.identity.platform.account.binding",
+      {
+        personInformationId: "person-ada",
+      },
+      [{ relation: "core:binds", informationId: "account-ada" }],
+    );
+    for (const [suffix, groupId, card] of [
+      ["other-group", "30003", "第二个群名片"],
+      ["later", "20002", "Ada · 新研究组"],
+    ] as const) {
+      await appendIdentity(
+        `inbound-ada-${suffix}`,
+        "core.message.inbound.text",
+        {
+          source: {
+            platform: "qq",
+            adapterId: "napcat",
+            senderId: "10001",
+            sender: { nickname: "Ada 新昵称", card },
+            destination: { kind: "group", groupId },
+          },
+        },
+      );
+      await appendIdentity(
+        `observed-ada-${suffix}`,
+        "memory.identity.person.observed",
+        {
+          nickname: "Ada 新昵称",
+          card,
+          observedAt: identityTime,
+        },
+        [
+          {
+            relation: "core:caused-by",
+            informationId: `inbound-ada-${suffix}`,
+          },
+          { relation: "core:observes", informationId: "account-ada" },
+        ],
+      );
+    }
+    await appendIdentity(
+      "account-ada-2",
+      "memory.identity.platform.account.entity",
+      {
+        platform: "qq",
+        adapterId: "napcat",
+        accountId: "10002",
+      },
+    );
+    await appendIdentity(
+      "binding-ada-2",
+      "memory.identity.platform.account.binding",
+      {
+        personInformationId: "person-ada",
+      },
+      [{ relation: "core:binds", informationId: "account-ada-2" }],
+    );
+    await appendIdentity("person-other", "memory.identity.person.entity", {
       accountId: "10001",
-      nickname: "Ada",
-      card: "Ada · 研究组",
-      observedAt: identityTime,
     });
+    await appendIdentity(
+      "account-other",
+      "memory.identity.platform.account.entity",
+      {
+        platform: "discord",
+        adapterId: "discord",
+        accountId: "10001",
+      },
+    );
+    await appendIdentity(
+      "binding-other",
+      "memory.identity.platform.account.binding",
+      {
+        accountId: "10001",
+        personInformationId: "person-other",
+      },
+      [{ relation: "core:binds", informationId: "account-other" }],
+    );
     await appendIdentity("scope-ada", "memory.identity.chat.scope.entity", {
       platform: "qq",
       adapterId: "napcat",
@@ -171,6 +290,7 @@ describe("developer inspection", () => {
         accountInformationId: "account-ada",
         personInformationId: "person-ada",
       },
+      [{ relation: "core:status-of", informationId: "inbound-ada" }],
     );
     original = JSON.stringify(await database.information.get("b"));
   });
@@ -186,8 +306,24 @@ describe("developer inspection", () => {
       ...(auth ? { headers } : {}),
     });
 
+  it("returns an empty read-only situation view without inventing history", async () => {
+    const before = await database.information.inspectPage({ limit: 100 });
+    const response = await get("situation");
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data).toMatchObject({
+      version: 1,
+      frames: [],
+      steps: [],
+      truncated: false,
+    });
+    expect(await database.information.inspectPage({ limit: 100 })).toEqual(
+      before,
+    );
+  });
+
   it("authenticates every endpoint before validating and disables response caching", async () => {
     for (const path of [
+      "situation",
       "modules",
       "atoms?limit=bad",
       "atoms/missing",
@@ -214,10 +350,9 @@ describe("developer inspection", () => {
     const modules = response.json().data.modules;
     expect(modules.length).toBeGreaterThan(0);
     const composer = modules.find(
-      (m: { definitionId: string }) =>
-        m.definitionId === "agent.message-composer",
+      (m: { definitionId: string }) => m.definitionId === "agent.heavy",
     );
-    expect(composer.bindings[0].instanceId).toBe("message-composer.default");
+    expect(composer.bindings[0].instanceId).toBe("heavy.default");
     expect(composer.tags).toEqual([]);
     expect(
       modules.find(
@@ -292,7 +427,7 @@ describe("developer inspection", () => {
   });
   it("shows non-semantic observations, filters by registered view and binds pagination to it", async () => {
     for (const [id, source, outcome, signal] of [
-      ["gate-a", "module:attention-arousal.default", "defer", "passive"],
+      ["gate-a", "module:lifecycle.default", "defer", "passive"],
       ["gate-b", "module:historical-gate", "observe", "recheck"],
     ] as const) {
       await database.information.append(
@@ -322,8 +457,7 @@ describe("developer inspection", () => {
         [],
       );
     }
-    const query =
-      "atoms?definitionId=agent.attention.arousal&view=gates&limit=1";
+    const query = "atoms?definitionId=agent.lifecycle&view=gates&limit=1";
     const response = await get(query);
     expect(response.statusCode).toBe(200);
     const first = response.json().data;
@@ -343,76 +477,30 @@ describe("developer inspection", () => {
     expect(second.items[0].informationId).toBe("gate-a");
     expect(second.nextCursor).toBeNull();
     expect(
-      (await get(query + "&source=module:attention-arousal.default")).json()
-        .data.items[0].informationId,
+      (await get(query + "&source=module:lifecycle.default")).json().data
+        .items[0].informationId,
     ).toBe("gate-a");
     expect((await get(query + "&source=module:other")).statusCode).toBe(400);
     expect((await get(query + "&kind=memory.text")).statusCode).toBe(400);
     expect(
       (
         await get(
-          "atoms?definitionId=memory.expression&view=library&cursor=" +
+          "atoms?definitionId=memory.native&view=formation&cursor=" +
             encodeURIComponent(first.nextCursor),
         )
       ).statusCode,
     ).toBe(400);
     expect(
-      (await get("atoms?definitionId=memory.expression&view=missing"))
-        .statusCode,
+      (await get("atoms?definitionId=memory.native&view=missing")).statusCode,
     ).toBe(404);
     expect(
-      (await get("flows?definitionId=memory.expression&view=library"))
-        .statusCode,
+      (await get("flows?definitionId=memory.native&view=formation")).statusCode,
     ).toBe(400);
     expect(
       (await get(query + "&after=2026-09-12T00:00:00Z")).json().data.items,
     ).toEqual([]);
     const stored = await database.information.get("gate-a");
     expect(stored!.payload).not.toHaveProperty("text");
-  });
-  it("reads real shared Memory documents while inactive and distinguishes missing vector storage", async () => {
-    const address = {
-      platform: "web",
-      adapterId: "web",
-      platformMessageId: "test",
-      accountId: "user",
-      destination: { kind: "web" as const },
-    };
-    for (const source of ["a", "b"])
-      await database.memory.put({
-        sourceInformationId: source,
-        sourceKind: "core.message.inbound.text",
-        content: "已存储原文 " + token,
-        occurredAt: time,
-        address: { ...address, platformMessageId: source },
-      });
-    const path = "modules/memory.writeback/storage?limit=1";
-    expect((await get(path, false)).statusCode).toBe(401);
-    const response = await get(path);
-    expect(response.statusCode).toBe(200);
-    expect(response.headers["cache-control"]).toBe("no-store");
-    expect(response.body).not.toContain(token);
-    const first = response.json().data;
-    expect(first.items).toHaveLength(1);
-    expect(first.items[0].fields[0].value).toContain("已存储原文");
-    const second = (
-      await get(path + "&cursor=" + encodeURIComponent(first.nextCursor))
-    ).json().data;
-    expect(second.items[0].id).not.toBe(first.items[0].id);
-    expect(second.nextCursor).toBeNull();
-    expect(
-      (await get("modules/memory.index/storage")).json().data.available,
-    ).toBe(false);
-    expect(
-      (await get("modules/memory.index/storage?cursor=invalid")).statusCode,
-    ).toBe(400);
-    expect((await get(path.replace("limit=1", "limit=999"))).statusCode).toBe(
-      400,
-    );
-    expect((await get("modules/memory.expression/storage")).statusCode).toBe(
-      404,
-    );
-    expect((await database.memory.getBySource("a"))!.content).toContain(token);
   });
   it("projects the identity surface with bounded search, filters, summary and related detail", async () => {
     const path = "modules/memory.identity/surfaces/people";
@@ -424,8 +512,8 @@ describe("developer inspection", () => {
     expect(page.items).toHaveLength(1);
     expect(page.items[0]).toMatchObject({
       entityId: "person-ada",
-      entityKey: "10001",
-      title: "Ada · 研究组",
+      entityKey: "person-ada",
+      title: "Ada",
       platform: "qq",
       status: "complete",
     });
@@ -435,13 +523,49 @@ describe("developer inspection", () => {
     });
     expect(page.platforms).toContain("qq");
     const detail = (await get(path + "/entities/person-ada")).json().data;
+    expect(detail.entity.title).toBe("Ada");
+    expect(detail.entity.subtitle).toBe("人物 ID · person-ada");
+    expect(
+      detail.entity.fields.some(
+        (field: { label: string }) => field.label === "账号",
+      ),
+    ).toBe(false);
+    expect(detail.accounts).toMatchObject([
+      { platform: "qq", accountId: "10001", nickname: "Ada 新昵称" },
+      { platform: "qq", accountId: "10002", nickname: null },
+    ]);
+    expect(detail.groupCards).toMatchObject([
+      { platform: "qq", groupId: "20002", card: "Ada · 新研究组" },
+      { platform: "qq", groupId: "30003", card: "第二个群名片" },
+    ]);
+    expect(detail.groupCards[0]).not.toHaveProperty("accountId");
+    expect(detail.recognitionStats).toEqual({
+      count: 1,
+      firstAt: time,
+      lastAt: time,
+    });
+    const other = (await get(path + "/entities/person-other")).json().data;
+    expect(other.accounts).toMatchObject([
+      { platform: "discord", accountId: "10001", nickname: null },
+    ]);
+    expect(other.groupCards).toEqual([]);
+    expect(
+      other.sections.find(
+        (section: { id: string }) => section.id === "observations",
+      ).items,
+    ).toEqual([]);
+    expect(
+      (await get(path + "?platform=discord"))
+        .json()
+        .data.items.map((item: { entityId: string }) => item.entityId),
+    ).toEqual(["person-other"]);
     expect(
       detail.sections.find(
         (section: { id: string }) => section.id === "observations",
       ).items[0].fields,
     ).toContainEqual({
       label: "群名片",
-      value: "Ada · 研究组",
+      value: "Ada · 新研究组",
     });
     expect(
       detail.sections.find((section: { id: string }) => section.id === "scopes")
@@ -452,7 +576,7 @@ describe("developer inspection", () => {
     expect((await get(path + "?limit=51")).statusCode).toBe(400);
     expect(
       JSON.stringify(await database.information.get("person-ada")),
-    ).toContain("10001");
+    ).not.toContain('"accountId"');
   });
   it("keeps flows within one context, preserves reference edges and reports truncation", async () => {
     const response = await get("flows/ctx-a");

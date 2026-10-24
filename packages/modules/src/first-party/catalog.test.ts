@@ -1,18 +1,29 @@
 /**
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
- * 测试显式注入统一文件模板，避免 Planner 或 Expression 绕过 default/local 选择。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
  * 功能概述：验证 first-party Catalog 默认配置及激活边界。
  * 主要职责：catalog fixture 注入宿主能力与共享 kind，测试八个默认模块、严格 modelTier 设置、
- * disabled 配置校验与旧 reply/outbound 配置拒绝；Profile 身份不再投影进 Heartflow 设置。
+ * disabled 配置校验与旧 reply/outbound 配置拒绝；Profile 身份不再投影进 Router 设置。
  * 检查视图只引用 Catalog 中的模块 Kind，或由 model-task 能力及请求 Surface 明确声明的 Runtime 请求 Kind。
- * 代码库关系：直接约束 catalog 工厂以及 message-composer 模块的公开 settings schema。
- * 输入输出与副作用：纯内存组装，不连接模型或数据库；错误包含重新初始化说明。
+ * 代码库关系：直接约束 catalog 工厂以及 heavy 模块的公开 settings schema。
+ * 输入输出与副作用：纯内存组装，不连接模型或数据库；错误不包含设置值。
+ */
+/**
+ * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
+ * 功能概述：验证 first-party Catalog 默认配置及激活边界。
+ * 主要职责：catalog fixture 注入宿主能力与共享 kind，测试八个默认模块、严格 modelTier 设置、
+ * disabled 配置校验与旧 reply/outbound 配置拒绝；Profile 身份不再投影进 Router 设置。
+ * 检查视图只引用 Catalog 中的模块 Kind，或由 model-task 能力及请求 Surface 明确声明的 Runtime 请求 Kind。
+ * 代码库关系：直接约束 catalog 工厂以及 heavy 模块的公开 settings schema。
+ * 输入输出与副作用：纯内存组装，不连接模型或数据库；错误不包含设置值。
  */
 import { loadFirstPartyPromptTemplates } from "../node/prompt-templates.js";
 const testPrompts = loadFirstPartyPromptTemplates();
 import { describe, expect, it } from "vitest";
 
 import { executionExhaustedInformationKind } from "@kaguya/engine";
+import { rawContextCapability } from "@kaguya/memory";
 import { z } from "@kaguya/schema";
 import { defineInformationKind, defineModuleCapability } from "@kaguya/sdk";
 
@@ -29,16 +40,12 @@ const testIdentity = {
   timeZone: "Asia/Shanghai",
 };
 const testMessageTemplates = {
-  ...testPrompts.messageComposer,
-  main: "{{scene}}{{history}}{{memory}}{{turn}}",
-  history: "{{#each messages}}{{> history-inbound}}{{/each}}",
+  ...testPrompts.heavy,
+  main: "{{scene}}{{global_context}}{{scope_context}}{{memory}}",
   historyInbound: "{{content}}",
   historyAssistant: "{{content}}",
   memory: "{{#each items}}{{> memory-item}}{{/each}}",
   memoryItem: "{{content}}",
-  quoted: "{{message}}",
-  turn: "{{#each messages}}{{> history-inbound}}{{/each}}",
-  plan: "{{topic}} {{reply_act}}",
 };
 
 function catalog() {
@@ -52,6 +59,7 @@ function catalog() {
       log: { enabled: false },
     });
   return createFirstPartyModuleCatalog({
+    rawContextCapability,
     modelTaskCapability: defineModuleCapability(
       "kaguya:model-task",
       1,
@@ -67,10 +75,10 @@ function catalog() {
     deliveryFailedInformationKind: kind("core.delivery.failed") as never,
     executionExhaustedInformationKind,
     promptTemplates: testMessageTemplates,
-    plannerTemplate: testPrompts.planner,
-    plannerBootstrapPolicy: testPrompts.plannerBootstrapPolicy,
-    memoryEnabled: false,
-    expressionTemplates: testPrompts.expression,
+    lightTemplate: testPrompts.light,
+    lightBootstrapPolicy: testPrompts.lightBootstrapPolicy,
+
+    nativeMemoryTemplate: testPrompts.nativeMemory,
     qqExpressionTemplates: testPrompts.qqExpression,
     agentIdentity: testIdentity,
   });
@@ -84,8 +92,15 @@ describe("first-party module configuration", () => {
         .flatMap((d) => [...d.manifest.produces, ...d.manifest.consumes])
         .map((k) => k.kind),
     );
-    expect(definitions).toHaveLength(13);
+    expect(definitions).toHaveLength(7);
     for (const { manifest } of definitions) {
+      if (manifest.development?.status === "incomplete") {
+        expect(manifest.inspection).toBeUndefined();
+        expect(manifest.consumes).toEqual([]);
+        expect(manifest.produces).toEqual([]);
+        expect(manifest.requires).toEqual([]);
+        continue;
+      }
       expect(manifest.inspection?.mechanism.length).toBeGreaterThan(0);
       expect(manifest.inspection?.views.length).toBeGreaterThan(0);
       expect(Object.isFrozen(manifest.inspection)).toBe(true);
@@ -115,17 +130,14 @@ describe("first-party module configuration", () => {
       }
     }
   });
-  it("materializes four disabled Memory features and static adapters", () => {
+  it("materializes only native Memory as a switchable feature", () => {
     const defaults = createFirstPartyModuleConfigDefaults("production");
-    expect(defaults).toHaveLength(15);
+    expect(defaults).toHaveLength(8);
+    expect(
+      defaults.some((config) => config.definitionId === "memory.expression"),
+    ).toBe(false);
     expect(defaults.every(({ version }) => version === 1)).toBe(true);
-    for (const id of [
-      "memory.writeback",
-      "memory.knowledge",
-      "memory.index",
-      "memory.cognition",
-      "adapter.napcat",
-    ])
+    for (const id of ["memory.native", "adapter.napcat"])
       expect(
         defaults.find((config) => config.definitionId === id)?.enabled,
       ).toBe(false);
@@ -133,23 +145,15 @@ describe("first-party module configuration", () => {
       defaults.find((config) => config.definitionId === "adapter.web")?.enabled,
     ).toBe(true);
     expect(createFirstPartyModuleActivations(catalog(), defaults)).toHaveLength(
-      9,
+      6,
     );
   });
 
-  it("classifies exactly the seven memory definitions", () => {
+  it("classifies the current identity and unified Memory definitions", () => {
     const tagged = catalog()
       .definitions.filter(({ manifest }) => manifest.tags?.includes("memory"))
       .map(({ manifest }) => manifest.definitionId);
-    expect(tagged).toEqual([
-      "memory.association",
-      "memory.cognition",
-      "memory.expression",
-      "memory.identity",
-      "memory.index",
-      "memory.knowledge",
-      "memory.writeback",
-    ]);
+    expect(tagged).toEqual(["memory.identity", "memory.native"]);
     expect(tagged).not.toEqual(
       expect.arrayContaining([
         "core.identity.normalize",
@@ -159,18 +163,28 @@ describe("first-party module configuration", () => {
     );
   });
 
-  it("uses only modelTier for the default message composer", () => {
+  it("fixes Heavy to the heavy tier with no module settings", () => {
     expect(createFirstPartyModuleConfigDefaults()[0]).toEqual({
       version: 1,
-      instanceId: "message-composer.default",
-      definitionId: "agent.message-composer",
+      instanceId: "heavy.default",
+      definitionId: "agent.heavy",
       enabled: true,
-      settings: { modelTier: "heavy" },
+      settings: {},
     });
   });
 
   it.each([
     { instanceId: "reply.default", definitionId: "demo.reply.llm" },
+    { instanceId: "heartflow.default", definitionId: "agent.heartflow.online" },
+    {
+      instanceId: "message-composer.default",
+      definitionId: "agent.message-composer",
+    },
+    {
+      instanceId: "attention-focus.default",
+      definitionId: "agent.attention.focus",
+    },
+    { settings: { modelTier: "heavy" } },
     {
       settings: {
         modelTier: "heavy",
@@ -188,23 +202,22 @@ describe("first-party module configuration", () => {
         },
       },
     },
-  ])(
-    "rejects legacy configuration with reinitialization guidance",
-    (legacy) => {
-      const defaults = createFirstPartyModuleConfigDefaults();
-      expect(() =>
-        createFirstPartyModuleActivations(catalog(), [
-          { ...defaults[0]!, ...legacy, enabled: false },
-          ...defaults.slice(1),
-        ]),
-      ).toThrow(/Reinitialize module configuration/);
-    },
-  );
+  ])("rejects invalid module configuration", (legacy) => {
+    const defaults = createFirstPartyModuleConfigDefaults();
+    expect(() =>
+      createFirstPartyModuleActivations(catalog(), [
+        { ...defaults[0]!, ...legacy, enabled: false },
+        ...defaults.slice(1),
+      ]),
+    ).toThrow(
+      /Unknown module configuration|Unknown module definition|Module settings failed validation/,
+    );
+  });
 
   it("exposes only the message intent protocol across catalog definitions", () => {
     const definitions = catalog().definitions;
     expect(definitions.map(({ manifest }) => manifest.definitionId)).toContain(
-      "agent.message-composer",
+      "agent.heavy",
     );
     expect(
       definitions.map(({ manifest }) => manifest.definitionId),
@@ -212,15 +225,15 @@ describe("first-party module configuration", () => {
     const kinds = definitions
       .flatMap(({ manifest }) => [...manifest.consumes, ...manifest.produces])
       .map(({ kind }) => kind);
-    expect(kinds).toContain("agent.message.intent.requested");
+    expect(kinds).toContain("agent.router.message.intent.requested");
     expect(kinds).not.toContain("core.reply.requested");
   });
 
   it("validates complete settings even for disabled instances", () => {
     const defaults = createFirstPartyModuleConfigDefaults("production");
     const disabled = defaults.map((item) =>
-      item.instanceId === "heartbeat.default"
-        ? { ...item, enabled: false, settings: {} }
+      item.instanceId === "lifecycle.default"
+        ? { ...item, enabled: false, settings: { pulse: { intervalMs: -1 } } }
         : item,
     );
     expect(() =>
@@ -231,18 +244,18 @@ describe("first-party module configuration", () => {
   it("does not activate a valid disabled instance", () => {
     const defaults = createFirstPartyModuleConfigDefaults("production");
     const disabled = defaults.map((item) =>
-      item.instanceId === "heartbeat.default"
+      item.instanceId === "lifecycle.default"
         ? { ...item, enabled: false }
         : item,
     );
     expect(
       createFirstPartyModuleActivations(catalog(), disabled).some(
-        ({ instanceId }) => instanceId === "heartbeat.default",
+        ({ instanceId }) => instanceId === "lifecycle.default",
       ),
     ).toBe(false);
   });
 
-  it("does not project Profile identity into Heartflow settings", () => {
+  it("does not project Profile identity into Router settings", () => {
     const customIdentity = {
       name: "Luna",
       aliases: ["月"],
@@ -253,11 +266,11 @@ describe("first-party module configuration", () => {
       "production",
       customIdentity,
     );
-    const heartflow = createFirstPartyModuleActivations(
+    const router = createFirstPartyModuleActivations(
       catalog(),
       defaults,
       customIdentity,
-    ).find(({ definitionId }) => definitionId === "agent.heartflow.online");
-    expect(heartflow?.settings).not.toHaveProperty("botNames");
+    ).find(({ definitionId }) => definitionId === "agent.router");
+    expect(router?.settings).not.toHaveProperty("botNames");
   });
 });

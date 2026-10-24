@@ -12,6 +12,20 @@
  * 输入输出与副作用：定义只构造冻结内存元数据，无 I/O；settings 由 Host parse 后深冻结。
  * start/ready/stop/dispose 与 AbortSignal 表达资源生命周期；ready 在订阅与可靠投递就绪后登记启动任务，业务顺序仍由 information DAG 表达。
  */
+/**
+ * ModuleRegistrationInput.openScope 为 registerOnce 声明开放范围及释放终态组，仍由 Core 验证并提交。
+ * promptTemplates 显式声明模块模板归属，Catalog 冻结其变量、partial 与组成关系。
+ * record-browser 校验根 Kind、状态字段、双向关系分组和来源投影的 view/字段白名单，随后与状态选项一起深冻结。
+ * model-request-browser 校验模型能力、请求归属字段和受支持的任务模式；Runtime 产生的请求无需由模块重复声明产出。
+ * inspection 显式声明领域视图、字段和机制；校验后冻结，供 Host 只读投影，不提供任意查询执行。
+ * 功能概述：定义唯一版本化模块协议、显式 Catalog 与受控能力边界，供模块作者和 Host 共用。
+ * 主要职责：defineInformationModule 校验静态清单；Catalog 确定性合并并拒绝身份冲突；
+ * capability token 保持命名空间和版本身份；onInformation 声明稳定订阅及投递语义。
+ * 代码库关系：Engine 在 create 前预检这些声明，Runtime 只装配 Catalog 与 activations；
+ * handler 通过受限 context 派生原子和选择上下文，无法取得裸存储或全局配置。
+ * 输入输出与副作用：定义只构造冻结内存元数据，无 I/O；settings 由 Host parse 后深冻结。
+ * start/ready/stop/dispose 与 AbortSignal 表达资源生命周期；ready 在订阅与可靠投递就绪后登记启动任务，业务顺序仍由 information DAG 表达。
+ */
 import type {
   DeepReadonly,
   InformationAtom,
@@ -136,8 +150,14 @@ export interface InformationModuleManifest<TSettings = unknown> {
   readonly definitionId: string;
   readonly moduleVersion: string;
   readonly displayName: string;
+  /** Definition is listed for planning, but must never be activated. */
+  readonly development?: {
+    readonly status: "incomplete";
+    readonly issueUrl: string;
+  };
   /** 用于 Catalog 与管理界面的稳定领域分类；不参与模块激活或执行。 */
   readonly tags?: readonly string[];
+  readonly category?: "identity" | "memory" | "agent" | "platform" | "other";
   readonly summary: string;
   readonly description: string;
   readonly settingsSchema: z.ZodType<TSettings>;
@@ -203,7 +223,11 @@ export interface InformationModuleHandlerContext extends InformationModuleCreate
 }
 export interface InformationModuleSubscription {
   readonly subscriptionId: string;
+  /** Explicit durable identity retained when moving a subscription between modules. */
+  readonly durableSubscriptionId?: string;
   readonly delivery: "live" | "durable";
+  readonly retryForever?: boolean;
+  readonly retryDelayMs?: number;
   readonly kind: string;
   readonly definition: InformationKindDefinition<string, JsonObject>;
   readonly handle: (
@@ -436,24 +460,9 @@ function validateInspectionSurface(
     if (!surface.layout.areas.includes(component.area))
       throw new Error(`Unknown inspection surface area: ${component.area}`);
     if (component.type === "mechanism-steps") continue;
-    if (component.type === "storage-browser") {
-      if (!inspection.storage)
-        throw new Error("Inspection storage browser requires storage");
-      if (new Set(component.columns).size !== component.columns.length)
-        throw new Error("Duplicate inspection storage column");
-      continue;
-    }
     const view = views.get(component.viewId);
     if (!view)
       throw new Error(`Unknown inspection surface view: ${component.viewId}`);
-    if (component.type === "wiki-browser") {
-      if (
-        !producedKinds.has(component.pageKind) ||
-        !view.kinds.includes(component.pageKind)
-      )
-        throw new Error("Invalid inspection Wiki page contract");
-      continue;
-    }
     if (component.type === "model-request-browser") {
       if (
         !manifest.requires.some(
@@ -471,9 +480,9 @@ function validateInspectionSurface(
       )
         throw new Error("Invalid inspection model request contract");
       const expectedTask =
-        component.mode === "planner"
-          ? "agent.turn.plan"
-          : "agent.message.compose";
+        component.mode === "light"
+          ? "agent.light.decide"
+          : "agent.heavy.respond";
       if (component.taskId !== expectedTask)
         throw new Error("Invalid inspection model request task mode");
       continue;
@@ -662,7 +671,10 @@ export function onInformation<K extends string, P extends JsonObject>(
   definition: InformationKindDefinition<K, P>,
   options: {
     readonly subscriptionId: string;
+    readonly durableSubscriptionId?: string;
     readonly delivery: "live" | "durable";
+    readonly retryForever?: boolean;
+    readonly retryDelayMs?: number;
   },
   handle: (
     atom: DeepReadonly<InformationAtom<K, P>>,
@@ -670,6 +682,8 @@ export function onInformation<K extends string, P extends JsonObject>(
   ) => Promise<void> | void,
 ): InformationModuleSubscription {
   assertId(options.subscriptionId, "subscription id");
+  if (options.durableSubscriptionId)
+    assertId(options.durableSubscriptionId, "durable subscription id");
   if (options.delivery !== "live" && options.delivery !== "durable")
     throw new Error("invalid subscription delivery");
   return Object.freeze({

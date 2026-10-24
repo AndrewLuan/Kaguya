@@ -1,63 +1,72 @@
 /**
  * QQ 表情 learn/select 模板纳入同一 default/local 读取和校验流程。
  * 功能概述：第一方模板的 Node 加载入口，优先读取显式声明的 local 覆盖。
- * 主要职责：loadFirstPartyPromptTemplates 返回消息组、授权消息、Planner、人物事实和表达学习模板并预检整组。
+ * 主要职责：loadFirstPartyPromptTemplates 返回消息组、授权消息、Light、人物事实和表达学习模板并预检整组。
  * 代码库关系：资源存储与编译器共用 prompt-declarations；composition 注入运行模块。
  * 输入输出与副作用：只读未渲染模板，保留有效空白；缺失 local 才回退，非法内容直接拒绝。
  */
-import type { MessagePromptTemplates } from "../first-party/message-composer/message-prompt.js";
+/**
+ * QQ 表情 learn/select 模板纳入同一 default/local 读取和校验流程。
+ * 功能概述：第一方模板的 Node 加载入口，优先读取显式声明的 local 覆盖。
+ * 主要职责：loadFirstPartyPromptTemplates 返回消息组、授权消息、Light、人物事实和表达学习模板并预检整组。
+ * 代码库关系：资源存储与编译器共用 prompt-declarations；composition 注入运行模块。
+ * 输入输出与副作用：只读未渲染模板，保留有效空白；缺失 local 才回退，非法内容直接拒绝。
+ */
+import type { HeavyPromptTemplates } from "../first-party/heavy/message-prompt.js";
 import {
   qqExpressionModulePromptTemplates,
   qqExpressionTemplateDeclarations,
-  expressionModulePromptTemplates,
-  expressionTemplateDeclarations,
   authorizedMessageTemplateDeclarations,
-  messageModulePromptTemplates,
+  heavyModulePromptTemplates,
   messageTemplateDeclarations,
   identityAliasesTemplateDeclaration,
   identityNameTemplateDeclaration,
   identityPersonaTemplateDeclaration,
-  plannerTemplateDeclaration,
-  plannerBootstrapPolicyDeclaration,
-  plannerPlatformPolicyDeclarations,
-  personFactTemplateDeclaration,
+  lightTemplateDeclaration,
+  lightBootstrapPolicyDeclaration,
+  lightPlatformPolicyDeclarations,
+  nativeMemoryTemplateDeclaration,
 } from "../prompt-declarations.js";
 import {
   readPromptResources,
   validatePromptResources,
 } from "./prompt-template-store.js";
 export * from "./prompt-template-store.js";
-export type { MessagePromptTemplates } from "../first-party/message-composer/message-prompt.js";
+export type { HeavyPromptTemplates } from "../first-party/heavy/message-prompt.js";
 export interface FirstPartyPromptTemplates {
   readonly identityName: string;
   readonly identityAliases: readonly string[];
   readonly identityPersona: string;
   readonly qqExpression: { readonly learn: string; readonly select: string };
-  readonly expression: { readonly learn: string; readonly select: string };
   readonly authorizedMessage: {
     readonly automatic: string;
     readonly admin: string;
   };
-  readonly messageComposer: MessagePromptTemplates;
-  readonly personFact: string;
-  readonly planner: string;
-  readonly plannerBootstrapPolicy: string;
-  readonly plannerPlatformPolicies: Readonly<
+  readonly heavy: HeavyPromptTemplates;
+  readonly nativeMemory: string;
+  readonly light: string;
+  readonly lightBootstrapPolicy: string;
+  readonly lightPlatformPolicies: Readonly<
     Record<"default" | "qq" | "web", string>
   >;
 }
 export function loadFirstPartyPromptTemplates(
   options: { readonly root?: URL } = {},
 ): FirstPartyPromptTemplates {
-  const messages = readPromptResources(
-    messageModulePromptTemplates,
+  const nativeMemory = readPromptResources(
+    [nativeMemoryTemplateDeclaration],
     options.root,
   );
-  const planner = readPromptResources(
+  validatePromptResources([nativeMemoryTemplateDeclaration], nativeMemory);
+  const messages = readPromptResources(
+    heavyModulePromptTemplates,
+    options.root,
+  );
+  const lightResources = readPromptResources(
     [
-      plannerTemplateDeclaration,
-      plannerBootstrapPolicyDeclaration,
-      ...plannerPlatformPolicyDeclarations,
+      lightTemplateDeclaration,
+      lightBootstrapPolicyDeclaration,
+      ...lightPlatformPolicyDeclarations,
     ],
     options.root,
   );
@@ -69,29 +78,20 @@ export function loadFirstPartyPromptTemplates(
     ],
     options.root,
   );
-  const person = readPromptResources(
-    [personFactTemplateDeclaration],
-    options.root,
-  );
   const qqExpression = readPromptResources(
     qqExpressionModulePromptTemplates,
     options.root,
   );
-  const expression = readPromptResources(
-    expressionModulePromptTemplates,
-    options.root,
-  );
   for (const [declarations, values] of [
     [qqExpressionModulePromptTemplates, qqExpression],
-    [expressionModulePromptTemplates, expression],
-    [messageModulePromptTemplates, messages],
+    [heavyModulePromptTemplates, messages],
     [
       [
-        plannerTemplateDeclaration,
-        plannerBootstrapPolicyDeclaration,
-        ...plannerPlatformPolicyDeclarations,
+        lightTemplateDeclaration,
+        lightBootstrapPolicyDeclaration,
+        ...lightPlatformPolicyDeclarations,
       ],
-      planner,
+      lightResources,
     ],
     [
       [
@@ -101,7 +101,6 @@ export function loadFirstPartyPromptTemplates(
       ],
       identity,
     ],
-    [[personFactTemplateDeclaration], person],
   ] as const) {
     // 保持启动错误上下文；管理端只公开稳定错误代码。
     for (const value of values)
@@ -130,22 +129,17 @@ export function loadFirstPartyPromptTemplates(
         qqExpression.find((v) => v.templateId === d.templateId)!.content,
       ]),
     ) as unknown as FirstPartyPromptTemplates["qqExpression"],
+    nativeMemory: nativeMemory[0]!.content,
     identityName,
     identityAliases,
     identityPersona: identity[2]!.content,
-    expression: Object.fromEntries(
-      expressionTemplateDeclarations.map((d) => [
-        d.key,
-        expression.find((v) => v.templateId === d.templateId)!.content,
-      ]),
-    ) as unknown as FirstPartyPromptTemplates["expression"],
     authorizedMessage: Object.fromEntries(
       authorizedMessageTemplateDeclarations.map((d) => [
         d.key,
         messages.find((v) => v.templateId === d.templateId)!.content,
       ]),
     ) as unknown as FirstPartyPromptTemplates["authorizedMessage"],
-    messageComposer: Object.fromEntries([
+    heavy: Object.fromEntries([
       ...messageTemplateDeclarations.map(
         (d) =>
           [
@@ -155,41 +149,38 @@ export function loadFirstPartyPromptTemplates(
       ),
       [
         "behavior",
-        messages.find((v) => v.templateId === "message-composer.behavior")!
-          .content,
+        messages.find((v) => v.templateId === "heavy.behavior")!.content,
       ],
       [
         "platformStyles",
         {
           default: messages.find(
-            (v) => v.templateId === "message-composer.platform-style",
+            (v) => v.templateId === "heavy.platform-style",
           )!.content,
-          qq: messages.find(
-            (v) => v.templateId === "message-composer.platform-style-qq",
-          )!.content,
+          qq: messages.find((v) => v.templateId === "heavy.platform-style-qq")!
+            .content,
           web: messages.find(
-            (v) => v.templateId === "message-composer.platform-style-web",
+            (v) => v.templateId === "heavy.platform-style-web",
           )!.content,
         },
       ],
-    ]) as unknown as MessagePromptTemplates,
-    personFact: person[0]!.content,
-    planner: planner.find(
-      (value) => value.templateId === plannerTemplateDeclaration.templateId,
+    ]) as unknown as HeavyPromptTemplates,
+    light: lightResources.find(
+      (value) => value.templateId === lightTemplateDeclaration.templateId,
     )!.content,
-    plannerBootstrapPolicy: planner.find(
+    lightBootstrapPolicy: lightResources.find(
       (value) =>
-        value.templateId === plannerBootstrapPolicyDeclaration.templateId,
+        value.templateId === lightBootstrapPolicyDeclaration.templateId,
     )!.content,
-    plannerPlatformPolicies: {
-      default: planner.find(
-        (value) => value.templateId === "heartflow.platform-policy",
+    lightPlatformPolicies: {
+      default: lightResources.find(
+        (value) => value.templateId === "light.platform-policy",
       )!.content,
-      qq: planner.find(
-        (value) => value.templateId === "heartflow.platform-policy-qq",
+      qq: lightResources.find(
+        (value) => value.templateId === "light.platform-policy-qq",
       )!.content,
-      web: planner.find(
-        (value) => value.templateId === "heartflow.platform-policy-web",
+      web: lightResources.find(
+        (value) => value.templateId === "light.platform-policy-web",
       )!.content,
     },
   };

@@ -1,12 +1,11 @@
 /**
- * observationCapability 提供持久观察快照与独立成功进度；只有显式声明依赖的可信模块可调用，不自动迁移旧消费者。
  * 入站 expressions 仅透传给插件，Runtime 不推断表情含义或改变调度。
  * 授权消息正文由 composition 注入的渲染器提供；Runtime 只传冻结变量并维持权限检查。
  * Runtime 只接收 outboundAllowlist；目标授权与最终 transport 前终检使用它，入站权限属于 AdapterHost。
- * Memory knowledge 仅在双开关启用时准备附加投影表、注册检索及 bootstrap；停用保留历史修订和原始账本。
- * 为 Heartflow 注入 conversation/route 窄能力，结构化候选由宿主冻结，自动跨会话投递继续经过最终授权检查。
+ * 为 Router 注入 conversation/route 窄能力，结构化候选由宿主冻结，自动跨会话投递继续经过最终授权检查。
  * close({ drain: true }) 用于热应用：停止调度与 claim 领取，允许已领取任务有界完成，
  * 然后 abort/清理旧宿主；外部注入的数据库保持打开，可供下一 Runtime 复用。
+ * createRuntimeKindRegistry 冻结完整 Kind（包括兼容读取版本），供数据库预检与 Runtime 共享；moduleLifecycle 注入真实插件 fiber。
  * 功能概述：以 PostgreSQL information ledger 装配通用 Runtime，接受显式 Catalog、activations 和宿主 capabilities。
  * 主要职责：start 注册完整 kind 并预检模块，最后开放 ingress；submit 持久化 context/inbound 后返回接受凭据；
  * 最终发送前使用当前出站 GatewayAllowlist 校验目的地，拒绝时只记录安全失败码和目标类型。
@@ -17,8 +16,31 @@
  * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
  * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
  * 模块只通过 #76 的 context.use 获得通用能力。缺少批准或无效 capability 在任何 create 前拒绝。
- * Memory 默认关闭；显式启用时 association 使用独立 Memory 仓储的 sparse Selector
- * strategy；宿主提供 embedding 时装配独立向量仓储和混合召回，扩展不可用时退化 sparse。关闭态仍保留 association terminal 形状，但不注册检索策略或 capability。
+ * 原始事件 Memory 常开；可选 Memory 开关只装配额外的入站文档、稀疏索引与召回能力。
+ * Runtime 过滤旧检索策略，不创建稀疏、向量或认知工作者。
+ * inspectModules 仅在 started 状态返回模块声明、版本、Kind、Prompt 和能力绑定的只读投影。
+ * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
+ */
+/**
+ * 入站 expressions 仅透传给插件，Runtime 不推断表情含义或改变调度。
+ * 授权消息正文由 composition 注入的渲染器提供；Runtime 只传冻结变量并维持权限检查。
+ * Runtime 只接收 outboundAllowlist；目标授权与最终 transport 前终检使用它，入站权限属于 AdapterHost。
+ * 为 Router 注入 conversation/route 窄能力，结构化候选由宿主冻结，自动跨会话投递继续经过最终授权检查。
+ * close({ drain: true }) 用于热应用：停止调度与 claim 领取，允许已领取任务有界完成，
+ * 然后 abort/清理旧宿主；外部注入的数据库保持打开，可供下一 Runtime 复用。
+ * createRuntimeKindRegistry 冻结完整 Kind（包括兼容读取版本），供数据库预检与 Runtime 共享；moduleLifecycle 注入真实插件 fiber。
+ * 功能概述：以 PostgreSQL information ledger 装配通用 Runtime，接受显式 Catalog、activations 和宿主 capabilities。
+ * 主要职责：start 注册完整 kind 并预检模块，最后开放 ingress；submit 持久化 context/inbound 后返回接受凭据；
+ * 最终发送前使用当前出站 GatewayAllowlist 校验目的地，拒绝时只记录安全失败码和目标类型。
+ * 平台投递使用 durable subscription，终态唯一槽避免重放再次落账，已有终态时不重复调用 transport。
+ * 代码库关系：依赖 Database、Core、ModuleHost 和平台适配契约；具体 Agent 列表与 LLM 模型绑定位于 apps composition root。
+ * 输入输出与副作用：连接、迁移、账本写入和 transport I/O 均在生命周期内执行；close 拒绝新入口并停止可靠领取。
+ * 数据库初始化错误脱敏；只关闭自行创建的连接。submit 的 deliveries 是当次实际收集快照，可靠链通常异步完成。
+ * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
+ * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
+ * 模块只通过 #76 的 context.use 获得通用能力。缺少批准或无效 capability 在任何 create 前拒绝。
+ * 原始事件 Memory 常开；可选 Memory 开关只装配额外的入站文档、稀疏索引与召回能力。
+ * Runtime 过滤旧检索策略，不创建稀疏、向量或认知工作者。
  * inspectModules 仅在 started 状态返回模块声明、版本、Kind、Prompt 和能力绑定的只读投影。
  * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
  */
@@ -33,6 +55,7 @@ import { randomUUID } from "node:crypto";
 import {
   InformationLogProjectionRunner,
   KaguyaDatabase,
+  PostgresNativeVectorRetriever,
   UnsupportedDatabaseSchemaError,
 } from "@kaguya/database";
 import {
@@ -50,28 +73,18 @@ import {
   type KaguyaLogger,
 } from "@kaguya/logger";
 import {
-  MEMORY_RETRIEVAL_STRATEGY_ID,
-  MEMORY_KNOWLEDGE_RETRIEVAL_STRATEGY_ID,
-  MEMORY_COGNITION_EVIDENCE_GUARD_STRATEGY_ID,
-  memoryKnowledgeCapability,
-  memoryCapability,
-  memoryDocumentReaderCapability,
-  embeddingCapability,
-  memoryVectorCapability,
-  HybridMemoryRecall,
-  type EmbeddingProvider,
-  type CognitionIdentity,
+  rawContextCapability,
+  nativeMemoryCapability,
+  memoryFormationCapability,
+  createNativeMemoryAccess,
+  type NativeEmbeddingSource,
+  type NativeMemoryAccess,
 } from "@kaguya/memory";
-import { PostgresMemoryVectorIndex } from "@kaguya/database";
 import {
   deliveryRequestedInformationKind,
   messageAuthorizationCapability,
   inboundTextInformationKind,
-  memoryKnowledgeBootstrapCapability,
 } from "@kaguya/modules";
-import { MemoryKnowledgeInformationRetrievalStrategy } from "./memory-knowledge-retrieval.js";
-import { createMemoryKnowledgeBootstrap } from "./memory-knowledge-maintenance.js";
-import { MemoryCognitionEvidenceGuardStrategy } from "./memory-cognition-evidence-guard.js";
 import {
   CadenceCoordinator,
   cadenceInformationKinds,
@@ -113,12 +126,12 @@ import {
   type ModelTaskClientOptions,
   type ModelTaskRequest,
 } from "./model-task.js";
-import { MemoryInformationRetrievalStrategy } from "./memory-retrieval.js";
 
 import {
   builtInInformationKinds,
   deliveryDeliveredInformationKind,
   deliveryFailedInformationKind,
+  deliveryStartedInformationKind,
   runtimeContextInformationKind,
   modelTaskSelectionPolicySchema,
   modelTaskInformationKinds,
@@ -155,17 +168,11 @@ export interface RuntimeTransportRegistration {
 export type InformationIdGenerator = () => string;
 
 export interface RuntimeMemoryOptions {
+  readonly embeddings?: readonly NativeEmbeddingSource[];
   readonly enabled: boolean;
-  readonly knowledgeEnabled?: boolean;
-  readonly embedding?: EmbeddingProvider;
 }
 
-const MEMORY_FEATURE_IDS = new Set([
-  "memory.writeback",
-  "memory.knowledge",
-  "memory.index",
-  "memory.cognition",
-]);
+const MEMORY_FEATURE_IDS = new Set(["memory.native"]);
 function isMemoryFeature(definitionId: string): boolean {
   return MEMORY_FEATURE_IDS.has(definitionId);
 }
@@ -184,16 +191,16 @@ type KaguyaRuntimeBaseOptions = {
   readonly logger?: KaguyaLogger;
   readonly now?: () => Date;
   readonly informationIdGenerator?: InformationIdGenerator;
+  readonly kindRegistry?: InformationKindRegistry;
+  readonly moduleLifecycle?: import("@kaguya/engine").ModuleHostLifecycle;
   readonly catalog: InformationModuleCatalog;
   readonly activations: readonly InformationModuleActivation[];
   readonly capabilities?: RuntimeCapabilities;
   readonly retrievalStrategies?: readonly InformationRetrievalStrategy[];
-  /** 默认关闭；开启后装配内置 PostgreSQL Memory capability 与稀疏召回。 */
+  /** 可选长期原文索引默认关闭；原始事件投影始终运行。 */
   readonly memory?: RuntimeMemoryOptions;
   readonly memoryFeatureState?: {
     enabled: boolean;
-    knowledgeEnabled: boolean;
-    cognitionIdentity?: CognitionIdentity;
   };
   readonly modelTask?: RuntimeModelTaskOptions;
   readonly cadence?: {
@@ -229,6 +236,28 @@ export function runtimeInformationKindNames(
       .map(({ kind }) => kind)
       .sort(),
   );
+}
+
+/** 预检与 Runtime 共用同一个完整、冻结的 Registry；包括未激活处理器的已安装声明。 */
+export function createRuntimeKindRegistry(
+  catalog: InformationModuleCatalog,
+  additional: readonly InformationKindDefinition<string, any>[] = [],
+): InformationKindRegistry {
+  const registry = createRegistry(catalog.definitions);
+  for (const definition of [
+    consumerFailedInformationKind,
+    executionExhaustedInformationKind,
+    ...oneShotInformationKinds,
+  ]) {
+    if (registry.has(definition.kind)) registry.assertRegistered(definition);
+    else registry.registerBuiltin(definition);
+  }
+  for (const definition of additional) {
+    if (registry.has(definition.kind)) registry.assertRegistered(definition);
+    else registry.register(definition);
+  }
+  registry.seal();
+  return registry;
 }
 
 export class RuntimeUnavailableError extends Error {
@@ -320,12 +349,22 @@ export class KaguyaRuntime implements InformationIngress {
   >();
   #hostCapabilities: readonly ModuleCapabilityImplementation[] = [];
   #memoryOptions: RuntimeMemoryOptions = { enabled: false };
+  #nativeAccess: NativeMemoryAccess | undefined;
+  #nativeFacade(access: NativeMemoryAccess): NativeMemoryAccess {
+    this.#nativeAccess = access;
+    return new Proxy(access, {
+      get: (_target, key) => Reflect.get(this.#nativeAccess!, key),
+    });
+  }
   #cadence: CadenceCoordinator | undefined;
   #cadenceUnsubscribe: readonly (() => void)[] = [];
   #oneShotSchedule: OneShotScheduleCapability | undefined;
   #oneShotScheduler: DurableOneShotScheduler | undefined;
   #oneShotRecoveryPromise: Promise<void> | undefined;
   #oneShotSchedulerReady = false;
+  #rawProjectionTimer: ReturnType<typeof setInterval> | undefined;
+  #rawProjectionInFlight = false;
+  #rawProjectionPromise: Promise<void> | undefined;
   readonly #oneShotPendingRefresh = new Set<InformationId>();
 
   constructor(private readonly options: KaguyaRuntimeOptions) {
@@ -364,7 +403,9 @@ export class KaguyaRuntime implements InformationIngress {
     );
     return main.map((definition) => {
       const active = auxiliary.find(
-        (item) => item.definitionId === definition.definitionId,
+        (item) =>
+          item.definitionId === definition.definitionId &&
+          item.bindings.length > 0,
       );
       return active ? { ...definition, bindings: active.bindings } : definition;
     });
@@ -388,7 +429,6 @@ export class KaguyaRuntime implements InformationIngress {
     memory: RuntimeMemoryOptions;
     activations: readonly InformationModuleActivation[];
     capabilities?: RuntimeCapabilities;
-    cognitionIdentity?: CognitionIdentity;
   }): Promise<void> {
     if (
       this.#state !== "started" ||
@@ -405,18 +445,7 @@ export class KaguyaRuntime implements InformationIngress {
       isMemoryFeature(item.definitionId),
     );
     if (!input.memory.enabled && desired.length)
-      throw new Error("Memory dependents require raw Memory");
-    if (
-      desired.some((item) => item.definitionId === "memory.index") &&
-      !input.memory.embedding
-    )
-      throw new Error("Embedding provider is required for memory.index");
-    if (input.memory.knowledgeEnabled)
-      await database.prepareMemoryKnowledgeSchema();
-    const vectorIndex = input.memory.embedding
-      ? new PostgresMemoryVectorIndex(database.sql)
-      : undefined;
-    if (vectorIndex) await vectorIndex.prepare();
+      throw new Error("Memory dependents require native Memory");
     const supplied =
       typeof input.capabilities === "function"
         ? input.capabilities({
@@ -429,41 +458,28 @@ export class KaguyaRuntime implements InformationIngress {
       ...this.#hostCapabilities.filter(
         ({ capability }) => !isMemoryCapability(capability.id),
       ),
-      ...(input.memory.enabled
-        ? [
-            { capability: memoryCapability, value: database.memory },
-            {
-              capability: memoryDocumentReaderCapability,
-              value: database.memory,
-            },
-          ]
-        : []),
-      ...(input.memory.embedding && vectorIndex
-        ? [
-            { capability: embeddingCapability, value: input.memory.embedding },
-            { capability: memoryVectorCapability, value: vectorIndex },
-          ]
-        : []),
-      ...(input.memory.knowledgeEnabled
-        ? [
-            {
-              capability: memoryKnowledgeCapability,
-              value: database.knowledge,
-            },
-            {
-              capability: memoryKnowledgeBootstrapCapability,
-              value: createMemoryKnowledgeBootstrap({ core, now: this.#now }),
-            },
-          ]
-        : []),
+      { capability: observationCapability, value: database.observations },
+      { capability: rawContextCapability, value: database.rawEvents },
+      {
+        capability: nativeMemoryCapability,
+        value: createNativeMemoryAccess({
+          enabled: input.memory.enabled,
+          store: database.memoryGraph.native,
+          retrievers: (input.memory.embeddings ?? []).map(
+            (s) => new PostgresNativeVectorRetriever(database.sql, s),
+          ),
+        }),
+      },
+      {
+        capability: memoryFormationCapability,
+        value: database.memoryGraph.native,
+      },
       ...supplied.filter(({ capability }) => isMemoryCapability(capability.id)),
     ];
     const previous = new Map(this.#memoryHosts);
     const oldCapabilities = this.#hostCapabilities;
     const state = this.options.memoryFeatureState;
-    const oldCognitionIdentity = state?.cognitionIdentity;
     if (!input.memory.enabled && state) state.enabled = false;
-    if (!input.memory.knowledgeEnabled && state) state.knowledgeEnabled = false;
     try {
       for (const [id, active] of [...this.#memoryHosts].reverse()) {
         const next = desired.find((item) => item.definitionId === id);
@@ -478,21 +494,13 @@ export class KaguyaRuntime implements InformationIngress {
         await host.start([activation]);
         this.#memoryHosts.set(activation.definitionId, { host, activation });
       }
-      const strategies = this.#createMemoryStrategies(
-        database,
-        input.memory,
-        vectorIndex,
-      );
-      core.replaceRetrievalStrategies(strategies);
+      core.replaceRetrievalStrategies(this.options.retrievalStrategies ?? []);
       this.#hostCapabilities = capabilities;
+      this.#nativeAccess = capabilities.find(
+        (c) => c.capability.id === nativeMemoryCapability.id,
+      )!.value as NativeMemoryAccess;
       this.#memoryOptions = input.memory;
-      if (state) {
-        state.enabled = input.memory.enabled;
-        state.knowledgeEnabled = input.memory.knowledgeEnabled ?? false;
-        if (input.cognitionIdentity)
-          state.cognitionIdentity = input.cognitionIdentity;
-        else delete state.cognitionIdentity;
-      }
+      if (state) state.enabled = input.memory.enabled;
     } catch (error) {
       const recoveryFailures: unknown[] = [];
       for (const [id, active] of [...this.#memoryHosts].reverse()) {
@@ -514,13 +522,7 @@ export class KaguyaRuntime implements InformationIngress {
           recoveryFailures.push(failure);
         }
       }
-      if (state) {
-        state.enabled = this.#memoryOptions.enabled;
-        state.knowledgeEnabled = this.#memoryOptions.knowledgeEnabled ?? false;
-        if (oldCognitionIdentity)
-          state.cognitionIdentity = oldCognitionIdentity;
-        else delete state.cognitionIdentity;
-      }
+      if (state) state.enabled = this.#memoryOptions.enabled;
       if (recoveryFailures.length)
         throw new AggregateError(
           [error, ...recoveryFailures],
@@ -536,71 +538,15 @@ export class KaguyaRuntime implements InformationIngress {
     return new ModuleHost({
       core: this.#core!,
       catalog: this.options.catalog,
+      ...(this.options.moduleLifecycle
+        ? { lifecycle: this.options.moduleLifecycle }
+        : {}),
       capabilities,
       now: this.#now,
       drainTimeoutMs: this.options.drainTimeoutMs ?? 5000,
       manageReliableDelivery: false,
       observer: (observation) => this.#observeModule(observation),
     });
-  }
-
-  #createMemoryStrategies(
-    database: KaguyaDatabase,
-    memory: RuntimeMemoryOptions,
-    vectorIndex?: PostgresMemoryVectorIndex,
-  ): InformationRetrievalStrategy[] {
-    const base = (this.options.retrievalStrategies ?? []).filter(
-      ({ strategyId }) =>
-        ![
-          MEMORY_RETRIEVAL_STRATEGY_ID,
-          MEMORY_KNOWLEDGE_RETRIEVAL_STRATEGY_ID,
-          MEMORY_COGNITION_EVIDENCE_GUARD_STRATEGY_ID,
-        ].includes(strategyId),
-    );
-    if (!memory.enabled) return [...base];
-    const recall =
-      vectorIndex && memory.embedding
-        ? new HybridMemoryRecall(database.memory, vectorIndex, memory.embedding)
-        : database.memory;
-    const sparse = new MemoryInformationRetrievalStrategy(recall, {
-      reportFailure: ({ errorType }) =>
-        this.#runtimeLogger?.error(
-          { event: "memory.recall.failed", errorType },
-          "Memory recall failed",
-        ),
-    });
-    const knowledge = memory.knowledgeEnabled ?? false;
-    const wrapped: InformationRetrievalStrategy = knowledge
-      ? {
-          strategyId: sparse.strategyId,
-          retrieve: async (query) => {
-            try {
-              const ids = [...(await sparse.retrieve(query))].slice(
-                0,
-                query.limit,
-              );
-              const available = new Set(
-                await database.knowledge.filterAvailableSourceIds({
-                  sourceInformationIds: ids,
-                }),
-              );
-              return ids.filter((id) => available.has(id));
-            } catch {
-              return [];
-            }
-          },
-        }
-      : sparse;
-    return [
-      ...base,
-      wrapped,
-      ...(knowledge
-        ? [
-            new MemoryKnowledgeInformationRetrievalStrategy(database.knowledge),
-            new MemoryCognitionEvidenceGuardStrategy(database.knowledge),
-          ]
-        : []),
-    ];
   }
 
   start(): Promise<void> {
@@ -637,8 +583,12 @@ export class KaguyaRuntime implements InformationIngress {
       }
       this.#assertStarting();
       const definitions = this.options.catalog.definitions;
-      const registry = createRegistry(definitions);
-      const allDefinitions = collectDefinitions(definitions);
+      const registry =
+        this.options.kindRegistry ??
+        createRuntimeKindRegistry(this.options.catalog);
+      for (const definition of collectDefinitions(definitions))
+        registry.assertRegistered(definition);
+      const allDefinitions = registry.definitions();
       const logProjectionRunner = new InformationLogProjectionRunner({
         repository: database.information,
         sink:
@@ -669,95 +619,14 @@ export class KaguyaRuntime implements InformationIngress {
         },
       });
       const memoryEnabled = this.options.memory?.enabled ?? false;
-      const knowledgeEnabled =
-        memoryEnabled && (this.options.memory?.knowledgeEnabled ?? false);
-      if (knowledgeEnabled) await database.prepareMemoryKnowledgeSchema();
-      const vectorIndex =
-        memoryEnabled && this.options.memory?.embedding
-          ? new PostgresMemoryVectorIndex(database.sql)
-          : undefined;
-      if (vectorIndex) {
-        try {
-          await vectorIndex.prepare();
-        } catch {
-          this.#runtimeLogger?.warn(
-            { event: "memory.vector.unavailable" },
-            "Memory vector index unavailable; sparse recall remains enabled",
-          );
-        }
-      }
-      const memoryRecall =
-        vectorIndex && this.options.memory?.embedding
-          ? new HybridMemoryRecall(
-              database.memory,
-              vectorIndex,
-              this.options.memory.embedding,
-            )
-          : database.memory;
-      const baseRetrievalStrategies =
-        this.options.retrievalStrategies ??
-        (memoryEnabled
-          ? [
-              new MemoryInformationRetrievalStrategy(memoryRecall, {
-                reportFailure: ({ errorType }) => {
-                  this.#runtimeLogger?.error(
-                    { event: "memory.recall.failed", errorType },
-                    "Memory recall failed",
-                  );
-                },
-              }),
-            ]
-          : []);
-      const knowledgeStrategyIds = new Set([
-        MEMORY_KNOWLEDGE_RETRIEVAL_STRATEGY_ID,
-        MEMORY_COGNITION_EVIDENCE_GUARD_STRATEGY_ID,
-      ]);
-      const configuredRetrievalStrategies = baseRetrievalStrategies
-        .filter(({ strategyId }) => !knowledgeStrategyIds.has(strategyId))
-        .map((strategy) =>
-          knowledgeEnabled &&
-          strategy.strategyId === MEMORY_RETRIEVAL_STRATEGY_ID
-            ? {
-                strategyId: strategy.strategyId,
-                retrieve: async (
-                  query: Parameters<
-                    InformationRetrievalStrategy["retrieve"]
-                  >[0],
-                ) => {
-                  try {
-                    const ids = [...(await strategy.retrieve(query))].slice(
-                      0,
-                      query.limit,
-                    );
-                    const available = new Set(
-                      await database.knowledge.filterAvailableSourceIds({
-                        sourceInformationIds: ids,
-                      }),
-                    );
-                    return ids.filter((id) => available.has(id));
-                  } catch {
-                    return [];
-                  }
-                },
-              }
-            : strategy,
-        );
-      if (knowledgeEnabled)
-        configuredRetrievalStrategies.push(
-          new MemoryKnowledgeInformationRetrievalStrategy(database.knowledge),
-          new MemoryCognitionEvidenceGuardStrategy(database.knowledge),
-        );
+      const baseRetrievalStrategies = this.options.retrievalStrategies ?? [];
       const core = new InformationCore({
         drainTimeoutMs: this.options.drainTimeoutMs ?? 5000,
         registry,
         store: database.information,
         nextInformationId: this.#nextInformationId,
         now: this.#now,
-        retrievalStrategies: memoryEnabled
-          ? configuredRetrievalStrategies
-          : configuredRetrievalStrategies.filter(
-              ({ strategyId }) => strategyId !== MEMORY_RETRIEVAL_STRATEGY_ID,
-            ),
+        retrievalStrategies: baseRetrievalStrategies,
         bootstrapReporter: (error) => {
           this.#runtimeLogger?.error(
             {
@@ -829,13 +698,26 @@ export class KaguyaRuntime implements InformationIngress {
               oneShotSchedule,
             })
           : this.options.capabilities;
-      const enabledSuppliedCapabilities = memoryEnabled
-        ? (suppliedCapabilities ?? [])
-        : (suppliedCapabilities ?? []).filter(
-            ({ capability }) => !capability.id.startsWith("memory:access"),
-          );
+      const enabledSuppliedCapabilities = suppliedCapabilities ?? [];
       const capabilities = [
         { capability: observationCapability, value: database.observations },
+      { capability: rawContextCapability, value: database.rawEvents },
+        {
+          capability: nativeMemoryCapability,
+          value: this.#nativeFacade(
+            createNativeMemoryAccess({
+              enabled: memoryEnabled,
+              store: database.memoryGraph.native,
+              retrievers: (this.options.memory?.embeddings ?? []).map(
+                (s) => new PostgresNativeVectorRetriever(database.sql, s),
+              ),
+            }),
+          ),
+        },
+        {
+          capability: memoryFormationCapability,
+          value: database.memoryGraph.native,
+        },
         {
           capability: messageAuthorizationCapability,
           value: Object.freeze({
@@ -851,51 +733,22 @@ export class KaguyaRuntime implements InformationIngress {
               this.#messageTargets!.stage(assistant),
           }),
         },
-        ...(memoryEnabled
-          ? [
-              { capability: memoryCapability, value: database.memory },
-              {
-                capability: memoryDocumentReaderCapability,
-                value: database.memory,
-              },
-            ]
-          : []),
-        ...(vectorIndex && this.options.memory?.embedding
-          ? [
-              {
-                capability: embeddingCapability,
-                value: this.options.memory.embedding,
-              },
-              { capability: memoryVectorCapability, value: vectorIndex },
-            ]
-          : []),
-        ...(knowledgeEnabled
-          ? [
-              {
-                capability: memoryKnowledgeCapability,
-                value: database.knowledge,
-              },
-              {
-                capability: memoryKnowledgeBootstrapCapability,
-                value: createMemoryKnowledgeBootstrap({
-                  core,
-                  now: this.#now,
-                }),
-              },
-            ]
-          : []),
         ...composeModelTaskCapabilities(
           this.options,
           { core, now: this.#now, oneShotSchedule },
           enabledSuppliedCapabilities,
         ),
       ];
+
       this.#hostCapabilities = capabilities;
       this.#memoryOptions = this.options.memory ?? { enabled: false };
       const moduleHost = new ModuleHost({
         drainTimeoutMs: this.options.drainTimeoutMs ?? 5000,
         core,
         catalog: this.options.catalog,
+        ...(this.options.moduleLifecycle
+          ? { lifecycle: this.options.moduleLifecycle }
+          : {}),
         capabilities,
         now: this.#now,
         observer: (observation) => this.#observeModule(observation),
@@ -911,6 +764,34 @@ export class KaguyaRuntime implements InformationIngress {
           (activation) => !isMemoryFeature(activation.definitionId),
         ),
       );
+      const projectRaw = () => {
+        if (
+          this.#rawProjectionInFlight ||
+          this.#state === "closing" ||
+          this.#state === "closed"
+        )
+          return;
+        this.#rawProjectionInFlight = true;
+        this.#rawProjectionPromise = database.rawEvents
+          .projectLatest()
+          .then(() => undefined)
+          .catch((error) => {
+            this.#runtimeLogger?.error(
+              {
+                event: "raw.events.projection.failed",
+                errorType: safeErrorType(error),
+              },
+              "Raw Memory event projection failed",
+            );
+          })
+          .finally(() => {
+            this.#rawProjectionInFlight = false;
+            this.#rawProjectionPromise = undefined;
+          });
+      };
+      this.#rawProjectionTimer = setInterval(projectRaw, 1_000);
+      this.#rawProjectionTimer.unref?.();
+      projectRaw();
       for (const activation of this.options.activations.filter((item) =>
         isMemoryFeature(item.definitionId),
       )) {
@@ -1020,6 +901,13 @@ export class KaguyaRuntime implements InformationIngress {
     if (this.#cleanupPromise !== undefined) return this.#cleanupPromise;
     this.#cleanupPromise = (async () => {
       const failures: unknown[] = [];
+      if (this.#rawProjectionTimer) clearInterval(this.#rawProjectionTimer);
+      this.#rawProjectionTimer = undefined;
+      if (this.#rawProjectionPromise)
+        await drainRuntimeOperations(
+          [this.#rawProjectionPromise],
+          this.options.drainTimeoutMs ?? 5_000,
+        );
       try {
         await this.#oneShotScheduler?.stop();
       } catch (error) {
@@ -1208,6 +1096,26 @@ export class KaguyaRuntime implements InformationIngress {
     )
       return;
     const context = uniqueContextReference(request);
+    // Old versions had no started marker. A recovered delivery may already have
+    // reached the platform, so an earlier lease is evidence of an unknown result.
+    const attempts = await required(this.#database, "database").sql.query<{
+      attempts: number;
+    }>(
+      "SELECT attempts FROM information_deliveries WHERE subscription_id = $1 AND information_id = $2",
+      ["kaguya.runtime.delivery", request.informationId],
+    );
+    if (
+      (attempts.rows[0]?.attempts ?? 0) > 1 ||
+      (await core.select(deliveryStartedSelector, request.informationId)).length
+    ) {
+      await this.#registerDeliveryFailure(
+        request,
+        context.informationId,
+        "Delivery result is unknown after recovery",
+        "unknown",
+      );
+      return;
+    }
     const targetAuthorized =
       request.payload.platform === "web" ||
       (await this.#messageTargets!.validateDelivery(request));
@@ -1267,6 +1175,30 @@ export class KaguyaRuntime implements InformationIngress {
       throw error;
     }
 
+    const attemptId = randomUUID();
+    const started = await core.registerOnce(
+      "kaguya.delivery.started.v1",
+      request.informationId,
+      deliveryStartedInformationKind,
+      {
+        occurredAt: this.#now().toISOString(),
+        source: "runtime:delivery",
+        payload: { attemptId },
+        references: [
+          { relation: "core:caused-by", informationId: request.informationId },
+          { relation: "core:context", informationId: context.informationId },
+        ],
+      },
+    );
+    if (started.payload.attemptId !== attemptId) {
+      await this.#registerDeliveryFailure(
+        request,
+        context.informationId,
+        "Delivery result is unknown after recovery",
+        "unknown",
+      );
+      return;
+    }
     let receipt: PlatformDeliveryReceipt;
     try {
       receipt = await registration.transport.sendMessage(
@@ -1278,7 +1210,8 @@ export class KaguyaRuntime implements InformationIngress {
       await this.#registerDeliveryFailure(
         request,
         context.informationId,
-        "Platform transport failed",
+        "Platform transport result is unknown",
+        "unknown",
       );
       throw new OutboundTransportError(
         request.payload.adapterId,
@@ -1327,6 +1260,7 @@ export class KaguyaRuntime implements InformationIngress {
     request: DeliveryRequestedAtom,
     contextInformationId: InformationId,
     error: string,
+    outcome: "failed" | "unknown" = "failed",
   ): Promise<void> {
     await required(this.#core, "information core").commitTerminal(
       "kaguya.delivery.result.v1",
@@ -1341,6 +1275,7 @@ export class KaguyaRuntime implements InformationIngress {
           platform: request.payload.platform,
           target: request.payload.destination,
           error,
+          ...(outcome === "unknown" ? { outcome } : {}),
         },
         references: deliveryResultReferences(
           request.informationId,
@@ -1445,6 +1380,21 @@ function composeModelTaskCapabilities(
   }
   return capabilities;
 }
+
+const deliveryStartedSelector = defineInformationSelector({
+  selectorId: "runtime.delivery.started",
+  select: async ({ sourceAtom, ledger }) =>
+    (
+      await ledger.related({
+        from: [sourceAtom.informationId],
+        relation: "core:caused-by",
+        direction: "incoming",
+        limit: 100,
+      })
+    )
+      .filter((atom) => atom.kind === deliveryStartedInformationKind.kind)
+      .map((atom) => atom.informationId),
+});
 
 const deliveryTerminalSelector = defineInformationSelector({
   selectorId: "runtime.delivery.terminal",

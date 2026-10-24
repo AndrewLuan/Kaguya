@@ -4,6 +4,12 @@
  * 同时校验逐次请求目录和 Prompt 可用性；空目录可携带后续扫描游标，完整 Prompt 不限摘要长度。
  * 代码库关系：直接消费 inspection.ts；仅纯 Schema 解析，不做网络或数据库操作。
  */
+/**
+ * 功能概述：验证 record-browser 与 model-request-browser 的 wire 边界，拒绝表达式式字段路径、无界分组和不合法来源状态。
+ * 主要职责：覆盖门控展示、状态选项、正向引用与带 path 的字段；旧声明继续解析，非法 direction 和重复状态拒绝。
+ * 同时校验逐次请求目录和 Prompt 可用性；空目录可携带后续扫描游标，完整 Prompt 不限摘要长度。
+ * 代码库关系：直接消费 inspection.ts；仅纯 Schema 解析，不做网络或数据库操作。
+ */
 import { expect, it } from "vitest";
 import {
   moduleInspectionSurfaceSchema,
@@ -59,7 +65,7 @@ it("accepts active module bindings that do not consume a capability", () => {
       version: 1,
       modules: [
         {
-          definitionId: "memory.writeback",
+          definitionId: "memory.native",
           tags: ["memory"],
           displayName: "原始记忆",
           summary: "保存原文",
@@ -74,9 +80,7 @@ it("accepts active module bindings that do not consume a capability", () => {
           diagnostics: [],
           requires: [],
           provides: [],
-          bindings: [
-            { instanceId: "memory.writeback.default", capabilities: [] },
-          ],
+          bindings: [{ instanceId: "memory.native.default", capabilities: [] }],
         },
       ],
     }).modules[0]?.bindings[0]?.capabilities,
@@ -89,8 +93,8 @@ it("accepts model requests with bounded-scan continuation and an independent com
     type: "model-request-browser",
     area: "main",
     viewId: "model-requests",
-    taskId: "agent.turn.plan",
-    mode: "planner",
+    taskId: "agent.light.decide",
+    mode: "light",
   };
   expect(
     moduleInspectionSurfaceSchema.parse(surface(browser)).components[0]!.type,
@@ -160,48 +164,6 @@ it("accepts bounded declarative records without identity-only metadata", () => {
       nextCursor: null,
     }).items,
   ).toEqual([]);
-});
-it("accepts a page-oriented Wiki browser", () => {
-  expect(
-    moduleInspectionSurfaceSchema.parse(
-      surface({
-        id: "pages",
-        type: "wiki-browser",
-        area: "main",
-        viewId: "pages",
-        pageKind: "memory.knowledge.wiki.updated",
-        empty: "还没有 Wiki 页面。",
-      }),
-    ).components[0],
-  ).toMatchObject({
-    type: "wiki-browser",
-    pageKind: "memory.knowledge.wiki.updated",
-  });
-});
-it("accepts a bounded storage table and its page-specific hidden sections", () => {
-  const parsed = moduleInspectionSurfaceSchema.parse({
-    ...surface({
-      id: "documents",
-      type: "storage-browser",
-      area: "main",
-      columns: ["正文", "会话", "发生时间"],
-      empty: "还没有原始记忆。",
-    }),
-    hiddenSections: ["settings", "prompt-renderers"],
-  });
-  expect(parsed.components[0]!.type).toBe("storage-browser");
-  expect(parsed.hiddenSections).toEqual(["settings", "prompt-renderers"]);
-  expect(() =>
-    moduleInspectionSurfaceSchema.parse({
-      ...surface({
-        id: "documents",
-        type: "storage-browser",
-        area: "main",
-        columns: [],
-        empty: "暂无",
-      }),
-    }),
-  ).toThrow();
 });
 it("rejects executable paths and unbounded relation reads", () => {
   expect(() =>

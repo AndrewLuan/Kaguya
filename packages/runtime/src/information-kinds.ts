@@ -1,7 +1,7 @@
 /**
  * conversationContextInformationKind 注册宿主冻结的背景与目标解析投影，内容日志仅输出目录状态。
  * 出站策略拒绝使用不含 target ID 的失败分支；消费者通过请求引用关联 turn，日志只投影安全字段。
- * Planner 的普通请求日志仅投影任务元数据，不包含 Prompt 预览；显式 content detail 保留受控诊断。
+ * Light 的普通请求日志仅投影任务元数据，不包含 Prompt 预览；显式 content detail 保留受控诊断。
  * 功能概述：定义 Runtime 自有的 context、通用 Model Task 生命周期和投递结果 kind，并聚合内建 DAG。
  * Model Task：四个 modelTask*InformationKind 保存任务版本、选择策略、模型、激活来源与 Prompt
  * provenance；终态使用同一 requested 的 status-of，输出仅为 JSON，具体 schema 由调用方拥有。
@@ -41,6 +41,8 @@ import {
   type InformationId,
   type JsonObject,
   compiledPromptSchema,
+  nativeMessagesSchema,
+  nativeResponseSchema,
   jsonValueSchema,
   informationIdSchema,
   platformDestinationSchema,
@@ -135,7 +137,7 @@ export const deliveryDeliveredInformationKind = defineInformationKind({
   kind: "core.delivery.delivered",
   displayName: "平台投递成功",
   description:
-    "适配器确认投递完成后记录发送结果；Heartflow 据此闭合回合，历史选择器只将成功投递的助手消息纳入历史。",
+    "适配器确认投递完成后记录发送结果；Router 据此闭合回合，历史选择器只将成功投递的助手消息纳入历史。",
   payloadSchema: z.union([
     z
       .object({
@@ -179,12 +181,36 @@ export const deliveryDeliveredInformationKind = defineInformationKind({
   },
 });
 
+/** A durable send boundary. A recovered dispatch must not send a second time. */
+export const deliveryStartedInformationKind = defineInformationKind({
+  kind: "core.delivery.started",
+  displayName: "平台投递已开始",
+  description:
+    "外部发送前保存唯一尝试标识。恢复时已有标识但无回执的投递标记为结果未知。",
+  payloadSchema: z.strictObject({ attemptId: nonBlankString }),
+  references: {
+    "core:caused-by": {
+      required: true,
+      multiple: false,
+      targetKinds: [deliveryRequestedInformationKind.kind],
+    },
+    "core:context": contextReference,
+  },
+  log: { enabled: false },
+});
+
 export const deliveryFailedInformationKind = defineInformationKind({
   kind: "core.delivery.failed",
   displayName: "平台投递失败",
   description:
-    "平台发送未完成时记录安全错误和目标信息；Heartflow 与诊断据此结束失败路径，不把已生成正文当作已送达。",
+    "平台发送未完成时记录安全错误和目标信息；Router 与诊断据此结束失败路径，不把已生成正文当作已送达。",
   payloadSchema: z.union([
+    z.strictObject({
+      ...safeDeliveryBaseShape,
+      ok: z.literal(false),
+      outcome: z.literal("unknown"),
+      error: nonBlankString,
+    }),
     z
       .object({
         ...safeDeliveryBaseShape,
@@ -257,7 +283,6 @@ const modelTaskProvenanceSchema = z.array(
 export const modelTaskMetadataSchema = z
   .object({
     taskId: nonBlankString,
-    version: nonBlankString,
     outputMode: modelTaskOutputModeSchema,
     sourceInformationId: informationIdSchema,
     contextInformationId: informationIdSchema,
@@ -266,6 +291,7 @@ export const modelTaskMetadataSchema = z
     promptTemplateId: nonBlankString,
     promptTemplateDigest: nonBlankString,
     promptDigest: nonBlankString,
+    messagesDigest: nonBlankString.nullable().default(null),
     provenance: modelTaskProvenanceSchema,
     activation: z
       .object({ instanceId: nonBlankString, definitionId: nonBlankString })
@@ -306,6 +332,8 @@ const modelTaskSafeErrorBaseSchema = z
       "provider-request",
       "structured-output-parse",
       "task-schema-validation",
+      "context-budget",
+      "native-protocol",
     ]),
     message: z.literal("Model task generation failed"),
   })
@@ -329,6 +357,7 @@ export const modelTaskProviderReasonSchema = z.enum([
   "credential-blocked",
   "model-access-denied",
   "rate-limited",
+  "insufficient-balance",
   "invalid-request",
   "model-not-found",
   "provider-unavailable",
@@ -370,6 +399,7 @@ const providerFailureAction: Readonly<Record<ProviderFailureReason, string>> = {
   "credential-blocked": "检查或更新 API Key；若由组织管理，联系管理员解除封禁",
   "model-access-denied": "核对账号的模型访问授权",
   "rate-limited": "检查额度与限流策略，稍后重试",
+  "insufficient-balance": "检查 Provider 账户余额",
   "invalid-request": "核对模型请求参数与 Provider 能力",
   "model-not-found": "核对模型 ID 与 Provider 可用模型列表",
   "provider-unavailable": "检查上游服务状态，稍后重试",
@@ -402,7 +432,14 @@ export const modelTaskRequestedInformationKind = defineInformationKind({
   description:
     "模块通过受控能力提交任务后冻结 Prompt、模型选择和调用归属；Runtime 据此执行或恢复同一任务并保留输入溯源。",
   payloadSchema: modelTaskMetadataSchema
-    .extend({ prompt: informationCompiledPromptSchema })
+    .extend({
+      prompt: informationCompiledPromptSchema,
+      messages: nativeMessagesSchema.nullable().default(null),
+      inputBlocked: z
+        .enum(["context-budget", "native-protocol"])
+        .nullable()
+        .default(null),
+    })
     .strict(),
   references: {
     "core:caused-by": { required: true, multiple: false },
@@ -416,7 +453,6 @@ export const modelTaskRequestedInformationKind = defineInformationKind({
       event: "model.task.lifecycle",
       status: "requested",
       taskId: payload.taskId,
-      taskVersion: payload.version,
       activationDefinitionId: payload.activation.definitionId,
       activationInstanceId: payload.activation.instanceId,
       tier: payload.selectionPolicy.tier,
@@ -425,7 +461,7 @@ export const modelTaskRequestedInformationKind = defineInformationKind({
       outputMode: payload.outputMode,
       promptCharacters: Array.from(payload.prompt.text).length,
       promptVariableCount: payload.prompt.variables.length,
-      ...(payload.taskId === "agent.turn.plan"
+      ...(payload.taskId === "agent.light.decide"
         ? {}
         : promptPreview(payload.prompt.text)),
     }),
@@ -435,7 +471,6 @@ export const modelTaskRequestedInformationKind = defineInformationKind({
         event: "model.task.prompt",
         status: "requested",
         taskId: payload.taskId,
-        taskVersion: payload.version,
         promptFull: sanitizePromptForLogging(payload.prompt.text),
         promptVariables: payload.prompt.provenance.map((entry) => ({
           variableName: entry.variableName,
@@ -461,10 +496,15 @@ export const modelTaskCompletedInformationKind = defineInformationKind({
         ...modelTaskTerminalShape,
         ...modelTaskUsageShape,
         output: modelTaskOutputSchema,
+        native: nativeResponseSchema.nullable().default(null),
       })
       .strict(),
     z
-      .object({ ...modelTaskTerminalShape, output: modelTaskOutputSchema })
+      .object({
+        ...modelTaskTerminalShape,
+        output: modelTaskOutputSchema,
+        native: nativeResponseSchema.nullable().default(null),
+      })
       .strict(),
   ]),
   references: modelTaskTerminalReferences,
@@ -475,7 +515,6 @@ export const modelTaskCompletedInformationKind = defineInformationKind({
       event: "model.task.lifecycle",
       status: "completed",
       taskId: payload.taskId,
-      taskVersion: payload.version,
       activationDefinitionId: payload.activation.definitionId,
       activationInstanceId: payload.activation.instanceId,
       tier: payload.selectionPolicy.tier,
@@ -511,7 +550,6 @@ export const modelTaskFailedInformationKind = defineInformationKind({
       event: "model.task.lifecycle",
       status: "failed",
       taskId: payload.taskId,
-      taskVersion: payload.version,
       activationDefinitionId: payload.activation.definitionId,
       activationInstanceId: payload.activation.instanceId,
       tier: payload.selectionPolicy.tier,
@@ -565,7 +603,6 @@ export const modelTaskCancelledInformationKind = defineInformationKind({
       event: "model.task.lifecycle",
       status: "cancelled",
       taskId: payload.taskId,
-      taskVersion: payload.version,
       activationDefinitionId: payload.activation.definitionId,
       activationInstanceId: payload.activation.instanceId,
       tier: payload.selectionPolicy.tier,
@@ -618,5 +655,6 @@ export const builtInInformationKinds = Object.freeze([
   inboundTextInformationKind,
   deliveryRequestedInformationKind,
   deliveryDeliveredInformationKind,
+  deliveryStartedInformationKind,
   deliveryFailedInformationKind,
 ] as const satisfies readonly InformationKindDefinition<string, any>[]);

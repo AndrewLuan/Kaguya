@@ -8,6 +8,16 @@
  * 代码库关系：SDK 校验声明，Host 投影给 Server；Server 按声明查询账本，Web 使用通用视图。
  * 输入输出与副作用：纯静态元数据，无 I/O、配置值或 UI 组件；历史记录只说明当时事实，不推断当前状态。
  */
+/**
+ * 功能概述：第一方模块拥有的检查视图，定义门控机制、历史/数据分组和可读字段。
+ * 记忆联想用 record-browser 按查询串起完成事实、排名候选和 canonical source；字段与文案均由本模块声明。
+ * 注意力用 attention-gate 展示唤醒状态与 observe/defer 完成事实，只投影非语义信号、水位与 Focus 快照。
+ * 在线心流与消息组织用 model-request-browser 按持久化模型请求浏览，完整 Prompt 与来源由独立详情承载。
+ * 主要职责：firstPartyInspection 由各模块 Manifest 显式引用；view 将稳定字段路径与中文标题绑定。
+ * arousalFields 由列表、详情和 SDK 校验复用；不查询或展示正文，也不补写历史条件。
+ * 代码库关系：SDK 校验声明，Host 投影给 Server；Server 按声明查询账本，Web 使用通用视图。
+ * 输入输出与副作用：纯静态元数据，无 I/O、配置值或 UI 组件；历史记录只说明当时事实，不推断当前状态。
+ */
 import type { ModuleInspection } from "@kaguya/schema";
 const fields = (entries: Record<string, string>) =>
   Object.entries(entries).map(([path, label]) => ({ path, label }));
@@ -20,7 +30,7 @@ const view = (
 ) => ({ id, title, description, kinds, fields: fields(entries) });
 const arousalFields = {
   outcome: "结果",
-  arousalState: "Arousal 状态",
+  arousalState: "睡眠状态",
   arousalStateInformationId: "状态事实",
   wakeSignal: "唤醒信号",
   scopeKey: "会话范围",
@@ -45,7 +55,7 @@ const arousalViewFields = {
   startedAt: "开始时间",
   expiresAt: "到期时间",
   generation: "代次",
-  heartbeatInformationId: "短心跳",
+  heartbeatInformationId: "观察调度",
   triggerInformationId: "观察触发",
   lastEvaluatedAt: "最近检查时间",
   lastInboundInformationId: "最近全局消息",
@@ -78,6 +88,7 @@ export const firstPartyInspection = {
     mechanism: [
       "按平台、适配器和目标解析会话范围。",
       "关联账号与人物实体；无法确认时明确记录 unresolved 或 ambiguous。",
+      "人物画像由管理端手动维护；保存后重启服务才进入 Light 与 Heavy，Memory 自动提取尚未接入。",
     ],
     views: [
       view(
@@ -97,12 +108,15 @@ export const firstPartyInspection = {
           adapterId: "适配器",
           destination: "会话",
           accountId: "账号",
+          initialName: "初始称呼",
+          informationId: "人物 ID",
           personInformationId: "人物",
           displayName: "名称",
           scopeMode: "范围类型",
           nickname: "昵称",
           card: "群名片",
           observedAt: "观察时间",
+          revision: "画像版本",
         },
       ),
       view(
@@ -146,22 +160,21 @@ export const firstPartyInspection = {
           area: "main",
           viewId: "identities",
           entityKind: "memory.identity.person.entity",
-          entityKeyField: "accountId",
+          entityKeyField: "informationId",
           activity: {
-            viewId: "identities",
-            kinds: ["memory.identity.person.observed"],
-            entityKeyField: "accountId",
+            viewId: "history",
+            kinds: ["memory.identity.person.context.completed"],
+            entityKeyField: "personInformationId",
           },
           titleFields: [
-            { path: "card", label: "群名片" },
-            { path: "nickname", label: "昵称" },
-            { path: "accountId", label: "账号" },
+            { path: "initialName", label: "初始称呼" },
+            { path: "informationId", label: "人物 ID" },
           ],
           searchFields: [
             {
               viewId: "identities",
               kind: "memory.identity.person.entity",
-              path: "accountId",
+              path: "initialName",
             },
             {
               viewId: "identities",
@@ -187,24 +200,6 @@ export const firstPartyInspection = {
             statusField: "status",
           },
           relations: [
-            {
-              id: "accounts",
-              title: "平台账号与绑定",
-              viewId: "identities",
-              kinds: [
-                "memory.identity.platform.account.entity",
-                "memory.identity.platform.account.binding",
-              ],
-              match: { source: "entity-key", field: "accountId" },
-              presentation: "relation-list",
-              fields: [
-                { path: "platform", label: "平台" },
-                { path: "adapterId", label: "适配器" },
-                { path: "accountId", label: "账号" },
-                { path: "personInformationId", label: "人物" },
-              ],
-              limit: 20,
-            },
             {
               id: "observations",
               title: "名称观察时间线",
@@ -277,7 +272,7 @@ export const firstPartyInspection = {
       "Arousal 最新状态事实是唤醒状态真值；空闲休眠、夜间边界与周期唤醒分别等待持久化绝对 deadline，初始状态为 awake。",
       "私聊、Web、@、回复、有效 Focus 或周期复查会确认唤醒；休眠状态默认每五分钟短暂唤醒一次。",
       "awake 状态下观察机会默认 observe；只有显式 asleep 且没有唤醒信号时才 defer。",
-      "defer 不推进已观察水位；只有 observe 后 Heartflow 才按上下界读取并冻结全部未读。",
+      "defer 不推进已观察水位；只有 observe 后 Router 才按上下界读取并冻结全部未读。",
     ],
     views: [
       view(
@@ -287,9 +282,9 @@ export const firstPartyInspection = {
         [
           "agent.attention.arousal.completed",
           "agent.attention.arousal.state.recorded",
-          "agent.turn.candidate",
-          "agent.attention.focus.opened",
-          "agent.attention.focus.renewed",
+          "agent.heartbeat.candidate",
+          "agent.router.focus.opened",
+          "agent.router.focus.renewed",
         ],
         arousalViewFields,
       ),
@@ -325,13 +320,13 @@ export const firstPartyInspection = {
             mechanism: "观察机制",
           },
           notice:
-            "这里只展示当时已记录的唤醒状态、通知、Focus 与水位事实；observe 不代表 Planner 最终回复。",
+            "这里只展示当时已记录的唤醒状态、通知、Focus 与水位事实；observe 不代表 Light 最终回复。",
           relations: [
             {
               id: "candidate",
               title: "观察机会",
               viewId: "gates",
-              kinds: ["agent.turn.candidate"],
+              kinds: ["agent.heartbeat.candidate"],
               reference: "core:status-of",
               direction: "forward",
               presentation: "field-grid",
@@ -377,8 +372,8 @@ export const firstPartyInspection = {
               title: "Focus 租约",
               viewId: "gates",
               kinds: [
-                "agent.attention.focus.opened",
-                "agent.attention.focus.renewed",
+                "agent.router.focus.opened",
+                "agent.router.focus.renewed",
               ],
               reference: "core:uses-context",
               direction: "forward",
@@ -416,8 +411,8 @@ export const firstPartyInspection = {
           "agent.heartbeat.fired",
           "agent.heartbeat.superseded",
           "agent.heartbeat.failed",
-          "agent.observation.wake",
-          "agent.turn.candidate",
+          "agent.heartbeat.observation.wake",
+          "agent.heartbeat.candidate",
         ],
         {
           reason: "触发原因",
@@ -439,11 +434,13 @@ export const firstPartyInspection = {
       ),
     ],
   },
-  "agent.heartflow.online": {
+  "agent.router": {
     mechanism: [
       "仅在 Arousal 记录 observe 后认领候选，并按上下水位读取、冻结全部未读。",
-      "身份屏障完成后由 Planner 选择 message、wait 或 silent；记录中断与替换。",
+      "身份屏障完成后由 Light 选择 message、wait 或 silent；记录中断与替换。",
       "只有投递事实确认后才能判定发送完成。",
+      "直接唤醒或成功参与可开启、续租群聊关注。",
+      "租约到期和关闭只影响对应代际；关注不绕过硬门禁。",
     ],
     views: [
       modelRequestsView(),
@@ -452,15 +449,15 @@ export const firstPartyInspection = {
         "回合与规划",
         "冻结输入、话题时效、模型动作与终态。",
         [
-          "agent.turn.context.completed",
-          "agent.turn.plan.completed",
-          "agent.turn.completed",
-          "agent.turn.waiting",
-          "agent.turn.silent",
-          "agent.turn.failed",
-          "agent.turn.superseded",
-          "agent.turn.interrupted",
-          "agent.turn.decision.interrupted",
+          "agent.router.turn.context.completed",
+          "agent.light.decision.completed",
+          "agent.router.turn.completed",
+          "agent.router.turn.waiting",
+          "agent.router.turn.silent",
+          "agent.router.turn.failed",
+          "agent.router.turn.superseded",
+          "agent.router.turn.interrupted",
+          "agent.router.turn.decision.interrupted",
         ],
         {
           action: "规划动作",
@@ -474,39 +471,15 @@ export const firstPartyInspection = {
           claimInformationId: "认领",
         },
       ),
-    ],
-    surface: {
-      version: 1,
-      id: "planner-requests",
-      title: "Planner 决策",
-      layout: { type: "sections", areas: ["requests"] },
-      components: [
-        {
-          id: "requests",
-          type: "model-request-browser",
-          area: "requests",
-          viewId: "model-requests",
-          taskId: "agent.turn.plan",
-          mode: "planner",
-        },
-      ],
-    },
-  },
-  "agent.attention.focus": {
-    mechanism: [
-      "直接唤醒或成功参与可开启、续租群聊关注。",
-      "到期和关闭只影响指定代际，旧租约到期不会关闭新租约；关注不绕过硬门禁。",
-    ],
-    views: [
       view(
         "leases",
         "关注租约历史",
         "按记录时间展示开启、续租、关闭和到期；不能把一页历史当作全局有效租约表。",
         [
-          "agent.attention.focus.opened",
-          "agent.attention.focus.renewed",
-          "agent.attention.focus.closed",
-          "agent.attention.focus.expired",
+          "agent.router.focus.opened",
+          "agent.router.focus.renewed",
+          "agent.router.focus.closed",
+          "agent.router.focus.expired",
         ],
         {
           scopeKey: "会话范围",
@@ -518,172 +491,57 @@ export const firstPartyInspection = {
         },
       ),
     ],
-  },
-  "memory.expression": {
-    mechanism: [
-      "从真人消息批次中学习受限的情境与表达方式，验证后整体落库。",
-      "按会话聚合习惯，当前语境最多选择三项；空结果不影响正文生成。",
-    ],
-    views: [
-      view(
-        "library",
-        "表达习惯库",
-        "已持久化学习批次，保留验证状态和来源；重复习惯可能出现在多个批次中。",
-        ["memory.expression.learning.completed"],
-        {
-          status: "验证结果",
-          habits: "情境与表达方式",
-          reason: "原因",
-          scopeInformationId: "会话范围",
-        },
-      ),
-      view(
-        "selection",
-        "学习与选用历史",
-        "查看冻结样本、候选与最终选用。",
-        [
-          "memory.expression.learning.requested",
-          "memory.expression.selection.requested",
-          "memory.expression.selection.completed",
-        ],
-        {
-          habits: "选用习惯",
-          candidates: "候选习惯",
-          reason: "原因",
-          sourceInformationIds: "样本",
-          watermark: "学习水位",
-          scopeInformationId: "会话范围",
-        },
-      ),
-    ],
-  },
-  "memory.association": {
-    mechanism: [
-      "从冻结回合的输入构造查询；检索仅限同一平台、适配器和会话，且早于截止时间。",
-      "用 sparse-2gram 检索，按覆盖程度排序，最多召回 8 条；排除本轮输入。",
-      "候选只记录排名与来源引用。消息合成沿引用重新读取材料，召回不代表最终进入 Prompt。",
-    ],
-    views: [
-      view(
-        "queries",
-        "联想查询",
-        "实际查询及冻结的检索范围。",
-        ["memory.association.query"],
-        {
-          query: "查询",
-          queryText: "原始输入",
-          "scope.platform": "平台",
-          "scope.adapterId": "适配器",
-          "scope.destination": "会话",
-          "scope.destination.groupId": "群号",
-          "scope.destination.userId": "用户",
-          asOf: "截止时间",
-          method: "检索方法",
-          limit: "候选上限",
-          "memory.identity.status": "身份状态",
-        },
-      ),
-      view(
-        "retrieval",
-        "召回结果与候选",
-        "记录结果、排名与原因；不推断是否采用。",
-        ["memory.association.candidate", "memory.association.completed"],
-        {
-          rank: "排名",
-          strategy: "检索策略",
-          reasonCodes: "原因",
-          candidateCount: "候选数量",
-          status: "结果",
-        },
-      ),
-      view(
-        "sources",
-        "记忆来源",
-        "沿候选的 canonical source 引用读取原始记录。",
-        ["core.message.inbound.text", "memory.text"],
-        {
-          text: "原文",
-          source: "来源会话",
-        },
-      ),
-    ],
     surface: {
       version: 1,
-      id: "associations",
-      title: "记忆联想",
-      layout: { type: "master-detail", areas: ["main", "context"] },
+      id: "light-requests",
+      title: "Light 决策",
+      layout: { type: "sections", areas: ["requests"] },
       components: [
         {
-          id: "queries",
-          type: "record-browser",
-          area: "main",
-          viewId: "queries",
-          recordKind: "memory.association.query",
-          titleField: "query",
-          searchFields: [
-            "query",
-            "scope.platform",
-            "scope.adapterId",
-            "scope.destination.groupId",
-            "scope.destination.userId",
-          ],
-          fields: fields({
-            "scope.platform": "平台",
-            "scope.adapterId": "适配器",
-            "scope.destination": "会话",
-            asOf: "截止时间",
-            method: "检索方法",
-            limit: "候选上限",
-          }),
-          labels: {
-            directory: "联想记录",
-            search: "查找联想",
-            placeholder: "查询内容、平台、适配器或会话 ID",
-            empty: "尚无联想查询。处理消息意图后，记录会出现在这里。",
-            mechanism: "记忆联想如何工作",
-          },
-          notice:
-            "候选表示已召回的材料；是否进入 Prompt，需沿原始记录继续追溯。",
-          relations: [
-            {
-              id: "result",
-              title: "召回结果",
-              viewId: "retrieval",
-              kinds: ["memory.association.completed"],
-              reference: "core:caused-by",
-              presentation: "field-grid",
-              fields: fields({
-                candidateCount: "候选数量",
-                reasonCodes: "原因",
-              }),
-              empty: "尚未记录完成结果；当前无法判断召回是否完成。",
-              limit: 1,
-            },
-            {
-              id: "candidates",
-              title: "记忆候选",
-              viewId: "retrieval",
-              kinds: ["memory.association.candidate"],
-              reference: "core:caused-by",
-              presentation: "ranked-list",
-              rankField: "rank",
-              fields: fields({ reasonCodes: "原因" }),
-              empty: "这次查询尚无候选记录。",
-              limit: 10,
-              source: {
-                reference: "agent:canonical-source",
-                viewId: "sources",
-                kinds: ["core.message.inbound.text", "memory.text"],
-                fields: fields({ text: "原文", occurredAt: "来源时间" }),
-              },
-            },
-          ],
+          id: "requests",
+          type: "model-request-browser",
+          area: "requests",
+          viewId: "model-requests",
+          taskId: "agent.light.decide",
+          mode: "light",
         },
-        { id: "mechanism", type: "mechanism-steps", area: "context" },
       ],
     },
   },
-  "agent.message-composer": {
+  "memory.native": {
+    mechanism: [
+      "来源按会话形成持久化批次，默认 8 条或 60 秒触发。",
+      "图、文本索引与版本审计原子发布。向量只辅助召回。",
+      "level 0 直接进入固定上下文，动态召回独立限额。",
+    ],
+    views: [
+      view(
+        "formation",
+        "形成与整理",
+        "冻结来源及发布结果。",
+        [
+          "memory.native.formation.requested.v1",
+          "memory.native.formation.completed.v1",
+          "memory.native.formation.retry.v1",
+        ],
+        {
+          batchId: "批次",
+          scope: "范围",
+          status: "状态",
+          reason: "原因",
+          nodeIds: "节点",
+        },
+      ),
+      view(
+        "revisions",
+        "版本发布",
+        "图与文本索引已提交的完整修订。",
+        ["memory.native.revision.v1"],
+        { operationId: "操作", nodes: "节点", edges: "连结" },
+      ),
+    ],
+  },
+  "agent.heavy": {
     mechanism: [
       "沿显式引用选择冻结输入、历史、记忆和表达参考，再编译 Prompt。",
       "模型生成正文后提交助手消息与投递请求；请求不等于投递成功。",
@@ -706,8 +564,8 @@ export const firstPartyInspection = {
     ],
     surface: {
       version: 1,
-      id: "composer-requests",
-      title: "消息生成",
+      id: "heavy-requests",
+      title: "Heavy 正文生成",
       layout: { type: "sections", areas: ["requests"] },
       components: [
         {
@@ -715,108 +573,10 @@ export const firstPartyInspection = {
           type: "model-request-browser",
           area: "requests",
           viewId: "model-requests",
-          taskId: "agent.message.compose",
-          mode: "composer",
+          taskId: "agent.heavy.respond",
+          mode: "heavy",
         },
       ],
     },
-  },
-  "memory.writeback": {
-    storage: "memory",
-    mechanism: [
-      "身份处理结束后按来源幂等保存入站原文，在线回合静默也会写回。",
-      "完成、空内容或失败形成唯一终态；暂时故障交给可靠消费者重试。",
-    ],
-    views: [
-      view(
-        "writeback",
-        "写回历史",
-        "写回事实与原始文档库分开查询；无终态不能直接认定失败。",
-        [
-          "memory.writeback.requested",
-          "memory.writeback.completed",
-          "memory.writeback.empty",
-          "memory.writeback.failed",
-        ],
-        { status: "结果" },
-      ),
-    ],
-    surface: {
-      version: 1,
-      id: "raw-memory",
-      title: "原始记忆",
-      layout: { type: "sections", areas: ["documents"] },
-      components: [
-        {
-          id: "memory-documents",
-          type: "storage-browser",
-          area: "documents",
-          columns: ["平台", "适配器", "会话", "账号", "发生时间", "正文"],
-          empty: "还没有原始记忆。",
-        },
-      ],
-      hiddenSections: [
-        "responsibilities",
-        "settings",
-        "templates",
-        "prompt-renderers",
-        "diagnostics",
-      ],
-    },
-  },
-  "memory.index": {
-    storage: "vectors",
-    mechanism: [
-      "原始文档与向量分开存储，向量按模型、revision 和维度隔离。",
-      "后台有界分页回填；模型切换后旧任务可能标为 superseded。",
-    ],
-    views: [
-      view(
-        "index",
-        "索引与回填历史",
-        "回填游标与结果来自持久化事实。",
-        [
-          "memory.index.requested",
-          "memory.index.backfill.requested",
-          "memory.index.completed",
-        ],
-        {
-          identity: "模型版本",
-          status: "结果",
-          sourceInformationId: "文档来源",
-          afterMemoryId: "回填游标",
-          batchSize: "批次大小",
-        },
-      ),
-    ],
-  },
-  "memory.cognition": {
-    mechanism: [
-      "从已写入文档中冻结有界证据窗口，交由指定 provider/revision 处理。",
-      "仅验证完成的快照可被选用；空结果、失效版本和非法输出分别记录。",
-    ],
-    views: [
-      view(
-        "snapshots",
-        "认知快照库",
-        "持久化正文与证据引用；当前查询不代表已被某次回复使用。",
-        ["memory.text"],
-        { text: "记忆内容", provenance: "来源" },
-      ),
-      view(
-        "cognition",
-        "认知处理历史",
-        "provider 版本、证据窗口与验证结果。",
-        ["memory.cognition.requested", "memory.cognition.completed"],
-        {
-          identity: "提供方版本",
-          status: "结果",
-          scopeKey: "会话范围",
-          asOf: "截止时间",
-          sourceInformationIds: "证据来源",
-          memoryInformationId: "快照",
-        },
-      ),
-    ],
   },
 } satisfies Record<string, ModuleInspection>;

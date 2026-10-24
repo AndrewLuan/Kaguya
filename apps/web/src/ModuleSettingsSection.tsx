@@ -2,7 +2,7 @@
  * 功能概述：模块详情页的全局 settings 表单，控件完全由模块字段元数据生成。
  * 主要职责：ModuleSettingsSection 读取实例；InstanceEditor 保留失败草稿并发送带 revision 的完整替换。
  * 代码库关系：通过 #152 的 section 插槽接收 definitionId/token；独立客户端复用共享响应 schema。
- * 输入输出与副作用：保存只写磁盘并提示显式应用；切换模块取消读取，不自动应用配置。
+ * 输入输出与副作用：普通模块的设置与启停保存后提示显式应用；Memory/NapCat 保留重启提示；切换模块取消读取，不自动应用配置。
  */
 import "./module-editors.css";
 import { Button } from "./components/ui.js";
@@ -25,12 +25,7 @@ import {
   type FeatureId,
   type FeatureView,
 } from "./feature-api.js";
-const MEMORY_FEATURES = new Set([
-  "memory.writeback",
-  "memory.knowledge",
-  "memory.index",
-  "memory.cognition",
-]);
+const MEMORY_FEATURES = new Set(["memory.native"]);
 export function ModuleSettingsSection(props: ModuleEditorProps) {
   return (
     <SettingsLoader key={`${props.definitionId}:${props.token}`} {...props} />
@@ -66,8 +61,10 @@ function SettingsLoader({ definitionId, token }: ModuleEditorProps) {
       <p>
         全局模块配置：不随顶栏 Profile 切换。
         {MEMORY_FEATURES.has(definitionId)
-          ? "设置保存后立即应用；启停与概览同步。"
-          : "其他模块保存后需在生效管理中显式应用。"}
+          ? "设置与启停保存后需重启生效。"
+          : view?.effect === "restart_required"
+            ? "设置与启停保存后需重启生效。"
+            : "设置与启停保存后需显式应用生效。"}
       </p>
       {error ? (
         <p role="alert">{error}</p>
@@ -136,15 +133,13 @@ function InstanceEditor({
     try {
       const submittedValues = { ...values };
       for (const field of fields) {
-        if (field.itemType !== "object") continue;
+        if (field.itemType !== "object" && field.type !== "object") continue;
         const draft = submittedValues[field.key];
         if (typeof draft !== "string") continue;
         try {
           submittedValues[field.key] = JSON.parse(draft);
         } catch {
-          setErrors([
-            { path: field.key, message: "请输入有效的 JSON 规则数组。" },
-          ]);
+          setErrors([{ path: field.key, message: "请输入有效的 JSON 配置。" }]);
           return;
         }
       }
@@ -163,9 +158,9 @@ function InstanceEditor({
       setValues(next.settings);
       setEnabled(next.enabled);
       setNotice(
-        MEMORY_FEATURES.has(definitionId)
-          ? "配置已保存并应用。"
-          : "全局配置已保存。请前往生效管理，显式应用当前配置；运行实例尚未改变。",
+        MEMORY_FEATURES.has(definitionId) || definitionId === "adapter.napcat"
+          ? "配置已保存。重启后生效；当前运行状态未改变。"
+          : "全局配置已保存。请前往生效管理，显式应用当前配置。",
       );
       if (MEMORY_FEATURES.has(definitionId))
         window.dispatchEvent(new Event(FEATURE_CHANGED_EVENT));
@@ -230,6 +225,10 @@ function InstanceEditor({
             配置启用状态
           </label>
         )}
+        <small>
+          期望：{saved.enabled ? "开启" : "关闭"} · 当前：
+          {saved.running ? "运行" : "未运行"}
+        </small>
         {fields.length === 0 && <p>无需配置 settings 字段。</p>}
         {fields.map((field) => (
           <div key={field.key}>
@@ -337,18 +336,19 @@ function MemoryModuleSwitch({
           role="switch"
           checked={feature?.enabled ?? false}
           disabled={
-            !feature || busy || dirty || (!!feature.blocker && !feature.enabled)
+            !feature || busy || dirty || feature.blocker === "recovery_failed"
           }
           onChange={(event) => void change(event.target.checked)}
         />
         启用此模块
       </label>
       {dirty && <small>请先保存当前设置再切换。</small>}
-      {feature?.blocker === "memory.writeback" && (
-        <small>请先开启原始记忆。</small>
-      )}
-      {feature?.enabled && !feature.active && (
-        <small>模块未运行，请检查配置或 Runtime 状态。</small>
+      {feature && (
+        <small>
+          期望：{feature.enabled ? "开启" : "关闭"} · 当前：
+          {feature.active ? "运行" : "未运行"}
+          {feature.enabled !== feature.active ? "；重启后生效" : ""}
+        </small>
       )}
       {error && <p role="alert">{error}</p>}
     </div>
@@ -383,6 +383,19 @@ function FieldControl({
           <option key={option}>{option}</option>
         ))}
       </select>
+    );
+  if (field.type === "object")
+    return (
+      <textarea
+        readOnly={field.readOnly}
+        rows={8}
+        value={
+          typeof value === "string"
+            ? value
+            : JSON.stringify(value ?? field.default ?? {}, null, 2)
+        }
+        onChange={(event) => onChange(event.target.value)}
+      />
     );
   if (field.type === "array")
     return (

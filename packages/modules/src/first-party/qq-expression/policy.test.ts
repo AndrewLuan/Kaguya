@@ -6,7 +6,7 @@ import type { InformationSelectorLedger } from "@kaguya/sdk";
 import { createQqExpressionModule } from "./index.js";
 import { modelToken } from "../test-support/cognitive-fixture.js";
 import { loadFirstPartyPromptTemplates } from "../../node/prompt-templates.js";
-import { atom, fixture, target } from "../message-composer/test-fixtures.js";
+import { atom, fixture, target } from "../heavy/test-fixtures.js";
 describe("emoji and expression limits", () => {
   it.each(["😂", "👍🏽", "👨‍👩‍👧‍👦", "🇨🇳", "1️⃣"])("keeps %s as one glyph", (glyph) => {
     expect(emojiParts(glyph)).toEqual([glyph]);
@@ -39,7 +39,7 @@ describe("emoji and expression limits", () => {
 
 it("does not reset cooldown when a busy conversation truncates recent history", () => {
   const history = Array.from({ length: 101 }, (_, i) =>
-    atom(`burst-${i}`, "agent.message.prepared", { text: "文字" }),
+    atom(`burst-${i}`, "agent.heavy.message.prepared", { text: "文字" }),
   );
   expect(
     rateAllowed(history, Date.parse(history[0]!.occurredAt) + 1000, {
@@ -50,27 +50,11 @@ it("does not reset cooldown when a busy conversation truncates recent history", 
   expect(stripEmoji("© 2026 ™ ordinary")).toBe("© 2026 ™ ordinary");
 });
 
-it.each([
-  [undefined, false],
-  ["neutral", false],
-  ["humorous", true],
-  ["teasing", true],
-] as const)(
-  "allows expression context only for an explicit humorous plan (%s)",
-  async (tone, allowed) => {
+it(
+  "selects same-scope expression context without a Light composition field",
+  async () => {
     const f = fixture();
-    const intent = atom(
-      f.intent.informationId,
-      f.intent.kind,
-      {
-        ...f.intent.payload,
-        composition: {
-          ...(f.intent.payload.composition as JsonObject),
-          ...(tone ? { tone } : {}),
-        },
-      },
-      [...f.intent.references],
-    );
+    const intent = f.intent;
     const request = atom("request", "core.model.task.requested", {}, [
       { relation: "core:caused-by", informationId: intent.informationId },
     ]);
@@ -79,11 +63,11 @@ it.each([
     ]);
     const draft = atom(
       "draft",
-      "agent.message.draft",
+      "agent.heavy.message.draft",
       {
         text: "普通正文",
         source: target,
-        originatingModuleInstanceId: "composer",
+        originatingModuleInstanceId: "heavy",
         turn: intent.payload.turn as JsonObject,
       },
       [{ relation: "core:caused-by", informationId: result.informationId }],
@@ -103,7 +87,7 @@ it.each([
       retrieve: async () => [],
     };
     const ids = await selector.select({ sourceAtom: draft, ledger });
-    expect(ids.includes(f.turn.informationId)).toBe(allowed);
+    expect(ids.includes(f.turn.informationId)).toBe(true);
     const crossDraft = atom(
       "cross",
       draft.kind,

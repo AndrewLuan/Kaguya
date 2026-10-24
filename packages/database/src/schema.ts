@@ -1,15 +1,26 @@
 /**
- * 功能概述：初始化并校验 PostgreSQL v1 账本及观察协议标记；prepareLifecycleProjection 建立可重建的开放集合及 scope 槽。
+ * 功能概述：初始化并校验 PostgreSQL v2 账本及 Router/Light/Heavy 协议标记；prepareLifecycleProjection 建立可重建的开放集合及 scope 槽。
  * 主要职责：prepareDatabaseSchema 在启动事务中校验既有结构并首次回填投影；后续启动不扫描历史。
- * prepareWebMemoryDestination 兼容旧 Web 目标约束，允许 conversationId 索引；旧 NULL 行不改写。
+ * prepareKindContracts 只增加通用 Kind 契约列，后续插件安装与升级不再执行模块专用 DDL。
+ * prepareMemoryGraphSchema 幂等建立独立节点／边表；prepareWebMemoryDestination 兼容旧 Web 目标约束。
+ * lifecycle 回填与在线追加使用同一 Web conversationId scope，保持历史查询和观察范围一致。
+ * 代码库关系：InformationRepository 同事务维护投影，ReliableInformationRepository 锁定 scope head；原子仍只追加。
+ * 输入输出与副作用：执行 DDL 与首次历史回填；不支持的账本结构报错，失败回滚全部 schema 变更。
+ */
+/**
+ * 功能概述：初始化并校验 PostgreSQL v2 账本及 Router/Light/Heavy 协议标记；prepareLifecycleProjection 建立可重建的开放集合及 scope 槽。
+ * 主要职责：prepareDatabaseSchema 在启动事务中校验既有结构并首次回填投影；后续启动不扫描历史。
+ * prepareKindContracts 只增加通用 Kind 契约列，后续插件安装与升级不再执行模块专用 DDL。
+ * prepareMemoryGraphSchema 幂等建立独立节点／边表；prepareWebMemoryDestination 兼容旧 Web 目标约束。
  * lifecycle 回填与在线追加使用同一 Web conversationId scope，保持历史查询和观察范围一致。
  * 代码库关系：InformationRepository 同事务维护投影，ReliableInformationRepository 锁定 scope head；原子仍只追加。
  * 输入输出与副作用：执行 DDL 与首次历史回填；不支持的账本结构报错，失败回滚全部 schema 变更。
  */
 import type { SqlDatabase } from "./driver.js";
+import { prepareMemoryGraphSchema } from "./memory-graph.js";
 
-export const POSTGRES_SCHEMA_VERSION = 1;
-export const INFORMATION_PROTOCOL_VERSION = "attention-observation.v1";
+export const POSTGRES_SCHEMA_VERSION = 2;
+export const INFORMATION_PROTOCOL_VERSION = "router-light-heavy.v2";
 
 const REQUIRED_TABLES = [
   "kaguya_schema_metadata",
@@ -20,8 +31,6 @@ const REQUIRED_TABLES = [
   "information_subscriptions",
   "information_deliveries",
   "information_commit_slots",
-  "memory_documents",
-  "memory_document_ngrams",
   "information_schedule_arms",
 ] as const;
 
@@ -32,10 +41,6 @@ const REQUIRED_INDEXES = [
   "information_atoms_source_occurred_at_idx",
   "information_references_target_relation_idx",
   "information_log_outbox_pending_idx",
-  "memory_document_ngrams_gram_idx",
-  "memory_documents_namespace_time_idx",
-  "memory_documents_account_time_idx",
-  "memory_documents_scope_time_idx",
 ] as const;
 
 const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
@@ -73,21 +78,6 @@ const REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
     "lease_until",
   ],
   information_commit_slots: ["slot_type", "namespace", "key", "information_id"],
-  memory_documents: [
-    "memory_id",
-    "source_information_id",
-    "source_kind",
-    "content",
-    "occurred_at",
-    "created_at",
-    "platform",
-    "adapter_id",
-    "platform_message_id",
-    "account_id",
-    "destination_kind",
-    "destination_id",
-  ],
-  memory_document_ngrams: ["memory_id", "gram"],
   information_schedule_arms: [
     "schedule_information_id",
     "due_at",
@@ -118,8 +108,10 @@ export async function prepareDatabaseSchema(
     }
     if (tableNames.has("kaguya_schema_metadata")) {
       await validateCurrentSchema(tx, tableNames);
-      await prepareWebMemoryDestination(tx);
       await prepareLifecycleProjection(tx);
+      await prepareKindContracts(tx);
+      await prepareRawEventMemory(tx);
+      await prepareMemoryGraphSchema(tx);
       return;
     }
     if (tableNames.size > 0) {
@@ -128,7 +120,7 @@ export async function prepareDatabaseSchema(
     await tx.exec(`
       CREATE TABLE kaguya_schema_metadata (
         singleton boolean PRIMARY KEY CHECK (singleton),
-        version integer NOT NULL CHECK (version = 1),
+        version integer NOT NULL CHECK (version = 2),
         information_protocol text NOT NULL
           CHECK (information_protocol = '${INFORMATION_PROTOCOL_VERSION}')
       );
@@ -188,34 +180,6 @@ export async function prepareDatabaseSchema(
         PRIMARY KEY (slot_type, namespace, key)
       );
 
-      CREATE TABLE memory_documents (
-        memory_id text PRIMARY KEY,
-        source_information_id text NOT NULL UNIQUE
-          REFERENCES information_atoms(information_id) ON DELETE RESTRICT,
-        source_kind text NOT NULL,
-        content text NOT NULL,
-        occurred_at text NOT NULL,
-        created_at text NOT NULL,
-        platform text NOT NULL,
-        adapter_id text NOT NULL,
-        platform_message_id text NOT NULL,
-        account_id text NOT NULL,
-        destination_kind text NOT NULL
-          CHECK (destination_kind IN ('private', 'group', 'web')),
-        destination_id text,
-        CONSTRAINT memory_documents_destination_check CHECK (
-          destination_kind = 'web'
-          OR (destination_kind IN ('private', 'group') AND destination_id IS NOT NULL)
-        )
-      );
-
-      CREATE TABLE memory_document_ngrams (
-        memory_id text NOT NULL
-          REFERENCES memory_documents(memory_id) ON DELETE CASCADE,
-        gram text NOT NULL,
-        PRIMARY KEY (memory_id, gram)
-      );
-
       CREATE TABLE information_schedule_arms (
         schedule_information_id text PRIMARY KEY
           REFERENCES information_atoms(information_id) ON DELETE RESTRICT,
@@ -242,20 +206,6 @@ export async function prepareDatabaseSchema(
       CREATE INDEX information_log_outbox_pending_idx
         ON information_log_outbox (attempt_count, created_at, information_id)
         WHERE projected_at IS NULL;
-
-      CREATE INDEX memory_document_ngrams_gram_idx
-        ON memory_document_ngrams (gram, memory_id);
-
-      CREATE INDEX memory_documents_namespace_time_idx
-        ON memory_documents (platform, adapter_id, occurred_at, memory_id);
-
-      CREATE INDEX memory_documents_account_time_idx
-        ON memory_documents (platform, adapter_id, account_id, occurred_at, memory_id);
-
-      CREATE INDEX memory_documents_scope_time_idx
-        ON memory_documents (
-          platform, adapter_id, destination_kind, destination_id, occurred_at, memory_id
-        );
 
       CREATE OR REPLACE FUNCTION kaguya_reject_information_mutation()
       RETURNS trigger
@@ -284,7 +234,65 @@ export async function prepareDatabaseSchema(
       [POSTGRES_SCHEMA_VERSION, INFORMATION_PROTOCOL_VERSION],
     );
     await prepareLifecycleProjection(tx);
+    await prepareKindContracts(tx);
+    await prepareRawEventMemory(tx);
+    await prepareMemoryGraphSchema(tx);
   });
+}
+
+/** Raw Memory is an idempotent ledger projection, independent of optional sparse indexing. */
+async function prepareRawEventMemory(
+  tx: import("./driver.js").SqlTransaction,
+): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock(168168)");
+  const existed = await tx.query<{
+    events: string | null;
+    rejections: string | null;
+  }>(
+    "SELECT to_regclass('memory_raw_events')::text AS events, to_regclass('memory_raw_rejections')::text AS rejections",
+  );
+  await tx.exec(`
+    CREATE TABLE IF NOT EXISTS memory_raw_events (
+      information_id text PRIMARY KEY REFERENCES information_atoms(information_id),
+      kind text NOT NULL,
+      payload jsonb NOT NULL,
+      "references" jsonb NOT NULL,
+      scope jsonb,
+      scope_key text,
+      occurred_at timestamptz NOT NULL,
+      position bigint NOT NULL,
+      is_semantic boolean NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS memory_raw_events_global_idx
+      ON memory_raw_events(occurred_at DESC, position DESC) WHERE is_semantic;
+    CREATE INDEX IF NOT EXISTS memory_raw_events_scope_idx
+      ON memory_raw_events(scope_key, occurred_at DESC, position DESC) WHERE is_semantic;
+    CREATE TABLE IF NOT EXISTS memory_raw_checkpoint (
+      singleton boolean PRIMARY KEY CHECK(singleton),
+      position bigint NOT NULL DEFAULT 0
+    );
+    INSERT INTO memory_raw_checkpoint(singleton, position) VALUES(true, 0)
+      ON CONFLICT (singleton) DO NOTHING;
+    CREATE TABLE IF NOT EXISTS memory_raw_rejections (
+      inbound_information_id text PRIMARY KEY REFERENCES information_atoms(information_id),
+      position bigint NOT NULL
+    );
+  `);
+  if (!existed.rows[0]?.events || !existed.rows[0]?.rejections) {
+    await tx.query(
+      "UPDATE memory_raw_checkpoint SET position=0 WHERE singleton=true",
+    );
+    await tx.query("DELETE FROM memory_raw_rejections");
+  }
+}
+
+/** 一次通用迁移：插件升级只追加 Kind/契约记录，不再增加模块专用 DDL。 */
+async function prepareKindContracts(
+  database: Pick<SqlDatabase, "exec">,
+): Promise<void> {
+  await database.exec(
+    "ALTER TABLE information_kinds ADD COLUMN IF NOT EXISTS contract jsonb",
+  );
 }
 
 async function validateCurrentSchema(
@@ -348,27 +356,6 @@ async function validateCurrentSchema(
   ) {
     throw new UnsupportedDatabaseSchemaError();
   }
-}
-
-/** 旧 v1 匿名 Web 约束只阻止新增会话 ID；替换后保留原行及 QQ 目标非空要求。 */
-async function prepareWebMemoryDestination(
-  tx: import("./driver.js").SqlTransaction,
-): Promise<void> {
-  await tx.query("SELECT pg_advisory_xact_lock(168168)");
-  const current = await tx.query<{ name: string }>(
-    `SELECT conname AS name FROM pg_constraint
-     WHERE conrelid = 'memory_documents'::regclass
-       AND conname = 'memory_documents_destination_check'`,
-  );
-  if (current.rows.length > 0) return;
-  await tx.exec(`
-    ALTER TABLE memory_documents
-      DROP CONSTRAINT IF EXISTS memory_documents_check,
-      ADD CONSTRAINT memory_documents_destination_check CHECK (
-        destination_kind = 'web'
-        OR (destination_kind IN ('private', 'group') AND destination_id IS NOT NULL)
-      );
-  `);
 }
 
 /** 可重建的开放集合与 scope head；旧账本仅首次建表回填，不改写业务事实。 */

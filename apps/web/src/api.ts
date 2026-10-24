@@ -1,5 +1,10 @@
+import {
+  modelRequestMetricsSchema,
+  type ModelMetricsWindow,
+  type ModelRequestMetrics,
+} from "@kaguya/schema";
+
 /**
- * Profile 与替换 DTO 显式保留 knowledgeEnabled，支持网页启用事件 / Wiki 与主动录入。
  * Web 会话通过 getConversationMessages 增量读取已持久化的双向消息；sendMessage 可携带
  * conversationId、调用方 requestId 与取消信号，requestId 仅写入请求头用于乐观消息去重。
  * ProfileReadResult 含所属 Profile 的 readiness；GatewayRequestError 保留安全字段路径用于表单反馈。
@@ -1081,6 +1086,36 @@ export async function getAdapterStatus(
       response.status,
     );
   return payload.data;
+}
+
+export async function getModelRequestMetrics(
+  config: GatewayConfig,
+  window: ModelMetricsWindow,
+  signal: AbortSignal,
+  fetchImplementation: typeof fetch = fetch,
+): Promise<ModelRequestMetrics> {
+  const response = await requestAuthenticatedJson(
+    config,
+    `/api/v1/metrics/model-requests?window=${encodeURIComponent(window)}`,
+    { method: "GET", signal, cache: "no-store" },
+    fetchImplementation,
+  );
+  const payload = await readJson(response);
+  if (!response.ok || !isRecord(payload))
+    throw new GatewayRequestError(
+      response.status === 503 ? "模型调用指标暂不可用" : "无法读取模型调用指标",
+      "model_metrics_failed",
+      response.status,
+    );
+  try {
+    return modelRequestMetricsSchema.parse(payload.data);
+  } catch {
+    throw new GatewayRequestError(
+      "模型调用指标格式无效",
+      "invalid_model_metrics",
+      response.status,
+    );
+  }
 }
 function isAdapterHostStatus(
   value: unknown,

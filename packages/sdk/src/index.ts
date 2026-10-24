@@ -1,7 +1,7 @@
 /**
- * observation.ts 提供按 scene/消费者独立推进的持久观察 capability 与输入契约。
  * 功能概述：聚合信息原子模块 SDK 的最终公共 API，使模块作者只接触 kind 声明、
  * `onInformation` 订阅、`context.register` 派生边界与显式 Selector 上下文选择契约。
+ * module-plugin.ts 还导出独立插件、持久 Kind 版本及只读兼容转换的公共协议。
  * 主要职责：从 `information-kind.ts` 导出 kind、引用和日志策略；从 `modules.ts`
  * 导出信息模块清单、实例、订阅与创建辅助函数；从 `information-selector.ts` 导出
  * Selector definition、受限只读 reader 与结构化查询类型。
@@ -31,5 +31,6 @@ export {
   type InformationSelectorLedger,
 } from "./information-selector.js";
 export * from "./modules.js";
+export * from "./module-plugin.js";
 
 export * from "./observation.js";

@@ -33,7 +33,6 @@ import {
 
 const metadata = {
   taskId: "test.task",
-  version: "1",
   outputMode: "object" as const,
   sourceInformationId: "source",
   contextInformationId: "context",
@@ -69,14 +68,9 @@ describe("runtime information kinds", () => {
         contextInformationId: "context",
       },
       memoryInformationIds: [],
-      composition: {
-        focusInformationIds: ["input"],
-        topic: "测试话题",
-        replyAct: "回应",
-      },
     };
     expect(messageIntentRequestedInformationKind.kind).toBe(
-      "agent.message.intent.requested",
+      "agent.router.message.intent.requested",
     );
     expect(messageIntentRequestedInformationKind.payloadSchema).toBe(
       messageIntentRequestedInformationPayloadSchema,
@@ -84,12 +78,17 @@ describe("runtime information kinds", () => {
     expect(
       messageIntentRequestedInformationPayloadSchema.parse(payload),
     ).toEqual(payload);
-    for (const key of [
-      "target",
-      "turn",
-      "memoryInformationIds",
-      "composition",
-    ] as const) {
+    expect(
+      messageIntentRequestedInformationPayloadSchema.safeParse({
+        ...payload,
+        composition: {
+          focusInformationIds: ["input"],
+          topic: "旧话题",
+          replyAct: "回应",
+        },
+      }).success,
+    ).toBe(false);
+    for (const key of ["target", "turn", "memoryInformationIds"] as const) {
       const { [key]: _missing, ...incomplete } = payload;
       expect(
         messageIntentRequestedInformationPayloadSchema.safeParse(incomplete)
@@ -273,14 +272,15 @@ describe("runtime information kinds", () => {
 
   it("aggregates every owned definition exactly once", () => {
     expect(builtInInformationKinds.map(({ kind }) => kind)).toEqual([
-      "agent.conversation.context.frozen",
-      "agent.message.target.authorized",
-      "agent.message.content.confirmed",
+      "agent.router.conversation.context.frozen",
+      "agent.router.message.target.authorized",
+      "agent.heavy.message.content.confirmed",
       "core.runtime.context",
       "consumer.failed",
       "core.message.inbound.text",
       "core.delivery.requested",
       "core.delivery.delivered",
+      "core.delivery.started",
       "core.delivery.failed",
     ]);
     expect(new Set(builtInInformationKinds.map(({ kind }) => kind)).size).toBe(

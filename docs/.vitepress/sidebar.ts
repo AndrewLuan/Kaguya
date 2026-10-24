@@ -1,7 +1,7 @@
 /**
  * 功能概述：按用户任务组织文档导航，将安装和配置与开发资料分开。
  * 主要职责：userGuide 提供入门、配置和日常使用目录；developerGuide 收纳架构、接口与设计资料。
- * 持续情境设计分组区分目标契约、已实现端口与迁移边界；Web 检视调研分组汇集八个研究专题，明确它们是决策资料而非已接入能力。
+ * 持续情境设计分组提供待实现契约与迁移边界；Web 检视调研分组汇集八个研究专题，明确它们是决策资料而非已接入能力。
  * 代码库关系：config.mts 导入 sidebar，由 VitePress 按页面路径选择对应目录；新增页面在这里登记。
  * 输入输出与副作用：导出静态路由映射，没有运行期 I/O；旧 guide 调度页仍可访问并指向开发文档。
  */
@@ -48,9 +48,11 @@ const developerGuide: DefaultTheme.SidebarItem[] = [
       { text: "外部设计参考", link: "/developers/design-references" },
       { text: "运行时架构", link: "/developers/architecture" },
       { text: "信息模块 SDK", link: "/developers/information-modules" },
+      { text: "LLM Prompt 装配与原文", link: "/developers/prompt-assembly" },
       { text: "Memory 认知层", link: "/developers/memory" },
       { text: "配置生命周期", link: "/developers/configuration-lifecycle" },
       { text: "信息账本", link: "/developers/information-ledger" },
+      { text: "测试与兼容边界", link: "/developers/testing-compatibility" },
       { text: "Runtime 可观测性", link: "/developers/observability" },
       { text: "一次性调度", link: "/developers/scheduler" },
       { text: "短心跳恢复", link: "/developers/heartbeat" },
@@ -60,7 +62,26 @@ const developerGuide: DefaultTheme.SidebarItem[] = [
     ],
   },
   {
-    text: "持续情境设计与实现",
+    text: "情境—行动上下文模型",
+    collapsed: false,
+    items: [
+      { text: "模型概览", link: "/developers/situation-model/" },
+      { text: "对象与关系", link: "/developers/situation-model/objects" },
+      { text: "上下文装配", link: "/developers/situation-model/assembly" },
+      { text: "行动连续性", link: "/developers/situation-model/continuity" },
+      { text: "更新与恢复", link: "/developers/situation-model/recovery" },
+      {
+        text: "DSH 观察与记忆",
+        link: "/developers/situation-model/dsh-cognition",
+      },
+      {
+        text: "实现映射与验收",
+        link: "/developers/situation-model/implementations",
+      },
+    ],
+  },
+  {
+    text: "持续情境设计（待实现）",
     collapsed: true,
     items: [
       { text: "公共契约与实施边界", link: "/developers/continuous/" },

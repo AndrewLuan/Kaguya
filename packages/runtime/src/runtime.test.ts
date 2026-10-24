@@ -1,13 +1,40 @@
+import {
+  lifecycleStartupCapability,
+  lifecycleStartedInformationKind,
+} from "@kaguya/modules";
 /**
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
- * Planner 普通日志仅保留元数据，不能泄漏 Prompt 预览或模型输出。
+ * Light 普通日志仅保留元数据，不能泄漏 Prompt 预览或模型输出。
  * fixture 显式批准合成 QQ 目标，生产 Runtime 默认为空出站白名单。
- * 测试显式注入统一文件模板，避免 Planner 或 Expression 绕过 default/local 选择。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
  * 功能概述：用真实 PGlite、Core 和 ModuleHost 验证 `KaguyaRuntime` 的完整信息 DAG。
  * 数据库收敛、日志落地和模型任务前置等待共用 8 秒持久化预算；超时附带队列元数据，内存取消与关闭 deadline 单独验证。
- * Planner v2 拒绝耗尽后的 wait；持续非法响应经一次修复后以 planner-unavailable 静默闭合。
- * Planner 使用独立 object Model Task，测试分别定位 plan 与 compose，确保故障静默与唯一分派。
+ * Light v2 拒绝耗尽后的 wait；持续非法响应经一次修复后以 light-unavailable 静默闭合。
+ * Light 使用独立 object Model Task，测试分别定位 plan 与 compose，确保故障静默与唯一分派。
+ * 主要职责：覆盖 Web 入站到投递成功的直接因果链、生成失败不会继续 assistant/outbound/delivery、
+ * 三类 transport 失败、无订阅持久化、同 kind 消费并发与多 message composer activation 共享模型任务后
+ * 各自按 intent target 投递纯文本，默认 OneBot action 仅含 text 段、start/close 确定性交错、
+ * in-flight 关闭、关闭后 ingress 拒绝、数据库初始化错误固定分类及抛出型反射属性，
+ * 以及消费者失败与其他结果并存；默认 message Prompt 必须带原子 provenance 和有序
+ * uses-context 引用。
+ * Memory 集成用例推进宿主时钟越过数据库实际入库时刻，分别验证未来入库证据被排除与后续正常召回。
+ * 代码库关系：测试直接消费 Runtime 的 `InformationIngress.submit` 和注入数据库选项；默认业务
+ * 模块来自 `@kaguya/modules`，自定义 fixture 只用于隔离并发和消费者故障语义。
+ * 输入输出与副作用：每个用例创建隔离的内存 PGlite 数据库，Runtime 只写 information
+ * ledger；所有创建 PGlite 的用例共享 15 秒跨平台超时，测试结束显式关闭注入数据库，
+ * 并检查持久化 payload 不包含 raw/provider secret。
+ */
+/**
+ * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
+ * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
+ * Light 普通日志仅保留元数据，不能泄漏 Prompt 预览或模型输出。
+ * fixture 显式批准合成 QQ 目标，生产 Runtime 默认为空出站白名单。
+ * 测试显式注入统一文件模板，避免 Light 或 Expression 绕过 default/local 选择。
+ * 功能概述：用真实 PGlite、Core 和 ModuleHost 验证 `KaguyaRuntime` 的完整信息 DAG。
+ * 数据库收敛、日志落地和模型任务前置等待共用 8 秒持久化预算；超时附带队列元数据，内存取消与关闭 deadline 单独验证。
+ * Light v2 拒绝耗尽后的 wait；持续非法响应经一次修复后以 light-unavailable 静默闭合。
+ * Light 使用独立 object Model Task，测试分别定位 plan 与 compose，确保故障静默与唯一分派。
  * 主要职责：覆盖 Web 入站到投递成功的直接因果链、生成失败不会继续 assistant/outbound/delivery、
  * 三类 transport 失败、无订阅持久化、同 kind 消费并发与多 message composer activation 共享模型任务后
  * 各自按 intent target 投递纯文本，默认 OneBot action 仅含 text 段、start/close 确定性交错、
@@ -22,6 +49,7 @@
  * 并检查持久化 payload 不包含 raw/provider secret。
  */
 import { loadFirstPartyPromptTemplates } from "@kaguya/modules/prompt-templates/node";
+import { rawContextCapability } from "@kaguya/memory";
 const testPrompts = loadFirstPartyPromptTemplates();
 import {
   KaguyaLlmClient,
@@ -52,7 +80,6 @@ import { defineInformationModuleCatalog } from "@kaguya/sdk";
 import { KaguyaDatabase } from "@kaguya/database";
 import { createLogger, type KaguyaLogger } from "@kaguya/logger";
 import { createTestingDatabase } from "@kaguya/database/testing";
-import { memoryCapability } from "@kaguya/memory";
 import { oneShotScheduleCapability } from "@kaguya/scheduler";
 import {
   createDeferredDeterministicModel,
@@ -69,7 +96,11 @@ import type {
   PlatformInboundMessage,
   PlatformOutboundTransport,
 } from "@kaguya/platform-adapters";
-import { z } from "@kaguya/schema";
+import {
+  z,
+  freezeInformationAtom,
+  informationAtomSchema,
+} from "@kaguya/schema";
 import {
   defineInformationKind,
   defineInformationModule,
@@ -85,16 +116,12 @@ const testIdentity = {
   timeZone: "Asia/Shanghai",
 };
 const testMessageTemplates = {
-  ...testPrompts.messageComposer,
-  main: "{{scene}}{{history}}{{memory}}{{turn}}",
-  history: "{{#each messages}}{{> history-inbound}}{{/each}}",
+  ...testPrompts.heavy,
+  main: "{{scene}}{{global_context}}{{scope_context}}{{memory}}",
   historyInbound: "{{content}}",
   historyAssistant: "{{content}}",
   memory: "{{#each items}}{{> memory-item}}{{/each}}",
   memoryItem: "{{content}}",
-  quoted: "{{message}}",
-  turn: "{{#each messages}}{{> history-inbound}}{{/each}}",
-  plan: "{{topic}} {{reply_act}}",
 };
 
 import { GatewayAllowlist } from "./gateway-allowlist.js";
@@ -221,7 +248,7 @@ async function createRuntime(
     ? createFirstPartyModuleActivations(
         createMessageComposition(undefined, undefined, true).catalog,
         createFirstPartyModuleConfigDefaults("test").map((config) =>
-          config.definitionId === "memory.writeback"
+          config.definitionId === "memory.native"
             ? { ...config, enabled: true }
             : config,
         ),
@@ -230,7 +257,6 @@ async function createRuntime(
   const composition = createMessageComposition(
     overrides.resolveModelSelection,
     activations,
-    memoryEnabled,
   );
   const runtime = new KaguyaRuntime({
     ...composition,
@@ -289,6 +315,17 @@ function parentId(
 }
 
 describe("KaguyaRuntime", () => {
+  it("keeps main module bindings visible beside the native Memory host", async () => {
+    const { runtime } = await createRuntime({ memory: { enabled: true } });
+    await runtime.start();
+    const modules = runtime.inspectModules();
+    for (const id of ["memory.identity", "memory.native"]) {
+      expect(
+        modules.find((module) => module.definitionId === id)?.bindings,
+      ).toHaveLength(1);
+    }
+  });
+
   it(
     "logs module startup and expands the persisted Information DAG at debug",
     async () => {
@@ -299,7 +336,7 @@ describe("KaguyaRuntime", () => {
         namespaceLevels: {
           "runtime:information": "trace",
           "runtime:modules": "debug",
-          "runtime:module:agent.message-composer": "debug",
+          "runtime:module:agent.heavy": "debug",
         },
         stream: {
           write: (line) => {
@@ -336,27 +373,24 @@ describe("KaguyaRuntime", () => {
           )
           .map((entry) => entry.definitionId),
       ).toEqual([
-        "agent.attention.arousal",
-        "agent.attention.focus",
-        "agent.heartbeat.short",
-        "agent.heartflow.online",
-        "memory.association",
-        "memory.expression",
+        "agent.heavy",
+        "agent.lifecycle",
         "memory.identity",
-        "agent.message-composer",
+        "agent.router",
+        "agent.situation",
       ]);
       expect(logs).toContainEqual(
         expect.objectContaining({
-          module: "runtime:module:agent.message-composer",
-          event: "message.model.dispatching",
-          taskId: "agent.message.compose",
+          module: "runtime:module:agent.heavy",
+          event: "heavy.model.dispatching",
+          taskId: "agent.heavy.respond",
           tier: "heavy",
         }),
       );
       const plannerSummary = logs.find(
         (entry) =>
           entry.kind === "core.model.task.requested" &&
-          entry.taskId === "agent.turn.plan" &&
+          entry.taskId === "agent.light.decide" &&
           entry.detail !== true,
       );
       expect(plannerSummary).toMatchObject({
@@ -370,27 +404,25 @@ describe("KaguyaRuntime", () => {
         (entry) =>
           entry.module === "runtime:information" &&
           entry.kind === "core.model.task.requested" &&
-          entry.taskId === "agent.message.compose" &&
+          entry.taskId === "agent.heavy.respond" &&
           entry.detail !== true,
       );
       const requestDetail = logs.find(
         (entry) =>
           entry.module === "runtime:information" &&
           entry.kind === "core.model.task.requested" &&
-          entry.taskId === "agent.message.compose" &&
+          entry.taskId === "agent.heavy.respond" &&
           entry.detail === true,
       );
       expect(requestSummary).toMatchObject({
         event: "model.task.lifecycle",
-        taskId: "agent.message.compose",
+        taskId: "agent.heavy.respond",
         tier: "heavy",
         providerId: "test",
         modelId: "deterministic-heavy",
-        promptVariableCount: 5,
+        promptVariableCount: 6,
       });
-      expect(requestSummary?.promptPreview).toContain(
-        "已决定在当前私聊中发送一条自然消息",
-      );
+      expect(requestSummary?.promptPreview).toContain("当前是私聊");
       expect(requestSummary?.references).toEqual(expect.any(Array));
       expect(requestDetail).toMatchObject({
         informationId: requestSummary?.informationId,
@@ -416,8 +448,7 @@ describe("KaguyaRuntime", () => {
     await database.information.synchronizeKinds(["core.model.task.completed"]);
     await database.information.reliable.configureSubscriptions([
       {
-        subscriptionId:
-          "message-composer.default:kaguya.message.model-task-completed",
+        subscriptionId: "heavy.default:kaguya.heavy.model-task-completed",
         kind: "core.model.task.completed",
       },
     ]);
@@ -427,7 +458,7 @@ describe("KaguyaRuntime", () => {
     "rejects %s model capability before module create",
     async (mode) => {
       const base = createMessageComposition().catalog.definitions.find(
-        (d) => d.manifest.definitionId === "agent.message-composer",
+        (d) => d.manifest.definitionId === "agent.heavy",
       )!;
       const create = vi.fn(base.create);
       const definition = defineInformationModule({ ...base, create });
@@ -460,7 +491,7 @@ describe("KaguyaRuntime", () => {
     let activation: unknown;
     let exposed: string[] = [];
     const base = createMessageComposition().catalog.definitions.find(
-      (d) => d.manifest.definitionId === "agent.message-composer",
+      (d) => d.manifest.definitionId === "agent.heavy",
     )!;
     const definition = defineInformationModule({
       ...base,
@@ -483,8 +514,8 @@ describe("KaguyaRuntime", () => {
     await runtime.start();
     expect(value).toBeInstanceOf(ModelTaskClient);
     expect(activation).toEqual({
-      instanceId: "message-composer.default",
-      definitionId: "agent.message-composer",
+      instanceId: "heavy.default",
+      definitionId: "agent.heavy",
     });
     expect(exposed).not.toEqual(expect.arrayContaining(["core"]));
     for (const forbidden of [
@@ -501,14 +532,14 @@ describe("KaguyaRuntime", () => {
       {
         activation: {
           instanceId: "forged",
-          definitionId: "agent.message-composer",
+          definitionId: "agent.heavy",
         },
         selectionPolicy: { tier: "heavy" as const },
       },
       {
         activation: {
-          instanceId: "message-composer.default",
-          definitionId: "agent.message-composer",
+          instanceId: "heavy.default",
+          definitionId: "agent.heavy",
         },
         selectionPolicy: { tier: "light" as const },
       },
@@ -517,8 +548,7 @@ describe("KaguyaRuntime", () => {
         value!.execute({
           ...request,
           task: {
-            taskId: "agent.message.compose",
-            version: "1",
+            taskId: "agent.heavy.respond",
             outputMode: "object",
             allowedTiers: ["light", "heavy"],
             outputSchema: z.object({ text: z.string() }).strict(),
@@ -558,16 +588,16 @@ describe("KaguyaRuntime", () => {
         informationId: result.rootInformationId,
       });
       const reply = graph.find(
-        ({ kind }) => kind === "agent.message.intent.requested",
+        ({ kind }) => kind === "agent.router.message.intent.requested",
       )!;
       const requested = graph.find(
         ({ kind, payload }) =>
           kind === "core.model.task.requested" &&
-          payload.taskId === "agent.message.compose",
+          payload.taskId === "agent.heavy.respond",
       )!;
 
       const context = graph.find(
-        ({ kind }) => kind === "agent.turn.context.completed",
+        ({ kind }) => kind === "agent.router.turn.context.completed",
       )!;
       const inbound = graph.find(
         ({ kind }) => kind === "core.message.inbound.text",
@@ -588,13 +618,12 @@ describe("KaguyaRuntime", () => {
           requested.payload,
         );
       expect(requestedPayload).toMatchObject({
-        taskId: "agent.message.compose",
-        version: "1",
-        outputMode: "text",
+        taskId: "agent.heavy.respond",
+        outputMode: "object",
         sourceInformationId: reply.informationId,
         activation: {
-          instanceId: "message-composer.default",
-          definitionId: "agent.message-composer",
+          instanceId: "heavy.default",
+          definitionId: "agent.heavy",
         },
         selectionPolicy: { tier: "heavy" },
         resolvedModel: { providerId: "test", modelId: "deterministic-heavy" },
@@ -603,8 +632,12 @@ describe("KaguyaRuntime", () => {
       expect(requestedPayload.prompt.provenance).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            variableName: "turn",
-            informationIds: [inbound.informationId],
+            variableName: "scope_context",
+            informationIds: [
+              graph.find(
+                (atom) => atom.kind === "agent.router.memory.context.frozen",
+              )!.informationId,
+            ],
           }),
         ]),
       );
@@ -612,228 +645,6 @@ describe("KaguyaRuntime", () => {
     },
     TEST_TIMEOUT,
   );
-
-  it(
-    "recalls a Web Memory globally through its original inbound provenance",
-    async () => {
-      // MemoryStore 使用真实入库时钟；不能让测试的固定 Runtime 时钟停留在写入之前。
-      let nowMs = Date.now();
-      const { runtime, database } = await createRuntime({
-        memory: { enabled: true },
-        now: () => new Date(nowMs),
-      });
-      await runtime.start();
-
-      const first = await runtime.submit({
-        ...webMessage("remember moonlight"),
-        occurredAt: new Date(nowMs - 1000).toISOString(),
-      });
-      await settleDeliveries(database);
-      const firstGraph = await database.information.query({
-        informationId: first.rootInformationId,
-      });
-      const firstInbound = firstGraph.find(
-        ({ kind }) => kind === inboundTextInformationKind.kind,
-      )!;
-      const saved = await database.memory.put({
-        sourceInformationId: firstInbound.informationId,
-        sourceKind: firstInbound.kind,
-        content: "remember moonlight",
-        occurredAt: firstInbound.occurredAt,
-        address: {
-          platform: "web",
-          adapterId: "web.ui.main",
-          platformMessageId: "request-1",
-          accountId: "web",
-          destination: { kind: "web" },
-        },
-      });
-
-      await expect(
-        database.memory.recall({
-          query: "moonlight",
-          limit: 8,
-          occurredBefore: firstInbound.occurredAt,
-          recordedBefore: new Date(
-            Date.parse(saved.document.createdAt) - 1,
-          ).toISOString(),
-        }),
-      ).resolves.toEqual([]);
-      nowMs = Math.max(Date.now(), Date.parse(saved.document.createdAt));
-
-      const second = await runtime.submit({
-        ...webMessage("moonlight again"),
-        platformMessageId: "request-2",
-        occurredAt: new Date(nowMs).toISOString(),
-      });
-      let secondGraph: Awaited<ReturnType<typeof database.information.query>> =
-        [];
-      await vi.waitFor(async () => {
-        secondGraph = await database.information.query({
-          informationId: second.rootInformationId,
-        });
-        expect(
-          secondGraph.some(
-            ({ kind, payload }) =>
-              kind === modelTaskRequestedInformationKind.kind &&
-              payload.taskId === "agent.message.compose",
-          ),
-        ).toBe(true);
-      }, PERSISTENCE_WAIT);
-      const requested = secondGraph.find(
-        ({ kind, payload }) =>
-          kind === modelTaskRequestedInformationKind.kind &&
-          payload.taskId === "agent.message.compose",
-      )!;
-      const payload = modelTaskRequestedInformationKind.payloadSchema.parse(
-        requested.payload,
-      );
-
-      expect(payload.prompt.provenance).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            variableName: "memory",
-            informationIds: [firstInbound.informationId],
-          }),
-        ]),
-      );
-      expect(payload.prompt.variables).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            name: "memory",
-            informationIds: [firstInbound.informationId],
-          }),
-        ]),
-      );
-      expect(payload.prompt.text).toContain("remember moonlight");
-    },
-    TEST_TIMEOUT,
-  );
-
-  it(
-    "keeps disabled Memory as an unavailable shell without reading stored documents",
-    async () => {
-      const { runtime, database } = await createRuntime();
-      const recall = vi.spyOn(database.memory, "recall");
-      await runtime.start();
-
-      const first = await runtime.submit(webMessage("remember moonlight"));
-      await settleDeliveries(database);
-      const firstGraph = await database.information.query({
-        informationId: first.rootInformationId,
-      });
-      const firstInbound = firstGraph.find(
-        ({ kind }) => kind === inboundTextInformationKind.kind,
-      )!;
-      await database.memory.put({
-        sourceInformationId: firstInbound.informationId,
-        sourceKind: firstInbound.kind,
-        content: "remember moonlight",
-        occurredAt: firstInbound.occurredAt,
-        address: {
-          platform: "web",
-          adapterId: "web.ui.main",
-          platformMessageId: "request-1",
-          accountId: "web",
-          destination: { kind: "web" },
-        },
-      });
-
-      const second = await runtime.submit({
-        ...webMessage("moonlight again"),
-        platformMessageId: "request-2",
-        occurredAt: "2026-09-04T00:00:02.000Z",
-      });
-      await settleDeliveries(database);
-      const secondGraph = await database.information.query({
-        informationId: second.rootInformationId,
-      });
-      const association = secondGraph.find(
-        ({ kind }) => kind === "memory.association.completed",
-      );
-      const requested = secondGraph.find(
-        ({ kind, payload }) =>
-          kind === modelTaskRequestedInformationKind.kind &&
-          payload.taskId === "agent.message.compose",
-      )!;
-      const payload = modelTaskRequestedInformationKind.payloadSchema.parse(
-        requested.payload,
-      );
-
-      expect(recall).not.toHaveBeenCalled();
-      expect(association?.payload).toMatchObject({
-        status: "unavailable",
-        candidateCount: 0,
-        reasonCodes: ["provider-unavailable"],
-      });
-      expect(
-        secondGraph.some(({ kind }) => kind === "memory.association.candidate"),
-      ).toBe(false);
-      expect(payload.prompt.provenance).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            variableName: "turn",
-            informationIds: [
-              secondGraph.find(
-                ({ kind }) => kind === inboundTextInformationKind.kind,
-              )!.informationId,
-            ],
-          }),
-        ]),
-      );
-      expect(payload.prompt.provenance).toContainEqual(
-        expect.objectContaining({
-          variableName: "memory",
-          informationIds: [],
-        }),
-      );
-    },
-    TEST_TIMEOUT,
-  );
-
-  it("does not expose the Memory capability while Memory is disabled", async () => {
-    const create = vi.fn(() => ({ provisions: [], subscriptions: [] }));
-    const consumer = defineInformationModule({
-      manifest: {
-        protocolVersion: 1,
-        summary: "Test information module.",
-        moduleVersion: "1.0.0",
-        definitionId: "test.memory.consumer",
-        displayName: "Memory consumer",
-        description: "Defines the Memory consumer information module.",
-        settingsSchema: z.object({}).strict(),
-        consumes: [],
-        produces: [],
-        selectors: [],
-        promptRenderers: [],
-        requires: [memoryCapability],
-        provides: [],
-      },
-      create,
-    });
-    const database = await createTestingDatabase();
-    const runtime = new KaguyaRuntime({
-      database,
-      catalog: defineInformationModuleCatalog(consumer),
-      activations: [
-        {
-          instanceId: "memory.consumer",
-          definitionId: consumer.manifest.definitionId,
-          settings: {},
-        },
-      ],
-      capabilities: [
-        {
-          capability: memoryCapability,
-          value: database.memory,
-        },
-      ],
-    });
-    resources.push({ runtime, database });
-
-    await expect(runtime.start()).rejects.toThrow(/capability/i);
-    expect(create).not.toHaveBeenCalled();
-  });
 
   it(
     "classifies schema preparation failures without retaining database details",
@@ -1144,12 +955,7 @@ describe("KaguyaRuntime", () => {
       expect(new Set(graph.map(({ kind }) => kind))).toEqual(
         new Set([
           "core.message.inbound.text",
-          "agent.message.intent.requested",
-          "memory.expression.selection.requested",
-          "memory.expression.selection.completed",
-          "memory.association.requested",
-          "memory.association.query",
-          "memory.association.completed",
+          "agent.router.message.intent.requested",
           "core.model.task.requested",
           "core.model.task.completed",
           "core.message.assistant.text",
@@ -1159,15 +965,19 @@ describe("KaguyaRuntime", () => {
           "memory.identity.person.resolution",
           "memory.identity.person.context.completed",
           "agent.attention.arousal.activity",
+          "agent.lifecycle.state.recorded",
           "agent.attention.arousal.completed",
           "agent.attention.arousal.state.recorded",
-          "agent.turn.candidate",
-          "agent.turn.claimed",
-          "agent.turn.started",
-          "agent.turn.context.completed",
-          "agent.turn.plan.completed",
-          "agent.turn.completed",
+          "agent.heartbeat.candidate",
+          "agent.router.turn.claimed",
+          "agent.router.turn.started",
+          "agent.router.turn.context.completed",
+          "agent.router.memory.context.frozen",
+          "agent.light.decision.completed",
+          "agent.router.turn.completed",
           "core.delivery.delivered",
+          "core.delivery.started",
+          "agent.situation.frozen",
         ]),
       );
       expect(result.deliveries).toEqual([]);
@@ -1180,10 +990,13 @@ describe("KaguyaRuntime", () => {
 
       const byKind = new Map(graph.map((atom) => [atom.kind, atom]));
       const chain = [
-        ["agent.attention.arousal.completed", "agent.turn.candidate"],
-        ["agent.turn.plan.completed", "agent.turn.context.completed"],
-        ["agent.message.intent.requested", "agent.turn.plan.completed"],
-        ["core.model.task.requested", "agent.message.intent.requested"],
+        ["agent.attention.arousal.completed", "agent.situation.frozen"],
+        ["agent.light.decision.completed", "agent.attention.arousal.completed"],
+        [
+          "agent.router.message.intent.requested",
+          "agent.light.decision.completed",
+        ],
+        ["core.model.task.requested", "agent.router.message.intent.requested"],
         ["core.model.task.completed", "core.model.task.requested"],
         ["core.message.assistant.text", "core.model.task.completed"],
         ["core.delivery.requested", "core.message.assistant.text"],
@@ -1240,7 +1053,7 @@ describe("KaguyaRuntime", () => {
         "agent.attention.arousal.state.recorded",
       );
       expect(graph.map(({ kind }) => kind)).toContain(
-        "agent.turn.context.completed",
+        "agent.router.turn.context.completed",
       );
     },
     TEST_TIMEOUT,
@@ -1283,7 +1096,7 @@ describe("KaguyaRuntime", () => {
         expect.arrayContaining([
           "core.model.task.requested",
           "core.model.task.failed",
-          "agent.turn.silent",
+          "agent.router.turn.failed",
         ]),
       );
       for (const forbiddenKind of [
@@ -1306,15 +1119,13 @@ describe("KaguyaRuntime", () => {
       const { runtime, database } = await createRuntime({
         activations: [
           ...createMessageComposition().activations.filter(
-            (a) => a.definitionId !== "agent.message-composer",
+            (a) => a.definitionId !== "agent.heavy",
           ),
-          ...["message-composer.one", "message-composer.two"].map(
-            (instanceId) => ({
-              instanceId,
-              definitionId: "agent.message-composer",
-              settings: { modelTier: "heavy" as const },
-            }),
-          ),
+          ...["heavy.one", "heavy.two"].map((instanceId) => ({
+            instanceId,
+            definitionId: "agent.heavy",
+            settings: {},
+          })),
         ],
       });
       const sendMessage = vi.fn<PlatformOutboundTransport["sendMessage"]>(
@@ -1346,7 +1157,7 @@ describe("KaguyaRuntime", () => {
           .filter((atom) => atom.kind === "core.model.task.completed")
           .map((atom) => atom.payload.taskId)
           .sort(),
-      ).toEqual(["agent.message.compose", "agent.turn.plan"]);
+      ).toEqual(["agent.heavy.respond", "agent.light.decide"]);
       expect(count("core.message.assistant.text")).toBe(2);
       expect(count("core.delivery.requested")).toBe(2);
       expect(sendMessage).toHaveBeenCalledTimes(2);
@@ -1359,7 +1170,7 @@ describe("KaguyaRuntime", () => {
           .filter((atom) => atom.kind === "core.message.assistant.text")
           .map(({ payload }) => payload.originatingModuleInstanceId)
           .sort(),
-      ).toEqual(["message-composer.one", "message-composer.two"]);
+      ).toEqual(["heavy.one", "heavy.two"]);
     },
     TEST_TIMEOUT,
   );
@@ -1420,7 +1231,9 @@ describe("KaguyaRuntime", () => {
 
       expect(result.deliveries).toEqual([]);
       expect(graph.map(({ kind }) => kind)).toContain("core.delivery.failed");
-      expect(graph.map(({ kind }) => kind)).toContain("agent.turn.failed");
+      expect(graph.map(({ kind }) => kind)).toContain(
+        "agent.router.turn.failed",
+      );
       expect(graph.map(({ kind }) => kind)).not.toContain("consumer.failed");
       const failed = graph.find(({ kind }) => kind === "core.delivery.failed")!;
       const requested = graph.find(
@@ -1461,7 +1274,9 @@ describe("KaguyaRuntime", () => {
 
       expect(result.deliveries).toEqual([]);
       expect(graph.map(({ kind }) => kind)).toContain("core.delivery.failed");
-      expect(graph.map(({ kind }) => kind)).toContain("agent.turn.failed");
+      expect(graph.map(({ kind }) => kind)).toContain(
+        "agent.router.turn.failed",
+      );
       expect(graph.map(({ kind }) => kind)).not.toContain("consumer.failed");
       expect(JSON.stringify(graph)).not.toContain(
         "provider-token-must-not-enter-ledger",
@@ -1500,7 +1315,9 @@ describe("KaguyaRuntime", () => {
 
       expect(result.deliveries).toEqual([]);
       expect(graph.map(({ kind }) => kind)).toContain("core.delivery.failed");
-      expect(graph.map(({ kind }) => kind)).toContain("agent.turn.failed");
+      expect(graph.map(({ kind }) => kind)).toContain(
+        "agent.router.turn.failed",
+      );
       expect(graph.map(({ kind }) => kind)).not.toContain("consumer.failed");
       expect(JSON.stringify(graph)).not.toMatch(
         /provider-specific failure|failed-receipt-raw/,
@@ -1586,7 +1403,7 @@ describe("KaguyaRuntime", () => {
         ),
         activations: [
           ...createMessageComposition().activations.filter(
-            (a) => a.definitionId !== "agent.message-composer",
+            (a) => a.definitionId !== "agent.heavy",
           ),
           {
             instanceId: "observer.one",
@@ -1800,13 +1617,17 @@ type RuntimeModelSelectionResolver = (selection: ModuleModelSelection) => {
   readonly model: ReturnType<KaguyaLlmModelResolver>;
 };
 function createDeterministicModelSelectionResolver(): RuntimeModelSelectionResolver {
-  const model = createPlanningDeterministicModel(
+  const lightModel = createPlanningDeterministicModel(
     "It is a lovely night for watching the moon.",
   );
+  const heavyModel = createRepeatingDeterministicModel({
+    action: "message",
+    text: "It is a lovely night for watching the moon.",
+  });
   return ({ modelTier }) => ({
     providerId: "test",
     modelId: `deterministic-${modelTier}`,
-    model,
+    model: modelTier === "light" ? lightModel : heavyModel,
   });
 }
 function createMessageComposition(
@@ -1815,6 +1636,7 @@ function createMessageComposition(
   memoryEnabled = false,
 ) {
   const catalog = createFirstPartyModuleCatalog({
+    rawContextCapability,
     modelTaskCapability,
     modelTaskCompletedInformationKind,
     modelTaskFailedInformationKind,
@@ -1823,10 +1645,10 @@ function createMessageComposition(
     deliveryFailedInformationKind,
     executionExhaustedInformationKind,
     promptTemplates: testMessageTemplates,
-    plannerTemplate: testPrompts.planner,
-    plannerBootstrapPolicy: testPrompts.plannerBootstrapPolicy,
-    memoryEnabled,
-    expressionTemplates: testPrompts.expression,
+    lightTemplate: testPrompts.light,
+    lightBootstrapPolicy: testPrompts.lightBootstrapPolicy,
+
+    nativeMemoryTemplate: testPrompts.nativeMemory,
     qqExpressionTemplates: testPrompts.qqExpression,
     agentIdentity: testIdentity,
   });
@@ -1840,17 +1662,35 @@ function createMessageComposition(
   return {
     catalog,
     activations,
-    capabilities: ({ oneShotSchedule }: RuntimeCapabilityContext) => [
+    capabilities: ({
+      oneShotSchedule,
+      core,
+      now,
+    }: RuntimeCapabilityContext) => [
       { capability: oneShotScheduleCapability, value: oneShotSchedule },
+      {
+        capability: lifecycleStartupCapability,
+        value: {
+          start: async (instanceId: string) => {
+            await core.register(lifecycleStartedInformationKind, {
+              occurredAt: now().toISOString(),
+              source: `module:${instanceId}`,
+              payload: { instanceId, at: now().toISOString() },
+              references: [],
+            });
+          },
+        },
+      },
     ],
     modelTask: {
       renderStructuredOutputPrompt,
       approvals: activations
         .filter((a) =>
           [
-            "agent.message-composer",
-            "agent.heartflow.online",
-            "memory.expression",
+            "agent.heavy",
+            "agent.router",
+            "agent.situation",
+            "memory.native",
           ].includes(a.definitionId),
         )
         .map((a) => ({
@@ -1859,12 +1699,8 @@ function createMessageComposition(
             definitionId: a.definitionId,
           },
           selectionPolicy: {
-            tier:
-              a.definitionId !== "agent.message-composer"
-                ? "light"
-                : z
-                    .object({ modelTier: z.enum(["light", "heavy"]) })
-                    .parse(a.settings).modelTier,
+            tier: (a.definitionId === "agent.heavy" ? "heavy" : "light") as
+              "light" | "heavy",
           },
         })),
       client: new KaguyaLlmClient({
@@ -1980,7 +1816,7 @@ it.each([
     },
   ],
 ])(
-  "allows Planner silence for QQ %s without Composer or delivery",
+  "allows Light silence for QQ %s without Heavy or delivery",
   async (_name, input) => {
     const model = createPlanningDeterministicModel("must not be composed", {
       action: "silent",
@@ -2004,20 +1840,20 @@ it.each([
         ?.payload.outcome,
     ).toBe("observe");
     expect(
-      graph.find((atom) => atom.kind === "agent.turn.silent")?.payload
+      graph.find((atom) => atom.kind === "agent.router.turn.silent")?.payload
         .reasonCodes,
     ).toEqual(["no-response-needed"]);
     expect(
       graph
         .filter((atom) => atom.kind === "core.model.task.requested")
         .map((atom) => atom.payload.taskId),
-    ).toEqual(["agent.turn.plan"]);
+    ).toEqual(["agent.light.decide"]);
     expect(
       graph.some((atom) =>
         [
           "core.message.assistant.text",
           "core.delivery.requested",
-          "agent.turn.failed",
+          "agent.router.turn.failed",
         ].includes(atom.kind),
       ),
     ).toBe(false);
@@ -2026,7 +1862,7 @@ it.each([
   TEST_TIMEOUT,
 );
 
-it("recovers Planner waits after restart, merges new input and exhausts the shared budget", async () => {
+it("recovers Light waits after restart, merges new input and exhausts the shared budget", async () => {
   const model = createPlanningDeterministicModel("must not be composed", {
     action: "wait",
     reason: "await-more-context",
@@ -2053,7 +1889,8 @@ it("recovers Planner waits after restart, merges new input and exhausts the shar
       limit: 1000,
     });
   expect(
-    (await all()).find((atom) => atom.kind === "agent.wait.requested")?.payload,
+    (await all()).find((atom) => atom.kind === "agent.router.wait.requested")
+      ?.payload,
   ).toMatchObject({ attempt: 1, wakeOnMessage: true });
   await runtime.close();
   currentTime = new Date("2026-09-04T00:00:02.000Z");
@@ -2075,11 +1912,11 @@ it("recovers Planner waits after restart, merges new input and exhausts the shar
   await settleDeliveries(database);
   expect(
     (await all())
-      .filter((atom) => atom.kind === "agent.wait.requested")
+      .filter((atom) => atom.kind === "agent.router.wait.requested")
       .map((atom) => atom.payload.attempt),
   ).toEqual([1, 2]);
   const latestTurn = (await all())
-    .filter((atom) => atom.kind === "agent.turn.context.completed")
+    .filter((atom) => atom.kind === "agent.router.turn.context.completed")
     .at(-1)!;
   expect(
     (latestTurn.payload.inputs as any[]).map((input) => input.text),
@@ -2106,19 +1943,19 @@ it("recovers Planner waits after restart, merges new input and exhausts the shar
   const graph = await all();
   expect(
     graph
-      .filter((atom) => atom.kind === "agent.wait.requested")
+      .filter((atom) => atom.kind === "agent.router.wait.requested")
       .map((atom) => atom.payload.attempt),
   ).toEqual([1, 2, 3]);
   expect(
-    graph.find((atom) => atom.kind === "agent.turn.silent")?.payload
-      .reasonCodes,
-  ).toEqual(["planner-unavailable"]);
+    graph.find((atom) => atom.kind === "agent.router.turn.failed")?.payload
+      .reason,
+  ).toEqual("model-task-failed");
   expect(
     graph.some((atom) =>
       [
         "core.message.assistant.text",
         "core.delivery.requested",
-        "agent.turn.failed",
+        "agent.router.turn.silent",
       ].includes(atom.kind),
     ),
   ).toBe(false);
@@ -2127,3 +1964,158 @@ it("recovers Planner waits after restart, merges new input and exhausts the shar
     graph.filter((atom) => atom.kind === "core.model.task.failed"),
   ).toHaveLength(1);
 }, 30000);
+
+it.each([true, false])(
+  "does not resend a recovered delivery (started marker: %s)",
+  async (hasMarker) => {
+    const { runtime: first, database } = await createRuntime();
+    const sendMessage = vi.fn<PlatformOutboundTransport["sendMessage"]>(
+      async (target) => ({
+        ok: true,
+        adapterId: "web.ui.main",
+        platform: "web",
+        target,
+      }),
+    );
+    first.registerTransport({
+      adapterId: "web.ui.main",
+      platform: "web",
+      transport: { sendMessage },
+    });
+    await first.start();
+    const submitted = await first.submit(webMessage());
+    await settleDeliveries(database);
+    const graph = await database.information.query({
+      informationId: submitted.rootInformationId,
+    });
+    const original = graph.find((a) => a.kind === "core.delivery.requested")!;
+    await first.close();
+    const append = async (atom: typeof original) =>
+      database.information.append(
+        freezeInformationAtom(informationAtomSchema.parse(atom)),
+        [...new Set(atom.references.map((r) => r.relation))].map(
+          (relation) => ({ relation, required: false, multiple: true }),
+        ),
+      );
+    const pending = { ...original, informationId: "recover:delivery" };
+    await append(pending);
+    if (hasMarker)
+      await append({
+        ...original,
+        informationId: "recover:started",
+        kind: "core.delivery.started",
+        payload: { attemptId: "previous-process" },
+        references: [
+          { relation: "core:caused-by", informationId: pending.informationId },
+          {
+            relation: "core:context",
+            informationId: submitted.rootInformationId,
+          },
+        ],
+      });
+    // Simulate an interrupted lease from either the current or legacy runtime.
+    await database.sql.query(
+      "UPDATE information_deliveries SET state = 'pending', attempts = $1 WHERE subscription_id = 'kaguya.runtime.delivery' AND information_id = $2",
+      [hasMarker ? 0 : 1, pending.informationId],
+    );
+    let sequence = 0;
+    const restored = new KaguyaRuntime({
+      ...createMessageComposition(),
+      database,
+      informationIdGenerator: () => `recover:result:${++sequence}`,
+    });
+    resources.find((r) => r.runtime === first)!.runtime = restored;
+    restored.registerTransport({
+      adapterId: "web.ui.main",
+      platform: "web",
+      transport: { sendMessage },
+    });
+    await restored.start();
+    await settleDeliveries(database);
+    const terminal = (
+      await database.information.query({
+        informationId: submitted.rootInformationId,
+      })
+    ).find(
+      (a) =>
+        a.kind === "core.delivery.failed" &&
+        a.references.some(
+          (r) =>
+            r.relation === "core:status-of" &&
+            r.informationId === pending.informationId,
+        ),
+    );
+    expect(terminal?.payload.outcome).toBe("unknown");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  },
+  TEST_TIMEOUT,
+);
+
+it(
+  "starts against the existing attention and Router durable subscription identities",
+  async () => {
+    const { runtime, database } = await createRuntime();
+    await runtime.start();
+    await runtime.close();
+    await database.information.reliable.configureSubscriptions([
+      {
+        subscriptionId: "attention-arousal.default:attention-arousal.observe",
+        kind: "agent.heartbeat.candidate",
+      },
+      {
+        subscriptionId:
+          "router.default:agent.router.observe.agent.router.turn.context.completed",
+        kind: "agent.router.turn.context.completed",
+      },
+    ]);
+    const restored = new KaguyaRuntime({
+      ...createMessageComposition(),
+      database,
+    });
+    resources.find((r) => r.runtime === runtime)!.runtime = restored;
+    await restored.start();
+    await restored.submit(webMessage());
+    await settleDeliveries(database);
+    expect(
+      (
+        await database.information.find({
+          kinds: ["agent.situation.frozen"],
+          limit: 10,
+        })
+      ).length,
+    ).toBe(1);
+  },
+  TEST_TIMEOUT,
+);
+
+it("reuses the permanent v1 Memory formation subscription on startup", async () => {
+  const { runtime, database } = await createRuntime({
+    memory: { enabled: true },
+  });
+  await database.prepareSchema();
+  await database.information.synchronizeKinds([
+    "memory.native.formation.requested.v1",
+  ]);
+  await database.information.reliable.setSubscription(
+    {
+      subscriptionId: "memory.native.default:memory.native.form",
+      kind: "memory.native.formation.requested.v1",
+    },
+    false,
+  );
+  await expect(runtime.start()).resolves.toBeUndefined();
+  const subscriptions = await database.sql.query<{
+    subscription_id: string;
+    kind: string;
+    enabled: boolean;
+  }>(
+    "SELECT subscription_id,kind,enabled FROM information_subscriptions WHERE kind LIKE 'memory.native.formation.requested.%'",
+  );
+  expect(subscriptions.rows).toEqual([
+    {
+      subscription_id: "memory.native.default:memory.native.form",
+      kind: "memory.native.formation.requested.v1",
+      enabled: true,
+    },
+  ]);
+});

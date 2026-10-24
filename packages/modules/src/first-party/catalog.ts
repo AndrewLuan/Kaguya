@@ -1,14 +1,25 @@
 /**
- * QQ 表情独立进入 Catalog 和生产默认配置，显式关闭后不安装 Composer 草稿处理路径。
+ * QQ 表情独立进入 Catalog 和生产默认配置，显式关闭后不安装 Heavy 草稿处理路径。
  * 功能概述：集中显式导入 first-party 模块，提供可被 composition root 选择和合并的 Catalog。
  * 主要职责：createFirstPartyModuleCatalog 接收宿主 Model Task token 和共享 completed kind，构造身份、时机与消息合成定义；
  * createFirstPartyModuleConfigDefaults 提供首次落盘模板，createFirstPartyModuleActivations
- * 同时提供独立 Memory writeback 定义，由 composition 在 Memory 启用时选择；
- * 事件与 Wiki 原型单独进入 Catalog，只有显式 knowledgeEnabled 才自动激活。
- * 严格校验已加载的实例文件，拒绝旧回复配置并提示重新初始化，与“可发现”的 Catalog 分开。
+ * 以 memory.native 提供统一记忆；
+ * 严格校验已加载的实例文件，与“可发现”的 Catalog 分开。
  * 代码库关系：Server、Demo 和测试组合入口传入 Runtime 的实际 token/definition；工厂仅依赖模块侧
  * 结构类型，保留 completed payload 泛型与对象身份，避免 modules 反向依赖 Runtime。
- * 模板正文由 composition 分别注入 Composer、Planner 与 Expression，默认值与本地覆盖统一在 Node 加载器选择。
+ * 模板正文由 composition 分别注入 Heavy、Light 与 Expression，默认值与本地覆盖统一在 Node 加载器选择。
+ * 输入输出与副作用：纯内存定义，没有 timer、环境读取、连接、全局注册或动态目录扫描。
+ */
+/**
+ * QQ 表情独立进入 Catalog 和生产默认配置，显式关闭后不安装 Heavy 草稿处理路径。
+ * 功能概述：集中显式导入 first-party 模块，提供可被 composition root 选择和合并的 Catalog。
+ * 主要职责：createFirstPartyModuleCatalog 接收宿主 Model Task token 和共享 completed kind，构造身份、时机与消息合成定义；
+ * createFirstPartyModuleConfigDefaults 提供首次落盘模板，createFirstPartyModuleActivations
+ * 以 memory.native 提供统一记忆；
+ * 严格校验已加载的实例文件，与“可发现”的 Catalog 分开。
+ * 代码库关系：Server、Demo 和测试组合入口传入 Runtime 的实际 token/definition；工厂仅依赖模块侧
+ * 结构类型，保留 completed payload 泛型与对象身份，避免 modules 反向依赖 Runtime。
+ * 模板正文由 composition 分别注入 Heavy、Light 与 Expression，默认值与本地覆盖统一在 Node 加载器选择。
  * 输入输出与副作用：纯内存定义，没有 timer、环境读取、连接、全局注册或动态目录扫描。
  */
 import { createQqExpressionModule } from "./qq-expression/index.js";
@@ -18,35 +29,29 @@ import {
   type InformationModuleActivation,
 } from "@kaguya/sdk";
 import type { JsonObject } from "@kaguya/schema";
-import {
-  createExpressionModule,
-  type ExpressionPromptTemplates,
-} from "./expression/index.js";
-import { attentionFocusModule } from "./attention-focus/index.js";
-import { memoryCognitionModule } from "./memory-cognition/index.js";
-import { memoryIndexModule } from "./memory-index/index.js";
-import { memoryWritebackModule } from "./memory-writeback/index.js";
-import { memoryKnowledgeModule } from "./memory-knowledge/index.js";
-import { associationModule } from "./association/index.js";
+import { createNativeMemoryModule } from "./memory-native/index.js";
 import { identityModule } from "./identity/index.js";
-import { createAttentionArousalModule } from "./attention-arousal/index.js";
-import { heartbeatModule } from "./heartbeat/index.js";
 import {
-  createHeartflowModule,
-  type CreateHeartflowModuleOptions,
-} from "./heartflow/index.js";
+  createLifecycleModule,
+  lifecycleSettingsSchema,
+} from "./lifecycle/index.js";
 import {
-  createMessageComposerModule,
+  createRouterModule,
+  createSituationRuntimeModule,
+  type CreateRouterModuleOptions,
+} from "./router/index.js";
+import {
+  createHeavyModule,
   type AgentIdentity,
-  type CreateMessageComposerModuleOptions,
+  type CreateHeavyModuleOptions,
   type ModelTaskCompletedInformationPayload,
-} from "./message-composer/index.js";
+} from "./heavy/index.js";
 export function createFirstPartyModuleCatalog<
   P extends ModelTaskCompletedInformationPayload,
 >(
-  options: CreateMessageComposerModuleOptions<P> &
-    CreateHeartflowModuleOptions & {
-      readonly expressionTemplates: ExpressionPromptTemplates;
+  options: CreateHeavyModuleOptions<P> &
+    CreateRouterModuleOptions & {
+      readonly nativeMemoryTemplate: string;
       readonly qqExpressionTemplates: { learn: string; select: string };
       readonly qqExpressionEnabled?: boolean;
     },
@@ -56,25 +61,18 @@ export function createFirstPartyModuleCatalog<
       modelTaskCapability: options.modelTaskCapability,
       templates: options.qqExpressionTemplates,
     }),
-    associationModule,
-    memoryWritebackModule,
-    memoryKnowledgeModule,
-    memoryIndexModule,
-    memoryCognitionModule,
-    identityModule,
-    createAttentionArousalModule({ timeZone: options.agentIdentity.timeZone }),
-    attentionFocusModule,
-    createExpressionModule({
+    createNativeMemoryModule({
       ...options,
-      promptTemplates: options.expressionTemplates,
+      nativeMemoryTemplate: options.nativeMemoryTemplate,
     }),
-    createMessageComposerModule({
+    identityModule,
+    createLifecycleModule({ timeZone: options.agentIdentity.timeZone }),
+    createHeavyModule({
       ...options,
-      expressionEnabled: true,
       draftProcessingEnabled: options.qqExpressionEnabled ?? false,
     }),
-    heartbeatModule,
-    createHeartflowModule(options),
+    createRouterModule(options),
+    createSituationRuntimeModule(options),
   );
 }
 export interface FirstPartyModuleInstanceConfig {
@@ -92,36 +90,18 @@ export function createFirstPartyModuleConfigDefaults(
   return Object.freeze([
     Object.freeze({
       version: 1 as const,
-      instanceId: "message-composer.default",
-      definitionId: "agent.message-composer",
-      enabled: true,
-      settings: Object.freeze({
-        modelTier: "heavy",
-      }),
-    }),
-    Object.freeze({
-      version: 1 as const,
-      instanceId: "memory.association.default",
-      definitionId: "memory.association",
+      instanceId: "heavy.default",
+      definitionId: "agent.heavy",
       enabled: true,
       settings: Object.freeze({}),
     }),
-    ...(
-      [
-        "memory.writeback",
-        "memory.knowledge",
-        "memory.index",
-        "memory.cognition",
-      ] as const
-    ).map((definitionId) =>
-      Object.freeze({
-        version: 1 as const,
-        instanceId: `${definitionId}.default`,
-        definitionId,
-        enabled: false,
-        settings: Object.freeze({}),
-      }),
-    ),
+    Object.freeze({
+      version: 1 as const,
+      instanceId: "memory.native.default",
+      definitionId: "memory.native",
+      enabled: false,
+      settings: Object.freeze({}),
+    }),
     Object.freeze({
       version: 1 as const,
       instanceId: "adapter.web.main",
@@ -145,59 +125,22 @@ export function createFirstPartyModuleConfigDefaults(
     }),
     Object.freeze({
       version: 1 as const,
-      instanceId: "attention-arousal.default",
-      definitionId: "agent.attention.arousal",
+      instanceId: "lifecycle.default",
+      definitionId: "agent.lifecycle",
       enabled: true,
-      settings: Object.freeze({
-        idleSleepEnabled: false,
-        idleSleepAfterMs: 120_000,
-        nightSleepEnabled: false,
-        nightSleepStart: "23:00",
-        nightSleepEnd: "07:00",
-        periodicWakeEnabled: true,
-        periodicWakeEveryMs: 300_000,
-      }),
+      settings: lifecycleSettingsSchema.parse({}),
     }),
     Object.freeze({
       version: 1 as const,
-      instanceId: "heartbeat.default",
-      definitionId: "agent.heartbeat.short",
+      instanceId: "router.default",
+      definitionId: "agent.router",
       enabled: true,
       settings: Object.freeze({
-        plannerInterruptQuietMs: 1000,
-        maxReplacementAttempts: 3,
-        totalWaitBudget: 3,
-        noActionBackoffBaseMs: 15_000,
-        noActionBackoffCapMs: 300_000,
-        noActionBackoffStartCount: 2,
-        noActionBackoffBypassPendingCount: 6,
-      }),
-    }),
-    Object.freeze({
-      version: 1 as const,
-      instanceId: "heartflow.default",
-      definitionId: "agent.heartflow.online",
-      enabled: true,
-      settings: Object.freeze({
-        plannerInterruptMaxConsecutiveCount: 2,
+        lightInterruptMaxConsecutiveCount: 2,
         muted: false,
         focusIdleMs: 120_000,
         staleAfterMs: 120_000,
       }),
-    }),
-    Object.freeze({
-      version: 1 as const,
-      instanceId: "attention-focus.default",
-      definitionId: "agent.attention.focus",
-      enabled: true,
-      settings: Object.freeze({}),
-    }),
-    Object.freeze({
-      version: 1 as const,
-      instanceId: "memory.expression.default",
-      definitionId: "memory.expression",
-      enabled: true,
-      settings: Object.freeze({ batchSize: 8 }),
     }),
     ...(profile === "production"
       ? [
@@ -218,17 +161,33 @@ export function createFirstPartyModuleActivations(
   configs: readonly FirstPartyModuleInstanceConfig[],
   _identity: Pick<AgentIdentity, "name" | "aliases"> = DEFAULT_AGENT_IDENTITY,
 ): readonly InformationModuleActivation[] {
+  const lifecycle = configs.find(
+    (config) => config.definitionId === "agent.lifecycle" && config.enabled,
+  );
+  const scopeIdleMs = lifecycle
+    ? lifecycleSettingsSchema.parse(lifecycle.settings).activity.scopeIdleMs
+    : undefined;
   return Object.freeze(
     configs
+      .flatMap((config) =>
+        config.definitionId === "agent.router"
+          ? [
+              config,
+              {
+                ...config,
+                instanceId: `${config.instanceId}.situation`,
+                definitionId: "agent.situation",
+              },
+            ]
+          : [config],
+      )
       .filter((config) => !config.definitionId.startsWith("adapter."))
       .map((config) => {
         if (
           config.definitionId === "demo.reply.llm" ||
           config.instanceId === "reply.default"
         ) {
-          throw new Error(
-            "Legacy reply configuration is unsupported. Reinitialize module configuration.",
-          );
+          throw new Error("Unknown module configuration");
         }
         const definition = catalog.definitions.find(
           ({ manifest }) => manifest.definitionId === config.definitionId,
@@ -236,8 +195,16 @@ export function createFirstPartyModuleActivations(
         if (definition === undefined) {
           throw new Error(`Unknown module definition: ${config.definitionId}`);
         }
+        if (definition.manifest.development?.status === "incomplete") {
+          throw new Error(
+            `Incomplete module cannot be activated: ${config.definitionId}`,
+          );
+        }
         const settings = definition.manifest.settingsSchema.safeParse(
-          config.settings,
+          scopeIdleMs !== undefined &&
+            ["agent.router", "agent.situation"].includes(config.definitionId)
+            ? { ...config.settings, focusIdleMs: scopeIdleMs }
+            : config.settings,
         );
         if (!settings.success) {
           throw new ModuleConfigurationError(
@@ -274,7 +241,7 @@ export class ModuleConfigurationError extends Error {
     readonly paths: readonly string[],
   ) {
     super(
-      `Module settings failed validation: ${instanceId} (${definitionId}), fields: ${paths.join(", ")}. Reinitialize module configuration.`,
+      `Module settings failed validation: ${instanceId} (${definitionId}), fields: ${paths.join(", ")}.`,
     );
     this.name = "ModuleConfigurationError";
   }

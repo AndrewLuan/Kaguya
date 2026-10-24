@@ -1,8 +1,9 @@
 /**
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
  * 管理端跨会话路由必须在任何解析前鉴权；Runtime 缺失返回 503 且禁止缓存。
+ * NapCat 采集设置保存后须重启；旧客户端省略采集字段时保留已配置范围与队列预算。
  * 功能概述：本文件验证 HTTP 应用的受保护 Profile readiness、Profile 管理接口、
- * 消息入口与统一错误映射上的外部契约，确保服务端只暴露显式的全局 Profile Registry
+ * NapCat 失败恢复、消息入口与统一错误映射上的外部契约，确保服务端只暴露显式的全局 Profile Registry
  * 行为，不再保留临时配置写桥接或隐式 default 回退。
  * 主要职责：前几组用例覆盖 `/api/v1/profiles` 的无密钥 readiness 与
  * 六个能力的鉴权优先级、CRUD/选择/删除语义，以及 `ConfigError` 到 HTTP 状态码和
@@ -13,7 +14,7 @@
  * Profile API 与 `packages/config`/`configuration-management.ts` 的集成行为；它与配置管理测试、
  * `server-composition.test.ts` 一起覆盖 Task 5 的服务层收口。
  * 输入输出与副作用：测试通过 `app.inject()` 发起内存内 HTTP 请求；Profile CRUD
- * 集成用例会在临时配置目录中落盘 Registry 文件并在结束后删除。若路由泄漏 secret、
+ * 与 NapCat 集成用例会在临时配置目录中落盘 Registry/模块文件并在结束后删除。若路由泄漏 secret、
  * 未先鉴权就执行校验，或错误映射偏离契约，本文件会立即失败。
  */
 import { mkdtemp, rm } from "node:fs/promises";
@@ -23,7 +24,10 @@ import { Writable } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { FileUserConfigManager } from "@kaguya/config";
+import {
+  FileUserConfigManager,
+  loadModuleInstanceConfigs,
+} from "@kaguya/config";
 import { OpenAiCompatibleModelDiscoveryError } from "@kaguya/llm/openai-compatible";
 import {
   closeLogger,
@@ -32,6 +36,7 @@ import {
   getLogContext,
   type LogContext,
 } from "@kaguya/logger";
+import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
 import { createHttpApplication } from "./app.js";
 import type { ServerConfig } from "./config.js";
 import {
@@ -39,6 +44,7 @@ import {
   type ConfigurationManagement,
   type ConfigurationRegistryStatus,
 } from "./configuration-management.js";
+import { FeatureManagement } from "./feature-management.js";
 import type { WebMessageGateway } from "./web-gateway.js";
 
 const gatewayToken = "test-gateway-token-12345";
@@ -83,6 +89,88 @@ function authorization(scheme = "Bearer") {
 }
 
 describe("application API gateway", () => {
+  it("saves NapCat settings for restart without activating the adapter", async () => {
+    const root = await mkdtemp(join(tmpdir(), "kaguya-napcat-api-"));
+    let app: Awaited<ReturnType<typeof createHttpApplication>> | undefined;
+    try {
+      const defaults = createFirstPartyModuleConfigDefaults();
+      await loadModuleInstanceConfigs({
+        rootDir: root,
+        defaults,
+        initialize: true,
+      });
+      const configuration = await createConfigurationManagement(root);
+      const featureManagement = new FeatureManagement({
+        rootDir: root,
+        defaults,
+        exclusive: (operation) => operation(),
+        activeMemory: () => [],
+        napCatLifecycle: () => ({
+          lifecycle: "stopped",
+          connectivity: "disconnected",
+        }),
+        committed: () => {},
+      });
+      app = await createHttpApplication({
+        config,
+        configuration,
+        featureManagement,
+      });
+      const current = await app.inject({
+        url: "/api/v1/napcat",
+        headers: authorization(),
+      });
+      expect(current.statusCode, current.body).toBe(200);
+      const payload = {
+        revision: current.json().data.revision,
+        enabled: false,
+        wsUrl: "ws://127.0.0.1:9",
+        selfId: "123",
+        accessToken: "fake-napcat-token",
+        reconnectMs: 4000,
+        captureEnabled: true,
+        captureGroups: ["456"],
+        captureQueueLimit: 20,
+      };
+      const saved = await app.inject({
+        method: "PUT",
+        url: "/api/v1/napcat",
+        headers: authorization(),
+        payload,
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json().data).toMatchObject({
+        restartRequired: true,
+        status: { enabled: false, reconnectMs: 4000 },
+      });
+      expect(saved.json().data.status).toMatchObject({
+        captureEnabled: true,
+        captureGroups: ["456"],
+        captureQueueLimit: 20,
+      });
+      const legacySave = await app.inject({
+        method: "PUT",
+        url: "/api/v1/napcat",
+        headers: authorization(),
+        payload: {
+          revision: saved.json().data.status.revision,
+          enabled: false,
+          selfId: "123",
+          reconnectMs: 4000,
+        },
+      });
+      expect(legacySave.statusCode, legacySave.body).toBe(200);
+      expect(legacySave.json().data.status).toMatchObject({
+        captureEnabled: true,
+        captureGroups: ["456"],
+        captureQueueLimit: 20,
+      });
+    } finally {
+      await app?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("authenticates model discovery before validation and returns provider models", async () => {
     const discoverModels = vi.fn(async () => ["model-a", "model-b"]);
     const app = await createHttpApplication({ config, discoverModels });

@@ -52,6 +52,16 @@ export {
 } from "./module-config.js";
 export type { ModuleInstanceConfig } from "./module-config.js";
 export {
+  CORDIS_SERVICE_NAMES,
+  defaultCordisTree,
+  loadCordisTree,
+  moduleEnabled,
+  validateCordisTree,
+  writeCordisModuleEnabled,
+  writeCordisTree,
+} from "./cordis-tree.js";
+export type { CordisPluginEntry, CordisPluginTree } from "./cordis-tree.js";
+export {
   aiConfigSchema,
   agentIdentitySchema,
   aiProviderConfigSchema,
@@ -90,3 +100,4 @@ export type {
   RuntimeConfig,
   RuntimeConfigInput,
 } from "./model.js";
+export { migrateLifecycleConfig } from "./lifecycle-migration.js";

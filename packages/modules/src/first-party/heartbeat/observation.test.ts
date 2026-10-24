@@ -29,7 +29,12 @@ import {
   attentionArousalStateRecordedInformationKind,
   turnSilentInformationKind,
   turnClaimedInformationKind,
+  turnContextCompletedInformationKind,
 } from "../information-kinds.js";
+
+import { situationFrozenInformationKind } from "../situation-runtime.js";
+
+import { focusOpened } from "../router/focus-facts.js";
 
 const clean: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -57,7 +62,9 @@ async function fixture(
     [
       ...catalogInformationKinds(catalog),
       runtimeContext,
+      focusOpened,
       turnClaimedInformationKind,
+      turnContextCompletedInformationKind,
     ].map((k) => [k.kind, k]),
   );
   for (const k of [...kinds.values()].filter(
@@ -130,6 +137,139 @@ async function fixture(
     selfId: "bot",
     platformMessageId: "m",
   };
+  // This fixture isolates heartbeat and attention. Publish the already-frozen
+  // boundary that the separate situation runtime supplies in production.
+  const publishFrozen = async () => {
+    if (!withArousal) return;
+    const candidates = await db.information.find({
+      kinds: ["agent.heartbeat.candidate"],
+      order: "asc",
+      limit: 100,
+    });
+    for (const candidate of candidates) {
+      const existing = await db.information.find({
+        kinds: [situationFrozenInformationKind.kind],
+        payloadContains: { candidateInformationId: candidate.informationId },
+        limit: 1,
+      });
+      if (existing.length) continue;
+      const inbound = await db.information.get(
+        String(candidate.payload.unreadThroughInformationId),
+      );
+      if (!inbound) throw Error("Missing fixture input");
+      const inboundPayload = inboundTextInformationKind.payloadSchema.parse(
+        inbound.payload,
+      );
+      const common = { occurredAt: now().toISOString(), source: "module:test" };
+      const root = {
+        relation: "core:context",
+        informationId: context.informationId,
+      };
+      const claim = await core.register(turnClaimedInformationKind, {
+        ...common,
+        payload: {
+          candidateInformationId: candidate.informationId,
+          scopeKey: String(candidate.payload.scopeKey),
+          generation: 0,
+          predecessorTerminalInformationId: null,
+        },
+        references: [
+          root,
+          {
+            relation: "agent:turn-candidate",
+            informationId: candidate.informationId,
+          },
+          {
+            relation: "core:caused-by",
+            informationId: candidate.informationId,
+          },
+        ],
+      });
+      const turn = await core.register(turnContextCompletedInformationKind, {
+        ...common,
+        payload: {
+          candidateInformationId: candidate.informationId,
+          claimInformationId: claim.informationId,
+          scopeKey: String(candidate.payload.scopeKey),
+          asOf: now().toISOString(),
+          backlog: {
+            isBacklog: false,
+            evaluatedAt: now().toISOString(),
+            oldestInputAgeMs: 0,
+            newestInputAgeMs: 0,
+            thresholdMs: 60000,
+          },
+          inputs: [
+            {
+              informationId: inbound.informationId,
+              occurredAt: inbound.occurredAt,
+              text: inboundPayload.text,
+              source: inboundPayload.source,
+              identity: {
+                terminalInformationId: inbound.informationId,
+                status: "unresolved",
+                scopeMode: "ephemeral",
+              },
+            },
+          ],
+          observedThroughInformationId: inbound.informationId,
+          text: inboundPayload.text,
+          source: inboundPayload.source,
+          messageCount: 1,
+          isPrivate: false,
+          isGroup: true,
+          mentionedSelf: false,
+          repliedToSelf: false,
+          muted: false,
+          safe: true,
+          destinationAvailable: true,
+          stale: false,
+          bootstrap: {
+            version: 2,
+            conversation: { scopeMode: "ephemeral", registration: null },
+            participants: [
+              {
+                inputInformationId: inbound.informationId,
+                ownerId: null,
+                registration: null,
+              },
+            ],
+          },
+          attempt: 0,
+          totalWaitBudget: 3,
+        },
+        references: [
+          root,
+          { relation: "core:caused-by", informationId: claim.informationId },
+          { relation: "agent:turn-claim", informationId: claim.informationId },
+          {
+            relation: "core:uses-context",
+            informationId: inbound.informationId,
+          },
+        ],
+      });
+      await core.register(situationFrozenInformationKind, {
+        ...common,
+        payload: {
+          candidateInformationId: candidate.informationId,
+          turnInformationId: turn.informationId,
+          rawInformationId: turn.informationId,
+          frame: {},
+          historyInformationIds: [],
+          continuity: [],
+        },
+        references: [
+          root,
+          { relation: "core:caused-by", informationId: turn.informationId },
+          {
+            relation: "core:uses-context",
+            informationId: candidate.informationId,
+          },
+        ],
+      });
+    }
+    await settle();
+  };
   const inbound = async (extra: any = {}) => {
     const atom = await core.register(inboundTextInformationKind, {
       occurredAt: now().toISOString(),
@@ -140,6 +280,7 @@ async function fixture(
       ],
     });
     await settle();
+    await publishFrozen();
     return atom;
   };
   const atoms = (kind: string) =>
@@ -209,6 +350,7 @@ async function fixture(
       );
     }
     await settle();
+    await publishFrozen();
   };
   const finish = async (candidate: any) => {
     const claim = await core.registerOnce(
@@ -220,7 +362,7 @@ async function fixture(
         source: "module:test",
         payload: {
           candidateInformationId: candidate.informationId,
-          scopeKey: candidate.payload.scopeKey,
+          scopeKey: String(candidate.payload.scopeKey),
           generation: 0,
           predecessorTerminalInformationId: null,
         },
@@ -238,7 +380,7 @@ async function fixture(
       },
     );
     const terminal = await core.commitTerminal(
-      "agent.turn.terminal",
+      "agent.router.turn.terminal",
       candidate.informationId,
       turnSilentInformationKind,
       {
@@ -247,7 +389,7 @@ async function fixture(
         payload: {
           candidateInformationId: candidate.informationId,
           claimInformationId: claim.informationId,
-          scopeKey: candidate.payload.scopeKey,
+          scopeKey: String(candidate.payload.scopeKey),
           reasonCodes: ["test"],
         },
         references: [
@@ -272,6 +414,7 @@ async function fixture(
     fire,
     finish,
     setArousalState,
+    context,
   };
 }
 it("opens one scope immediately and carries later notifications into the next observation", async () => {
@@ -280,7 +423,7 @@ it("opens one scope immediately and carries later notifications into the next ob
   await f.inbound();
   expect(await f.atoms("consumer.failed")).toEqual([]);
   expect(await f.atoms("agent.heartbeat.scheduled")).toHaveLength(0);
-  const candidates = await f.atoms("agent.turn.candidate");
+  const candidates = await f.atoms("agent.heartbeat.candidate");
   expect(candidates).toHaveLength(1);
   expect(candidates[0]!.payload).toMatchObject({
     unreadCount: 1,
@@ -290,10 +433,10 @@ it("opens one scope immediately and carries later notifications into the next ob
   const later = [];
   for (let i = 0; i < 10; i++) later.push(await f.inbound());
   expect(await f.atoms("agent.heartbeat.scheduled")).toHaveLength(0);
-  expect(await f.atoms("agent.turn.candidate")).toHaveLength(1);
-  expect(await f.atoms("agent.observation.wake")).toHaveLength(11);
+  expect(await f.atoms("agent.heartbeat.candidate")).toHaveLength(1);
+  expect(await f.atoms("agent.heartbeat.observation.wake")).toHaveLength(11);
   await f.finish(candidates[0]);
-  const all = await f.atoms("agent.turn.candidate");
+  const all = await f.atoms("agent.heartbeat.candidate");
   expect(all).toHaveLength(2);
   expect(all[1]!.payload).toMatchObject({
     unreadThroughInformationId: later.at(-1)!.informationId,
@@ -308,8 +451,8 @@ it("marks a direct notification as an immediate wake for the open scope", async 
   await f.inbound();
   await f.inbound({ mentions: [{ kind: "user", id: "bot" }] });
   expect(await f.atoms("agent.heartbeat.scheduled")).toHaveLength(0);
-  expect(await f.atoms("agent.turn.candidate")).toHaveLength(1);
-  const wakes = await f.atoms("agent.observation.wake");
+  expect(await f.atoms("agent.heartbeat.candidate")).toHaveLength(1);
+  const wakes = await f.atoms("agent.heartbeat.observation.wake");
   expect(wakes).toHaveLength(1);
   expect(wakes.at(-1)!.payload.immediate).toBe(true);
 });
@@ -390,4 +533,38 @@ it("recognizes private, replies and broadcast mentions without treating ordinary
       mentions: [{ kind: "user", id: "other" }],
     }),
   ).toBe(false);
+});
+
+it("reads Focus metadata from the frozen candidate while asleep", async () => {
+  const f = await fixture(true, {
+    nightSleepEnabled: true,
+    nightSleepStart: "00:00",
+    nightSleepEnd: "23:59",
+  });
+  await f.setArousalState("asleep");
+  await f.core.register(focusOpened, {
+    occurredAt: "2026-09-14T00:00:00.000Z",
+    source: "test:focus",
+    payload: {
+      scopeKey: "qq:qq.main:group:g",
+      generation: "focus:1",
+      startedAt: "2026-09-14T00:00:00.000Z",
+      expiresAt: "2026-09-14T00:02:00.000Z",
+      reason: "mentioned-self",
+      sourceInformationId: f.context.informationId,
+    },
+    references: [
+      { relation: "core:context", informationId: f.context.informationId },
+      { relation: "core:caused-by", informationId: f.context.informationId },
+      { relation: "core:uses-context", informationId: f.context.informationId },
+    ],
+  });
+  await f.inbound();
+  expect(
+    (await f.atoms("agent.attention.arousal.completed"))[0]?.payload,
+  ).toMatchObject({
+    outcome: "observe",
+    focusState: "active",
+    reasonCodes: ["focus-active"],
+  });
 });

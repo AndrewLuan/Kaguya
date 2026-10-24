@@ -1,7 +1,13 @@
 /**
  * 功能概述：turn 领域的 Information schema 与不可变定义，独立维护本领域引用和日志投影。
  * 主要职责：下列 schema 校验入账载荷，各 kind 声明因果关系、上下文和诊断元数据；无 I/O。
- * Arousal 只保存唤醒状态、观察机会、水位、非语义信号与 Focus 快照；正文仅在 observe 后进入回合上下文。
+ * Arousal 只保存唤醒状态、观察机会、水位、非语义信号与 Focus 快照；正文先冻结，注意模块仅读取元信息。
+ * 代码库关系：information-kinds.ts 稳定重导出公共对象；跨领域只复用相邻文件定义，保持 Registry 对象身份。
+ */
+/**
+ * 功能概述：turn 领域的 Information schema 与不可变定义，独立维护本领域引用和日志投影。
+ * 主要职责：下列 schema 校验入账载荷，各 kind 声明因果关系、上下文和诊断元数据；无 I/O。
+ * Arousal 只保存唤醒状态、观察机会、水位、非语义信号与 Focus 快照；正文先冻结，注意模块仅读取元信息。
  * 代码库关系：information-kinds.ts 稳定重导出公共对象；跨领域只复用相邻文件定义，保持 Registry 对象身份。
  */
 import { z } from "@kaguya/schema";
@@ -36,19 +42,23 @@ const turnInputSchema = z
   })
   .strict();
 
+const registrationEvidenceSchema = z
+  .object({
+    informationId: nonBlankString,
+    recordedAt: z.iso.datetime({ offset: true }),
+    sourceIds: z.array(nonBlankString),
+    createdInCurrentInputs: z.boolean(),
+  })
+  .strict()
+  .nullable();
+
 export const turnBootstrapProjectionSchema = z
   .object({
-    version: z.literal(1),
-    mode: z.enum(["cold-start", "warming", "established"]),
-    memory: z
-      .object({
-        state: z.enum(["disabled", "no-authorized-evidence", "available"]),
-        selectedCount: z.number().int().nonnegative(),
-      })
-      .strict(),
+    version: z.literal(2),
     conversation: z
       .object({
-        state: z.enum(["first-seen", "known", "ephemeral", "unresolved"]),
+        scopeMode: z.enum(["canonical", "ephemeral"]),
+        registration: registrationEvidenceSchema,
       })
       .strict(),
     participants: z
@@ -56,7 +66,8 @@ export const turnBootstrapProjectionSchema = z
         z
           .object({
             inputInformationId: nonBlankString,
-            state: z.enum(["first-seen", "known", "unresolved"]),
+            ownerId: nonBlankString.nullable(),
+            registration: registrationEvidenceSchema,
           })
           .strict(),
       )
@@ -68,58 +79,20 @@ export type TurnBootstrapProjection = z.infer<
   typeof turnBootstrapProjectionSchema
 >;
 
-export type NormalizedTurnBootstrapProjection =
-  | TurnBootstrapProjection
-  | {
-      readonly version: 1;
-      readonly mode: "legacy-unknown";
-      readonly memory: {
-        readonly state: "unknown" | "available";
-        readonly selectedCount: number;
-      };
-      readonly conversation: { readonly state: "unknown" };
-      readonly participants: readonly {
-        readonly inputInformationId: string;
-        readonly state: "unresolved";
-      }[];
-    };
+export type NormalizedTurnBootstrapProjection = TurnBootstrapProjection;
 
-/**
- * 旧回合没有 bootstrap 投影。读取时只根据已冻结字段恢复可证明的信息，
- * 其余状态保持 unknown，避免把旧事实误判为已认识人物或会话。
- */
+/** 仅接受当前协议冻结的 bootstrap 投影；旧账本在数据库边界拒绝。 */
 export function normalizeTurnBootstrap(
   payload: Readonly<Record<string, unknown>>,
 ): NormalizedTurnBootstrapProjection {
-  const current = turnBootstrapProjectionSchema.safeParse(payload.bootstrap);
-  if (current.success) return current.data;
-  const memories = Array.isArray(payload.memory) ? payload.memory : [];
-  const inputs = Array.isArray(payload.inputs) ? payload.inputs : [];
-  return {
-    version: 1,
-    mode: "legacy-unknown",
-    memory: {
-      state: memories.length > 0 ? "available" : "unknown",
-      selectedCount: memories.length,
-    },
-    conversation: { state: "unknown" },
-    participants: inputs.flatMap((input) => {
-      const informationId =
-        input && typeof input === "object" && "informationId" in input
-          ? (input as { informationId?: unknown }).informationId
-          : undefined;
-      return typeof informationId === "string" && informationId.trim()
-        ? [{ inputInformationId: informationId, state: "unresolved" as const }]
-        : [];
-    }),
-  };
+  return turnBootstrapProjectionSchema.parse(payload.bootstrap);
 }
 
 export const turnClaimedInformationKind = defineInformationKind({
-  kind: "agent.turn.claimed",
+  kind: "agent.router.turn.claimed",
   displayName: "回合认领",
   description:
-    "Heartflow 成功认领候选时记录范围、代次和前一终态；后续上下文及终态引用它以隔离并发回合。",
+    "Router 成功认领候选时记录范围、代次和前一终态；后续上下文及终态引用它以隔离并发回合。",
   payloadSchema: z
     .object({
       candidateInformationId: nonBlankString,
@@ -146,7 +119,7 @@ export const turnClaimedInformationKind = defineInformationKind({
     "agent:turn-candidate": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate"],
     },
   },
   log: {
@@ -164,7 +137,7 @@ export const turnClaimedInformationKind = defineInformationKind({
 });
 
 export const turnStartedInformationKind = defineInformationKind({
-  kind: "agent.turn.started",
+  kind: "agent.router.turn.started",
   displayName: "回合开始",
   description:
     "候选认领后登记正式推进的回合及代次；供回合生命周期诊断关联候选、认领与后续处理。",
@@ -201,7 +174,7 @@ export const turnStartedInformationKind = defineInformationKind({
 });
 
 export const turnDecisionSupersededInformationKind = defineInformationKind({
-  kind: "agent.turn.decision.superseded",
+  kind: "agent.router.turn.decision.superseded",
   displayName: "回合决策被替代",
   description:
     "较新候选替代当前认领的决策时记录替代来源；后续可据此识别过期决策并追溯候选竞争。",
@@ -216,7 +189,7 @@ export const turnDecisionSupersededInformationKind = defineInformationKind({
     "core:caused-by": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate"],
     },
     "core:context": {
       required: true,
@@ -237,7 +210,7 @@ export const turnDecisionSupersededInformationKind = defineInformationKind({
 });
 
 export const turnDecisionInterruptedInformationKind = defineInformationKind({
-  kind: "agent.turn.decision.interrupted",
+  kind: "agent.router.turn.decision.interrupted",
   displayName: "规划被新消息打断",
   description: "新输入在规划结果提交前赢得决策锁，旧规划结果不得再分派。",
   payloadSchema: z
@@ -286,7 +259,7 @@ const turnTerminalReferences = {
   "core:status-of": {
     required: true,
     multiple: false,
-    targetKinds: ["agent.turn.candidate"],
+    targetKinds: ["agent.heartbeat.candidate"],
   },
   "agent:turn-claim": {
     required: true,
@@ -302,7 +275,7 @@ const turnTerminalBaseShape = {
 };
 
 export const turnCompletedInformationKind = defineInformationKind({
-  kind: "agent.turn.completed",
+  kind: "agent.router.turn.completed",
   displayName: "回合完成",
   description:
     "回合在投递终态后结束时登记，并保存对应投递终态标识；用于闭合回合生命周期和后续候选衔接。",
@@ -321,7 +294,7 @@ export const turnCompletedInformationKind = defineInformationKind({
 });
 
 export const turnWaitingInformationKind = defineInformationKind({
-  kind: "agent.turn.waiting",
+  kind: "agent.router.turn.waiting",
   displayName: "回合等待",
   description:
     "回合选择暂缓时记录下次检查时间并形成当前回合终态；心跳调度负责后续唤醒，诊断可区分等待与卡住。",
@@ -344,7 +317,7 @@ export const turnWaitingInformationKind = defineInformationKind({
 });
 
 export const turnSilentInformationKind = defineInformationKind({
-  kind: "agent.turn.silent",
+  kind: "agent.router.turn.silent",
   displayName: "回合静默",
   description:
     "回合决定不发言时记录原因并闭合当前候选；供生命周期审计解释本次没有消息输出。",
@@ -360,13 +333,18 @@ export const turnSilentInformationKind = defineInformationKind({
 });
 
 export const turnFailedInformationKind = defineInformationKind({
-  kind: "agent.turn.failed",
+  kind: "agent.router.turn.failed",
   displayName: "回合失败",
   description:
     "回合无法继续推进时记录失败原因及所属认领；可靠执行和诊断可据此识别已结束的失败候选。",
-  payloadSchema: z
-    .object({ ...turnTerminalBaseShape, reason: nonBlankString })
-    .strict(),
+  payloadSchema: z.union([
+    z.strictObject({
+      ...turnTerminalBaseShape,
+      reason: nonBlankString,
+      deliveryTerminalInformationId: nonBlankString,
+    }),
+    z.strictObject({ ...turnTerminalBaseShape, reason: nonBlankString }),
+  ]),
   references: turnTerminalReferences,
   log: {
     enabled: true,
@@ -380,7 +358,7 @@ export const turnFailedInformationKind = defineInformationKind({
 });
 
 export const turnSupersededInformationKind = defineInformationKind({
-  kind: "agent.turn.superseded",
+  kind: "agent.router.turn.superseded",
   displayName: "回合被替代",
   description:
     "回合被更新候选取代时记录替代候选并结束旧回合；下游按新的候选继续推进，避免把旧回合当作待处理。",
@@ -399,7 +377,7 @@ export const turnSupersededInformationKind = defineInformationKind({
 });
 
 export const turnInterruptedInformationKind = defineInformationKind({
-  kind: "agent.turn.interrupted",
+  kind: "agent.router.turn.interrupted",
   displayName: "回合被新消息中断",
   description: "关闭已冻结但尚未完成规划的旧回合；后继候选按新消息重新构造。",
   payloadSchema: z
@@ -452,9 +430,22 @@ const turnContextPayloadSchema = z
     safe: z.boolean(),
     destinationAvailable: z.boolean(),
     stale: z.boolean(),
-    bootstrap: turnBootstrapProjectionSchema.optional(),
+    bootstrap: turnBootstrapProjectionSchema,
     /** Optional enrichments are intentionally advisory and do not affect timing. */
     memory: z.array(nonBlankString).optional(),
+    personNames: z
+      .array(
+        z
+          .object({
+            personInformationId: nonBlankString,
+            speakerKey: nonBlankString,
+            initialName: nonBlankString,
+            platform: nonBlankString.optional(),
+            adapterId: nonBlankString.optional(),
+          })
+          .strict(),
+      )
+      .optional(),
     association: z.array(nonBlankString).optional(),
     recheckAt: nonBlankString.optional(),
     attempt: z.number().int().min(0),
@@ -467,10 +458,10 @@ export type TurnContextCompletedPayload = z.infer<
 >;
 
 export const turnContextCompletedInformationKind = defineInformationKind({
-  kind: "agent.turn.context.completed",
+  kind: "agent.router.turn.context.completed",
   displayName: "回合上下文就绪",
   description:
-    "Arousal 决定 observe 后，Heartflow 等待身份屏障并冻结有界未读、来源、时机及积压年龄；只有 Planner 消费正文并判断语义时效。",
+    "情境运行模块等待身份屏障后冻结有界未读、来源、时机及积压年龄，再触发注意模块和 Light。",
   payloadSchema: turnContextPayloadSchema,
   references: {
     "core:caused-by": { required: true, multiple: false },
@@ -483,7 +474,7 @@ export const turnContextCompletedInformationKind = defineInformationKind({
     "agent:turn-claim": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.claimed"],
+      targetKinds: ["agent.router.turn.claimed"],
     },
   },
   log: {
@@ -592,9 +583,13 @@ export const attentionArousalStateRecordedInformationKind =
         required: false,
         multiple: false,
         targetKinds: [
-          "agent.turn.candidate",
+          "agent.heartbeat.candidate",
+          "agent.situation.frozen",
           "agent.attention.arousal.activity",
           "core.schedule.one-shot.due",
+          "core.message.inbound.text",
+          "agent.lifecycle.started",
+          "agent.lifecycle.state.recorded",
         ],
       },
       "core:context": {
@@ -653,13 +648,13 @@ export const attentionArousalCompletedInformationKind = defineInformationKind({
   kind: "agent.attention.arousal.completed",
   displayName: "注意力观察结果",
   description:
-    "依据持久化唤醒状态、平台信号和 Focus 租约记录观察或延后；observe 后 Heartflow 才能读取正文。",
+    "依据持久化唤醒状态、平台信号和 Focus 租约记录观察或延后；冻结完成后触发判断，observe 后 Router 才调用 Light。",
   payloadSchema: attentionArousalPayloadSchema,
   references: {
     "core:caused-by": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate", "agent.situation.frozen"],
     },
     "core:context": {
       required: true,
@@ -671,14 +666,15 @@ export const attentionArousalCompletedInformationKind = defineInformationKind({
       multiple: true,
       targetKinds: [
         attentionArousalStateRecordedInformationKind.kind,
-        "agent.attention.focus.opened",
-        "agent.attention.focus.renewed",
+        "agent.router.turn.context.completed",
+        "agent.router.focus.opened",
+        "agent.router.focus.renewed",
       ],
     },
     "core:status-of": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate"],
     },
   },
   log: {
@@ -701,7 +697,7 @@ export const attentionArousalCompletedInformationKind = defineInformationKind({
 });
 
 export const waitRequestedInformationKind = defineInformationKind({
-  kind: "agent.wait.requested",
+  kind: "agent.router.wait.requested",
   displayName: "等待唤醒请求",
   description:
     "回合需要稍后复查时记录到期时间、等待预算和消息唤醒策略；心跳模块据此创建可恢复调度。",
@@ -722,7 +718,7 @@ export const waitRequestedInformationKind = defineInformationKind({
     "core:caused-by": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.plan.completed"],
+      targetKinds: ["agent.light.decision.completed"],
     },
     "core:context": {
       required: true,

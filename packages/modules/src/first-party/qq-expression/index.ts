@@ -1,11 +1,20 @@
 /**
  * 功能概述：独立 QQ 表情插件，从真人上下文推断收藏表情的用法，并对草稿进行低频装饰。
  * collectionSelector 隔离群/适配器并限量选择上下文；收藏素材与学习结果独立持久化。
- * draftSelector 仅允许当前会话及 Planner 明确幽默/调侃意图，候选和来源先冻结再调用模型。
+ * draftSelector 仅允许当前会话，候选和来源先冻结再调用模型。
  * finalSelector 恢复原草稿、冻结来源及近期输出；串行额度提交防止并发草稿连发表情。
  * 所有模型失败、未知语义、跨群请求和额度不足均退回原正文；不主动发言、不改变投递授权。
- * Composer 只在显式启用插件时产生草稿，插件保存 prepared 后仍由 Composer 登记 assistant 并沿原链路发送。
+ * Heavy 只在显式启用插件时产生草稿，插件保存 prepared 后仍由 Heavy 登记 assistant 并沿原链路发送。
  */
+/**
+ * 功能概述：独立 QQ 表情插件，从真人上下文推断收藏表情的用法，并对草稿进行低频装饰。
+ * collectionSelector 隔离群/适配器并限量选择上下文；收藏素材与学习结果独立持久化。
+ * draftSelector 仅允许当前会话，候选和来源先冻结再调用模型。
+ * finalSelector 恢复原草稿、冻结来源及近期输出；串行额度提交防止并发草稿连发表情。
+ * 所有模型失败、未知语义、跨群请求和额度不足均退回原正文；不主动发言、不改变投递授权。
+ * Heavy 只在显式启用插件时产生草稿，插件保存 prepared 后仍由 Heavy 登记 assistant 并沿原链路发送。
+ */
+import { nativeMemoryCapability, memoryScope } from "@kaguya/memory";
 import { createHash } from "node:crypto";
 import {
   z,
@@ -30,7 +39,7 @@ import {
   messagePreparedInformationKind,
   messageDraftProcessorReady,
 } from "../kinds/message.js";
-import type { CreateMessageComposerModuleOptions } from "../message-composer/index.js";
+import type { CreateHeavyModuleOptions } from "../heavy/index.js";
 import { createPromptTemplateRenderer } from "../../prompt-template.js";
 import { qqExpressionTemplateDeclarations } from "../../prompt-declarations.js";
 import {
@@ -127,6 +136,21 @@ const draftSelector = defineInformationSelector({
       i < 4 && current?.kind !== messageIntentRequestedInformationKind.kind;
       i++
     ) {
+      if (
+        current?.kind === "agent.heavy.step.requested" ||
+        current?.kind === "agent.heavy.recall.completed"
+      ) {
+        const rootId = String(current.payload.intentInformationId);
+        if (
+          !current.references.some(
+            (r) =>
+              r.relation === "core:uses-context" && r.informationId === rootId,
+          )
+        )
+          return [sourceAtom.informationId];
+        current = await get(ledger, rootId);
+        break;
+      }
       const cause: string | undefined = current?.references.find(
         (r) => r.relation === "core:caused-by",
       )?.informationId;
@@ -148,13 +172,7 @@ const draftSelector = defineInformationSelector({
       return ids;
     const turnSource = turn.payload.source as unknown as typeof intent.target;
     // 跨会话的确认正文不加装饰，不把本群收藏转发到其他群。
-    if (
-      scopeKey(turnSource) !== scopeKey(intent.target) ||
-      !["humorous", "teasing"].includes(
-        "tone" in intent.composition ? intent.composition.tone : "neutral",
-      )
-    )
-      return ids;
+    if (scopeKey(turnSource) !== scopeKey(intent.target)) return ids;
     const inputId = (
       turn.payload.inputs as unknown as { informationId: string }[]
     ).at(-1)?.informationId;
@@ -168,31 +186,14 @@ const draftSelector = defineInformationSelector({
     )
       return ids;
     ids.push(turn.informationId, input.informationId);
-    const allMeanings = await ledger.find({
-      kinds: [learned.kind],
+    const assets = await ledger.find({
+      kinds: [collected.kind],
       payloadContains: { scope: scopeKey(draft.source) },
       registrationOrder: true,
       order: "desc",
-      limit: 200,
+      limit: 100,
     });
-    const meanings = [
-      ...new Map(
-        [...allMeanings]
-          .reverse()
-          .map((a) => [String(a.payload.assetInformationId), a]),
-      ).values(),
-    ];
-    for (const meaning of meanings) {
-      const asset = await get(
-        ledger,
-        String(meaning.payload.assetInformationId),
-      );
-      if (
-        asset?.kind === collected.kind &&
-        asset.payload.scope === scopeKey(draft.source)
-      )
-        ids.push(meaning.informationId, asset.informationId);
-    }
+    ids.push(...assets.map((a) => a.informationId));
     return ids;
   },
 });
@@ -228,7 +229,7 @@ const finalSelector = defineInformationSelector({
   },
 });
 export function createQqExpressionModule(
-  options: Pick<CreateMessageComposerModuleOptions, "modelTaskCapability"> & {
+  options: Pick<CreateHeavyModuleOptions, "modelTaskCapability"> & {
     templates: { learn: string; select: string };
     cacheSticker?: (url: string) => Promise<string | undefined>;
   },
@@ -254,6 +255,7 @@ export function createQqExpressionModule(
     ]);
   return defineInformationModule({
     manifest: {
+      category: "platform",
       protocolVersion: 1,
       moduleVersion: "1.0.0",
       definitionId: "plugin.qq-expression",
@@ -287,7 +289,7 @@ export function createQqExpressionModule(
         ...d,
         mutability: "editable" as const,
       })),
-      requires: [options.modelTaskCapability],
+      requires: [options.modelTaskCapability, nativeMemoryCapability],
       provides: [messageDraftProcessorReady],
       inspection: {
         mechanism: [
@@ -418,6 +420,7 @@ export function createQqExpressionModule(
             observed,
             { subscriptionId: "qq-expression.learn", delivery: "durable" },
             async (atom, context) => {
+              if (!context.use(nativeMemoryCapability).enabled) return;
               const state = await context.select(sourceSelector);
               const sources = state.filter(
                 (a) => a.kind === inboundTextInformationKind.kind,
@@ -434,7 +437,6 @@ export function createQqExpressionModule(
                   .execute({
                     task: {
                       taskId: "plugin.qq-expression.learn",
-                      version: "1",
                       outputMode: "object",
                       outputSchema: meaningSchema,
                       allowedTiers: ["light"],
@@ -501,21 +503,49 @@ export function createQqExpressionModule(
             { subscriptionId: "qq-expression.freeze", delivery: "durable" },
             async (atom, context) => {
               const state = await context.select(draftSelector);
-              const meanings = state
-                .filter(
-                  (a) =>
-                    a.kind === learned.kind &&
-                    Number(a.payload.confidence) >= settings.minConfidence,
-                )
-                .slice(0, 24);
-              // 限定模型来源，素材字节只在最终编码时读取。
-              const candidateIds = meanings.map((a) =>
-                String(a.payload.assetInformationId),
-              );
+              let candidates: {
+                id: string;
+                nodeId: string;
+                revision: number;
+                meaning: string;
+                usage: string;
+              }[] = [];
+              try {
+                const snapshot = await context
+                  .use(nativeMemoryCapability)
+                  .freeze({
+                    scope: memoryScope(atom.payload.source),
+                    owners: ["expression:kaguya"],
+                    asOf: atom.occurredAt,
+                    query: String(atom.payload.text).slice(-512),
+                  });
+                candidates = snapshot.recalled
+                  .map((r) => r.node)
+                  .filter(
+                    (n) =>
+                      typeof n.metadata.qqAssetId === "string" &&
+                      Number(n.metadata.confidence) >= settings.minConfidence &&
+                      state.some(
+                        (a) =>
+                          a.kind === collected.kind &&
+                          a.informationId === n.metadata.qqAssetId,
+                      ),
+                  )
+                  .map((n) => ({
+                    id: String(n.metadata.qqAssetId),
+                    nodeId: n.id,
+                    revision: n.metadata.revision,
+                    meaning: n.content,
+                    usage: "依据冻结的记忆和当前语境选用",
+                  }))
+                  .slice(0, 24);
+              } catch {
+                /* 可选表情召回失败时保持普通回复。 */
+              }
+              const candidateIds = candidates.map((c) => c.id);
               const frozen = state.filter(
                 (a) =>
                   (a.kind !== learned.kind && a.kind !== collected.kind) ||
-                  meanings.includes(a) ||
                   candidateIds.includes(a.informationId),
               );
               await context.registerOnce(
@@ -527,6 +557,7 @@ export function createQqExpressionModule(
                     draftInformationId: atom.informationId,
                     scope: scopeKey(atom.payload.source),
                     candidateIds,
+                    candidates,
                   },
                   references: frozen.map((a) => ({
                     relation: "core:uses-context",
@@ -581,28 +612,23 @@ export function createQqExpressionModule(
                   rateAllowed(history, context.now().getTime(), settings);
                 if (canDecorate) {
                   try {
-                    const meanings = state.filter(
-                      (a) => a.kind === learned.kind,
-                    );
                     const promptAtoms = [
                       semanticSource!,
                       atom,
                       draft,
                       intent!,
                       turn!,
-                      ...meanings,
                     ];
                     const result = await context
                       .use(options.modelTaskCapability)
                       .execute({
                         task: {
                           taskId: "plugin.qq-expression.select",
-                          version: "1",
                           outputMode: "object",
                           outputSchema: selectionSchema,
                           allowedTiers: ["light"],
                         },
-                        // 可选语义任务以真实入站为因果来源，失败不能沿 Composer 链结束回复。
+                        // 可选语义任务以真实入站为因果来源，失败不能沿 Heavy 链结束回复。
                         // 冻结草稿和选择请求仍列在 contextAtoms 中，保留完整审计与重放指纹。
                         sourceInformationId: semanticSource!.informationId,
                         contextInformationId: semanticSource!.references.find(
@@ -613,17 +639,12 @@ export function createQqExpressionModule(
                         contextAtoms: promptAtoms,
                         prompt: render("select", promptAtoms, {
                           text,
-                          composition: intent!.payload.composition,
                           context: (
                             turn!.payload.inputs as unknown as {
                               text: string;
                             }[]
                           ).map((a) => a.text.slice(0, 1000)),
-                          candidates: meanings.map((a) => ({
-                            id: a.payload.assetInformationId,
-                            meaning: a.payload.meaning,
-                            usage: a.payload.usage,
-                          })),
+                          candidates: atom.payload.candidates,
                         }),
                       });
                     const parsed =
@@ -658,7 +679,7 @@ export function createQqExpressionModule(
                         text += ` ${choice.emoji}`;
                     }
                   } catch {
-                    /* 选用失败仅回退正文，发送授权仍由 Composer 处理。 */
+                    /* 选用失败仅回退正文，发送授权仍由 Heavy 处理。 */
                   }
                 }
                 await context.registerOnce(

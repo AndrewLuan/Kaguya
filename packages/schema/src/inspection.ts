@@ -2,11 +2,17 @@
  * 功能概述：定义开发者控制台的版本化只读 DTO，与内部 Ledger 和模块实例隔离。
  * 主要职责：各 inspection*Schema 校验 Module、Atom 摘要/详情、游标页和有界 Flow；
  * 对应类型供服务端投影与 WebUI 共享，领域视图/机制由 Manifest 声明；presentation 展示安全字段。
- * inspectionStorageSchema 区分真实存储不可用与空页，游标不包含内容。
- * record-browser 声明按事实时间浏览的记录、双向引用分组与受限来源投影；wiki-browser 以当前页面而非修订流水为主体。
  * presentation.fields 的可选 path 保留稳定字段身份，中文 label 仅用于展示；旧客户端和未声明状态的记录兼容。
  * model-request-browser 按模块与任务隔离每次请求，独立详情保留冻结输入、完整脱敏 Prompt 和投递证据；
- * storage-browser 将模块声明的持久库投影为紧凑表格，hiddenSections 允许领域页面收起无关的通用技术区。
+ * 代码库关系：由 schema/index.ts 导出，server/inspection.ts 产出，Web API 校验后展示。
+ * 输入输出与副作用：仅声明 JSON wire contract，无 I/O；详情 payload 必须由服务端先脱敏。
+ */
+/**
+ * 功能概述：定义开发者控制台的版本化只读 DTO，与内部 Ledger 和模块实例隔离。
+ * 主要职责：各 inspection*Schema 校验 Module、Atom 摘要/详情、游标页和有界 Flow；
+ * 对应类型供服务端投影与 WebUI 共享，领域视图/机制由 Manifest 声明；presentation 展示安全字段。
+ * presentation.fields 的可选 path 保留稳定字段身份，中文 label 仅用于展示；旧客户端和未声明状态的记录兼容。
+ * model-request-browser 按模块与任务隔离每次请求，独立详情保留冻结输入、完整脱敏 Prompt 和投递证据；
  * 代码库关系：由 schema/index.ts 导出，server/inspection.ts 产出，Web API 校验后展示。
  * 输入输出与副作用：仅声明 JSON wire contract，无 I/O；详情 payload 必须由服务端先脱敏。
  */
@@ -50,26 +56,11 @@ const surfaceRelationSchema = z.object({
 const surfaceComponentSchema = z.discriminatedUnion("type", [
   z.object({
     id: z.string().trim().min(1),
-    type: z.literal("wiki-browser"),
-    area: z.string().trim().min(1),
-    viewId: z.string().trim().min(1),
-    pageKind: z.string().trim().min(1),
-    empty: z.string().trim().min(1),
-  }),
-  z.object({
-    id: z.string().trim().min(1),
-    type: z.literal("storage-browser"),
-    area: z.string().trim().min(1),
-    columns: z.array(z.string().trim().min(1)).min(1).max(8),
-    empty: z.string().trim().min(1),
-  }),
-  z.object({
-    id: z.string().trim().min(1),
     type: z.literal("model-request-browser"),
     area: z.string().trim().min(1),
     viewId: z.string().trim().min(1),
     taskId: z.string().trim().min(1),
-    mode: z.enum(["planner", "composer"]),
+    mode: z.enum(["light", "heavy"]),
   }),
   z.object({
     id: z.string().trim().min(1),
@@ -220,7 +211,6 @@ export const moduleInspectionSchema = z.object({
       fields: z.array(z.object({ path: z.string(), label: z.string() })),
     }),
   ),
-  storage: z.enum(["memory", "vectors"]).optional(),
   surface: moduleInspectionSurfaceSchema.optional(),
 });
 export type ModuleInspection = z.infer<typeof moduleInspectionSchema>;
@@ -248,7 +238,13 @@ const moduleTag = z
   .regex(/^[a-z][a-z0-9-]*$/u);
 export const inspectionModuleSchema = z.object({
   definitionId: z.string(),
+  development: z
+    .object({ status: z.literal("incomplete"), issueUrl: z.url() })
+    .optional(),
   tags: z.array(moduleTag).default([]),
+  category: z
+    .enum(["identity", "memory", "agent", "platform", "other"])
+    .optional(),
   inspection: moduleInspectionSchema.optional(),
   displayName: z.string(),
   summary: z.string(),
@@ -356,54 +352,42 @@ export const inspectionRecordPageSchema = inspectionSurfacePageSchema.omit({
   platforms: true,
   statuses: true,
 });
-const inspectionWikiPageSummarySchema = z.object({
-  pageId: z.string().min(1),
-  scopeInformationId: z.string().min(1),
-  entityInformationId: z.string().min(1),
-  title: z.string().min(1),
-  pageType: z.enum(["scope", "entity"]),
-  version: z.number().int().positive(),
-  dirty: z.boolean(),
-  reasons: z.array(z.string()),
-  updatedAt: z.string(),
-  sectionCount: z.number().int().nonnegative(),
-  excerpt: z.string(),
-});
-export const inspectionWikiPageSchema = z.object({
-  version: z.literal(1),
-  surfaceId: z.string(),
-  items: z.array(inspectionWikiPageSummarySchema),
-  nextCursor: z.string().nullable(),
-});
-export const inspectionWikiPageDetailSchema = z.object({
-  version: z.literal(1),
-  surfaceId: z.string(),
-  page: inspectionWikiPageSummarySchema,
-  sections: z.array(
-    z.object({
-      heading: z.string(),
-      content: z.string(),
-      evidenceSourceInformationIds: z.array(z.string()),
-      claimIds: z.array(z.string()),
-    }),
-  ),
-  history: z.array(
-    z.object({
-      version: z.number().int().positive(),
-      recordedAt: z.string(),
-      sectionCount: z.number().int().nonnegative(),
-    }),
-  ),
-  historyTruncated: z.boolean(),
-});
-export type InspectionWikiPage = z.infer<typeof inspectionWikiPageSchema>;
-export type InspectionWikiPageDetail = z.infer<
-  typeof inspectionWikiPageDetailSchema
->;
 export const inspectionSurfaceEntitySchema = z.object({
   version: z.literal(1),
   surfaceId: z.string(),
   entity: surfaceListItemSchema,
+  accounts: z
+    .array(
+      z.object({
+        platform: z.string(),
+        adapterId: z.string(),
+        accountId: z.string(),
+        nickname: z.string().nullable(),
+        accountInformationId: z.string(),
+        bindingInformationId: z.string(),
+      }),
+    )
+    .optional(),
+  accountsTruncated: z.boolean().optional(),
+  groupCards: z
+    .array(
+      z.object({
+        platform: z.string(),
+        groupId: z.string(),
+        card: z.string(),
+        observedAt: z.string(),
+        sourceInformationId: z.string(),
+      }),
+    )
+    .optional(),
+  groupCardsTruncated: z.boolean().optional(),
+  recognitionStats: z
+    .object({
+      count: z.number().int().nonnegative(),
+      firstAt: z.string().nullable(),
+      lastAt: z.string().nullable(),
+    })
+    .optional(),
   sections: z.array(
     z.object({
       id: z.string(),
@@ -501,18 +485,3 @@ export type InspectionRequestPage = z.infer<typeof inspectionRequestPageSchema>;
 export type InspectionRequestDetail = z.infer<
   typeof inspectionRequestDetailSchema
 >;
-
-export const inspectionStorageSchema = z.object({
-  version: z.literal(1),
-  available: z.boolean(),
-  title: z.string(),
-  description: z.string(),
-  items: z.array(
-    z.object({
-      id: z.string(),
-      sourceInformationId: z.string().optional(),
-      fields: inspectionPresentationSchema.shape.fields,
-    }),
-  ),
-  nextCursor: z.string().nullable(),
-});

@@ -1,7 +1,6 @@
 /**
  * runtimeConfigSchema 要求独立的 inboundAllowlist/outboundAllowlist，拒绝旧 gatewayAllowlist；持久化文件需手动升级。
  * Memory 可选 embedding/cognition 配置只定义宿主端点与版本身份；enabled=false 时不装配任何 provider。
- * knowledgeEnabled 显式启用事件与 Wiki 原型；省略时保留既有 Memory 行为，不迁移或删除原文。
  * 架构说明：本模块拥有配置 Profile 与 Registry 的持久化 schema，
  * 负责 JSON 克隆、引用完整性与 v1 注册表不变量。它被配置管理器、
  * 运行时启动链和 WebUI/API 层共同消费，必须保持可安全反序列化且
@@ -134,37 +133,8 @@ const platformConfigInnerSchema = z.strictObject({
 
 export const platformConfigSchema = guardSchemaInput(platformConfigInnerSchema);
 
-const memoryEndpointSchema = z.url().refine((value) => {
-  const url = new URL(value);
-  return (
-    ["https:", "http:"].includes(url.protocol) &&
-    !url.username &&
-    !url.password &&
-    !url.search &&
-    !url.hash
-  );
-}, "Invalid Memory endpoint");
 const memoryConfigInnerSchema = z.strictObject({
   enabled: z.boolean(),
-  knowledgeEnabled: z.boolean().optional(),
-  embedding: z
-    .strictObject({
-      providerId: nonEmptyIdSchema,
-      modelId: nonEmptyIdSchema,
-      revision: nonEmptyIdSchema,
-      dimensions: z.number().int().min(1).max(16000),
-      baseUrl: memoryEndpointSchema,
-      apiKey: z.string().min(1),
-    })
-    .optional(),
-  cognition: z
-    .strictObject({
-      provider: z.literal("mem0-rest"),
-      revision: nonEmptyIdSchema,
-      baseUrl: memoryEndpointSchema,
-      apiKey: z.string().min(1),
-    })
-    .optional(),
 });
 
 export const memoryConfigSchema = guardSchemaInput(memoryConfigInnerSchema);

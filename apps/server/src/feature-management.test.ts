@@ -1,11 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import {
-  loadModuleInstanceConfigs,
-  type ModuleInstanceConfig,
-} from "@kaguya/config";
+import { loadModuleInstanceConfigs } from "@kaguya/config";
 import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
 import { FeatureManagement } from "./feature-management.js";
 
@@ -20,91 +17,84 @@ async function fixture() {
   const rootDir = await mkdtemp(join(tmpdir(), "kaguya-features-"));
   roots.push(rootDir);
   const defaults = createFirstPartyModuleConfigDefaults("test");
-  await loadModuleInstanceConfigs({ rootDir, defaults, initialize: true });
-  let active: readonly string[] = [];
-  let fail = false;
-  const activateMemory = vi.fn(
-    async (configs: readonly ModuleInstanceConfig[]) => {
-      if (fail) throw new Error("activation failed");
-      active = configs
-        .filter(
-          (config) =>
-            config.enabled && config.definitionId.startsWith("memory."),
-        )
-        .map((config) => config.definitionId);
-    },
-  );
-  const activateNapCat = vi.fn(async () => {});
+  await loadModuleInstanceConfigs({ rootDir, defaults });
   const committed = vi.fn();
-  const recovered = vi.fn();
   const management = new FeatureManagement({
     rootDir,
     defaults,
     exclusive: (operation) => operation(),
-    activateMemory,
-    activateNapCat,
-    activeMemory: () => active,
+    activeMemory: () => [],
     napCatLifecycle: () => ({
       lifecycle: "stopped",
       connectivity: "disconnected",
     }),
     committed,
-    recovered,
   });
-  return {
-    rootDir,
-    management,
-    activateMemory,
-    activateNapCat,
-    committed,
-    recovered,
-    failNext: () => {
-      fail = true;
-    },
-  };
+  return { rootDir, defaults, management, committed };
 }
 
-it("cascades raw Memory off and keeps children off when reopened", async () => {
+it("writes the desired Memory switch only to the plugin tree and leaves runtime state alone", async () => {
   const f = await fixture();
-  let view = await f.management.get();
-  await expect(
-    f.management.toggle("memory.index", true, view.revision),
-  ).rejects.toMatchObject({ code: "memory_writeback_required" });
-  view = await f.management.toggle("memory.writeback", true, view.revision);
-  view = await f.management.toggle("memory.knowledge", true, view.revision);
-  view = await f.management.toggle("memory.writeback", false, view.revision);
+  const path = join(f.rootDir, "modules/memory.native.default/config.json");
+  const before = await readFile(path, "utf8");
+  const initial = await f.management.get();
+  const saved = await f.management.toggle(
+    "memory.native",
+    true,
+    initial.revision,
+  );
+  expect(await readFile(path, "utf8")).toBe(before);
   expect(
-    view.features
-      .filter((item) => item.id.startsWith("memory."))
-      .every((item) => !item.enabled),
-  ).toBe(true);
-  view = await f.management.toggle("memory.writeback", true, view.revision);
-  expect(
-    view.features.find((item) => item.id === "memory.knowledge")?.enabled,
-  ).toBe(false);
-  expect(f.activateNapCat).not.toHaveBeenCalled();
+    saved.features.find((item) => item.id === "memory.native"),
+  ).toMatchObject({
+    enabled: true,
+    active: false,
+    blocker: "restart_required",
+  });
+  expect(await readFile(join(f.rootDir, "cordis.yml"), "utf8")).toContain(
+    "id: module.memory.native.default",
+  );
+  expect(f.committed).toHaveBeenCalledOnce();
 });
 
-it("rejects stale versions and restores persisted state on activation failure", async () => {
+it("rejects stale revisions without changing the plugin tree", async () => {
   const f = await fixture();
   const before = await f.management.get();
-  await f.management.toggle("memory.writeback", true, before.revision);
+  await f.management.toggle("memory.native", true, before.revision);
+  const tree = await readFile(join(f.rootDir, "cordis.yml"), "utf8");
   await expect(
-    f.management.toggle("memory.writeback", false, before.revision),
+    f.management.toggle("memory.native", false, before.revision),
   ).rejects.toMatchObject({
     status: 409,
     code: "feature_configuration_changed",
   });
-  f.failNext();
-  const current = await f.management.get();
-  await expect(
-    f.management.toggle("memory.writeback", false, current.revision),
-  ).rejects.toMatchObject({ code: "feature_activation_failed" });
-  const after = await f.management.get();
+  expect(await readFile(join(f.rootDir, "cordis.yml"), "utf8")).toBe(tree);
+});
+
+it("saves NapCat settings only in the instance file and requires restart", async () => {
+  const f = await fixture();
+  const before = await f.management.get();
+  const tree = await readFile(join(f.rootDir, "cordis.yml"), "utf8");
+  const saved = await f.management.updateNapCat(
+    {
+      enabled: false,
+      wsUrl: "ws://127.0.0.1:9",
+      selfId: "123",
+      accessToken: "fake-napcat-token",
+      reconnectMs: 4000,
+    },
+    before.revision,
+  );
+  expect(await readFile(join(f.rootDir, "cordis.yml"), "utf8")).toBe(tree);
+  expect(saved.revision).not.toBe(before.revision);
+  const configs = await loadModuleInstanceConfigs({
+    rootDir: f.rootDir,
+    defaults: f.defaults,
+    initialize: false,
+  });
   expect(
-    after.features.find((item) => item.id === "memory.writeback")?.enabled,
-  ).toBe(true);
-  expect(after.revision).toBe(current.revision);
-  expect(f.committed).toHaveBeenCalledTimes(1);
-  expect(f.recovered).toHaveBeenCalledOnce();
+    configs.find((item) => item.definitionId === "adapter.napcat")?.settings,
+  ).toMatchObject({
+    reconnectMs: 4000,
+  });
 });

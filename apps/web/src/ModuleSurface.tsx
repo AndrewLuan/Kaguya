@@ -1,17 +1,21 @@
 /**
  * 功能概述：渲染模块 Manifest 声明的受控检查 Surface；首版提供状态摘要、实体主从浏览、关系列表、时间线与关系图。
- * wiki-browser 分派给页面目录与正文阅读器；record-browser 按 presentation 分派注意力观察或通用记录详情。
  * model-request-browser 分派给独立 RequestSurface，按持久化模型请求提供目录与详情。
- * storage-browser 分派给紧凑持久库表格，避免通用历史标签和卡片列表干扰领域浏览。
  * 主要职责：将搜索和筛选转换为只读 Inspection 查询，保持稳定游标；实体选择加载独立详情并允许追溯原始 Atom。
  * 代码库关系：ModulePages 在模块声明 surface 时挂载本组件；布局来自 Manifest，数据由版本化 surface DTO 提供。
- * 输入输出与副作用：只执行认证 GET、history 内页面状态与可访问焦点移动；不执行模块提供的代码，不修改人物事实。
+ * 输入输出与副作用：Inspection 继续只读；人物详情只读展示实体、绑定与识别记录，记忆内容在 Memory 工作台管理。
+ */
+/**
+ * 功能概述：渲染模块 Manifest 声明的受控检查 Surface；首版提供状态摘要、实体主从浏览、关系列表、时间线与关系图。
+ * model-request-browser 分派给独立 RequestSurface，按持久化模型请求提供目录与详情。
+ * 主要职责：将搜索和筛选转换为只读 Inspection 查询，保持稳定游标；实体选择加载独立详情并允许追溯原始 Atom。
+ * 代码库关系：ModulePages 在模块声明 surface 时挂载本组件；布局来自 Manifest，数据由版本化 surface DTO 提供。
+ * 输入输出与副作用：Inspection 继续只读；人物详情只读展示实体、绑定与识别记录，记忆内容在 Memory 工作台管理。
  */
 import { RecordSurface } from "./RecordSurface.js";
+
 import { GateSurface } from "./GateSurface.js";
 import { RequestSurface } from "./RequestSurface.js";
-import { StorageSurface } from "./StorageSurface.js";
-import { WikiSurface } from "./WikiSurface.js";
 import {
   inspectionSurfaceEntitySchema,
   inspectionSurfacePageSchema,
@@ -46,24 +50,6 @@ interface ModuleSurfaceProps {
 /** 分派组件不持有 Hook，跨模块导航时按 definitionId 隔离搜索、选择和异步详情状态。 */
 export function ModuleSurface(props: ModuleSurfaceProps) {
   const surface = props.module.inspection?.surface;
-  const storage = surface?.components.find(
-    (component) => component.type === "storage-browser",
-  );
-  if (storage)
-    return (
-      <StorageSurface
-        key={props.module.definitionId}
-        {...props}
-        browser={storage}
-      />
-    );
-  const wiki = surface?.components.find(
-    (component) => component.type === "wiki-browser",
-  );
-  if (wiki)
-    return (
-      <WikiSurface key={props.module.definitionId} {...props} browser={wiki} />
-    );
   const requests = surface?.components.find(
     (component) => component.type === "model-request-browser",
   );
@@ -247,6 +233,7 @@ function EntitySurface({
             />
             <PersonDetail
               state={detail}
+              token={token}
               headingRef={detailHeading}
               onTrace={setTrace}
             />
@@ -372,10 +359,12 @@ function PersonDirectory({
 
 function PersonDetail({
   state,
+  token,
   headingRef,
   onTrace,
 }: {
   state: { data?: InspectionSurfaceEntity; error?: string };
+  token: string;
   headingRef: RefObject<HTMLHeadingElement | null>;
   onTrace: (id: string) => void;
 }) {
@@ -393,7 +382,18 @@ function PersonDetail({
         <FieldMessage>正在加载人物详情…</FieldMessage>
       </section>
     );
-  const { entity, sections } = state.data;
+  const {
+    entity,
+    sections,
+    accounts = [],
+    groupCards = [],
+    recognitionStats,
+  } = state.data;
+  const accountsByPlatform = Map.groupBy(
+    accounts,
+    (account) => account.platform,
+  );
+  const cardsByPlatform = Map.groupBy(groupCards, (card) => card.platform);
   return (
     <article className="surface-detail">
       <header>
@@ -410,11 +410,147 @@ function PersonDetail({
       </header>
       <InspectionFields
         fields={entity.fields.map((field) =>
-          field.label === "最近观察" && typeof field.value === "string"
+          ["最近观察", "最近识别", "人物建立"].includes(field.label) &&
+          typeof field.value === "string"
             ? { ...field, value: new Date(field.value).toLocaleString() }
             : field,
         )}
       />
+      <section className="person-readonly-section" aria-label="绑定账号">
+        <header>
+          <h4>绑定账号</h4>
+          <span>只读 · 按平台</span>
+        </header>
+        {accountsByPlatform.size === 0 ? (
+          <p className="person-readonly-empty">暂无绑定账号</p>
+        ) : (
+          [...accountsByPlatform].map(([platform, rows]) => (
+            <div className="person-readonly-group" key={platform}>
+              <h5>{platform}</h5>
+              <div className="person-readonly-table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>适配器</th>
+                      <th>账号 ID</th>
+                      <th>最近平台昵称</th>
+                      <th>绑定记录</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((account) => (
+                      <tr key={account.accountInformationId}>
+                        <td>{account.adapterId}</td>
+                        <td>{account.accountId}</td>
+                        <td>{account.nickname || "—"}</td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onTrace(account.bindingInformationId)
+                            }
+                          >
+                            查看
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))
+        )}
+        {state.data.accountsTruncated && <p>账号较多，仅显示前 500 条。</p>}
+      </section>
+      <section className="person-readonly-section" aria-label="群名片">
+        <header>
+          <h4>群名片</h4>
+          <span>只读 · 各群最近观察</span>
+        </header>
+        {cardsByPlatform.size === 0 ? (
+          <p className="person-readonly-empty">暂无群名片观察</p>
+        ) : (
+          [...cardsByPlatform].map(([platform, rows]) => (
+            <div className="person-readonly-group" key={platform}>
+              <h5>{platform}</h5>
+              <div className="person-readonly-table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>群 ID</th>
+                      <th>群名片</th>
+                      <th>观察时间</th>
+                      <th>来源</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((card) => (
+                      <tr key={`${card.platform}:${card.groupId}`}>
+                        <td>{card.groupId}</td>
+                        <td>{card.card}</td>
+                        <td>
+                          <time dateTime={card.observedAt}>
+                            {new Date(card.observedAt).toLocaleString()}
+                          </time>
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            onClick={() => onTrace(card.sourceInformationId)}
+                          >
+                            查看
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))
+        )}
+        {state.data.groupCardsTruncated && (
+          <p>观察记录较多，群名片仅汇总最近 1,000 条观察。</p>
+        )}
+      </section>
+      <section
+        className="person-readonly-section person-recognition-stats"
+        aria-label="识别统计"
+      >
+        <header>
+          <h4>识别统计</h4>
+          <span>按身份终态事件计算</span>
+        </header>
+        <dl>
+          <div>
+            <dt>首次识别</dt>
+            <dd>
+              {recognitionStats?.firstAt
+                ? new Date(recognitionStats.firstAt).toLocaleString()
+                : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>最近识别</dt>
+            <dd>
+              {recognitionStats?.lastAt
+                ? new Date(recognitionStats.lastAt).toLocaleString()
+                : "—"}
+            </dd>
+          </div>
+          <div>
+            <dt>识别次数</dt>
+            <dd>{recognitionStats?.count ?? 0}</dd>
+          </div>
+        </dl>
+      </section>
+      <a
+        href={`/memory?ownerId=${encodeURIComponent(`person:${entity.entityId}`)}`}
+      >
+        查看此人的关系与记忆
+      </a>
+
       {sections.map((section) => (
         <SurfaceSection key={section.id} section={section} onTrace={onTrace} />
       ))}

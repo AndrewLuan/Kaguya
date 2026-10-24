@@ -1,8 +1,33 @@
+import { migrateLifecycleConfig } from "@kaguya/config";
 /**
- * MemoryIngestionService 随 Runtime 就绪状态开放，配置切换和关闭先取消并等待在途整理任务。
+ * Memory 图管理通过动态 database.memoryGraph 门面接入 HTTP，数据库重挂载后使用当前实例。
  * 模板管理与配置应用共享写锁，只写本地覆盖，用户需重启加载新模板。
  * 模块配置管理复用 configuration.exclusive，与显式应用共锁；保存不会切换运行实例。
  * 启动和显式热应用分别把 inboundAllowlist 交给 AdapterHost、outboundAllowlist 交给 Runtime 及目标授权服务。
+ * 插件清单在数据库前冻结 Catalog/Kind；预检、运行和失败回滚复用相同快照，真实 fiber 负责模块生命周期。
+ * 功能概述：Server composition root，组合配置、数据库、Runtime、HTTP/Web 与 NapCat 生命周期。
+ * 主要职责：startKaguyaServer 验证 Profile 和模块配置后启动宿主；close 逆序释放资源；
+ * createRuntimeModelSelectionResolver 根据 Profile 批准的 tier 解析 provider/model、思考参数及硬超时；
+ * generationOptionsForTier 仅在该 Provider 明确声明 supportsStructuredOutputs 时启用 schema，
+ * 其他 Provider 使用 json 与 LLM client 的本地业务 schema 校验，不扩大其能力声明。
+ * Memory provider 由共享 composition 从 selected Profile 显式创建，重启/热应用使用相同配置边界。
+ * 代码库关系：Runtime 业务装配统一来自 @kaguya/composition；createMessageCatalog/createMessageComposition 装配消息编写模块；AdapterHost
+ * 启动及显式应用将生效出站 GatewayAllowlist 注入 Runtime，出站恢复领取使用所属配置策略。
+ * 管理适配器；inspectModules 和账本只读端口交给 inspection.ts，配置仅用于秘密脱敏闭包。
+ * 检查服务持有当前数据库的只读文档/向量入口，随运行时应用刷新，未就绪期间不提供检查。
+ * 启动只接受严格 v1 Registry，不自动迁移旧配置；用户须先手动更新配置。
+ * ConfigurationApplication 保留 HTTP/Token/数据库，串行替换完整 Runtime/AdapterHost；
+ * Web、状态与 Inspection 通过动态门面读取当前实例，关闭失败禁止创建第二个活跃宿主。
+ * 输入输出与副作用：连接数据库、监听 HTTP 并启动适配器，失败时释放已创建资源并固定错误分类。
+ * Inspection 仅在 Runtime 可用时注入，不把 settings、凭据或数据库对象放入 HTTP 响应。
+ * Web adapter 将回复交付给持久账本；WebChatHistory 只投影已送达消息，热应用后读取当前数据库。
+ */
+/**
+ * Memory 图管理通过动态 database.memoryGraph 门面接入 HTTP，数据库重挂载后使用当前实例。
+ * 模板管理与配置应用共享写锁，只写本地覆盖，用户需重启加载新模板。
+ * 模块配置管理复用 configuration.exclusive，与显式应用共锁；保存不会切换运行实例。
+ * 启动和显式热应用分别把 inboundAllowlist 交给 AdapterHost、outboundAllowlist 交给 Runtime 及目标授权服务。
+ * 插件清单在数据库前冻结 Catalog/Kind；预检、运行和失败回滚复用相同快照，真实 fiber 负责模块生命周期。
  * 功能概述：Server composition root，组合配置、数据库、Runtime、HTTP/Web 与 NapCat 生命周期。
  * 主要职责：startKaguyaServer 验证 Profile 和模块配置后启动宿主；close 逆序释放资源；
  * createRuntimeModelSelectionResolver 根据 Profile 批准的 tier 解析 provider/model、思考参数及硬超时；
@@ -21,13 +46,10 @@
  * Web adapter 将回复交付给持久账本；WebChatHistory 只投影已送达消息，热应用后读取当前数据库。
  */
 import { ModuleTemplateManagement } from "./module-template-management.js";
-import {
-  MemoryIngestionService,
-  createMemoryIngestionGenerator,
-} from "./memory-ingestion.js";
 import { IdentityPersonaManagement } from "./identity-persona-management.js";
 import { ModuleSettingsManagement } from "./module-settings-management.js";
-import { FEATURE_IDS, FeatureManagement } from "./feature-management.js";
+import { FeatureManagement } from "./feature-management.js";
+import { CordisAssembly } from "@kaguya/composition";
 import { GatewayAllowlist } from "@kaguya/runtime";
 import {
   createInspectionService,
@@ -41,6 +63,8 @@ import {
 import {
   createMessageCatalog,
   createMessageComposition,
+  loadModulePlugins,
+  type ModulePluginSnapshot,
   createMemoryCompositionOptions,
   memoryConfigFromModules,
   type RuntimeModelSelectionResolver,
@@ -53,13 +77,16 @@ import {
   ConfigError,
   ConfigIncompleteError,
   ConfigReviewRequiredError,
+  FileUserConfigManager,
   inspectUserConfigProfile,
   loadModuleInstanceConfigs,
+  loadCordisTree,
+  type CordisPluginTree,
   type UserConfigProfile,
 } from "@kaguya/config";
 import {
   KaguyaDatabase,
-  PostgresMemoryIngestionStore,
+  InformationKindContractConflictError,
   UnsupportedDatabaseSchemaError,
 } from "@kaguya/database";
 import {
@@ -76,7 +103,7 @@ import {
 import {
   KaguyaRuntime,
   RuntimeDatabaseInitializationError,
-  runtimeInformationKindNames,
+  createRuntimeKindRegistry,
 } from "@kaguya/runtime";
 import type { FastifyInstance } from "fastify";
 
@@ -91,7 +118,7 @@ import {
   type ServerConfig,
 } from "./config.js";
 import { createGatewayAuthenticator } from "./gateway-auth.js";
-import { createServerAdapterHost, napCatPlugin } from "./adapter-plugins.js";
+import { createServerAdapterHost } from "./adapter-plugins.js";
 import { createConfigurationManagement } from "./configuration-management.js";
 import { AdapterHost } from "./adapter-host.js";
 import type { RuntimeUnavailableReason } from "@kaguya/platform-adapters";
@@ -162,6 +189,16 @@ export async function startKaguyaServer(
   >;
   let selectedProfile: UserConfigProfile;
   let moduleConfigs: readonly FirstPartyModuleInstanceConfig[];
+  let bootTree: CordisPluginTree;
+  let catalog: ReturnType<typeof createMessageCatalog>;
+  let pluginSnapshot: ModulePluginSnapshot;
+  const pluginSnapshots = new Map<string, ModulePluginSnapshot>();
+  const pluginSnapshotKey = (snapshot: ConfigurationSnapshot) =>
+    JSON.stringify([
+      snapshot.pluginTree,
+      snapshot.moduleConfigs,
+      snapshot.profile.identity,
+    ]);
   let config: ServerConfig;
   try {
     bootstrap =
@@ -171,6 +208,16 @@ export async function startKaguyaServer(
             configRoot: providedConfig.configRoot,
             development: providedConfig.development,
           };
+    const newConfigRoot =
+      (
+        await FileUserConfigManager.inspect({
+          rootDir: bootstrap.configRoot,
+        })
+      ).status === "setup_required";
+    await migrateLifecycleConfig(
+      bootstrap.configRoot,
+      createFirstPartyModuleConfigDefaults("production", workspaceIdentity()),
+    );
     configuration = await createConfigurationManagement(bootstrap.configRoot);
     configurationStatus = await configuration.getRegistryStatus();
     selectedProfile = await configuration.getRuntimeProfile(
@@ -178,28 +225,55 @@ export async function startKaguyaServer(
     );
     moduleConfigs = await loadModuleInstanceConfigs({
       rootDir: bootstrap.configRoot,
+      initialize: newConfigRoot,
       defaults: createFirstPartyModuleConfigDefaults(
         "production",
         workspaceIdentity(),
       ),
+    });
+    bootTree = await loadCordisTree({
+      rootDir: bootstrap.configRoot,
+      modules: createFirstPartyModuleConfigDefaults(
+        "production",
+        workspaceIdentity(),
+      ),
+      initialize: false,
     });
     if (
       moduleConfigs.find((item) => item.definitionId === "adapter.web")
         ?.enabled !== true
     )
       throw new Error("Web adapter plugin must remain enabled");
-    createMessageComposition(undefined, {
-      moduleConfigs,
-      agentIdentity: selectedProfile.identity,
+    catalog = createMessageCatalog(
+      selectedProfile.identity,
+      undefined,
+      moduleConfigs.some(
+        (item) => item.definitionId === "plugin.qq-expression" && item.enabled,
+      ),
+    );
+    pluginSnapshot = await loadModulePlugins({
+      rootDir: bootstrap.configRoot,
+      tree: bootTree,
+      catalog,
+      configs: moduleConfigs,
     });
-    config =
-      providedConfig ??
-      createServerConfig(
-        selectedProfile,
-        bootstrap,
-        undefined,
-        inspectNapCatConfig(moduleConfigs),
-      );
+    catalog = pluginSnapshot.catalog;
+    moduleConfigs = pluginSnapshot.configs;
+    createMessageComposition(undefined, {
+      pluginModelTasks: pluginSnapshot.modelTasks,
+      moduleConfigs,
+      catalog,
+      agentIdentity: selectedProfile.identity,
+      ai: selectedProfile.ai,
+    });
+    config = providedConfig
+      ? { ...providedConfig, napcat: inspectNapCatConfig(moduleConfigs) }
+      : createServerConfig(
+          selectedProfile,
+          bootstrap,
+          undefined,
+          inspectNapCatConfig(moduleConfigs),
+        );
     assertLoopbackHost(config.host);
   } catch (error) {
     rootLogger ??= createLogger({ service: "kaguya" });
@@ -231,6 +305,8 @@ export async function startKaguyaServer(
   const gatewayAuth = createGatewayAuthenticator(config.gatewayToken);
   const httpLogger = createModuleLogger(rootLogger, "server:http");
   let adapterHost = new AdapterHost(rootLogger, config.inboundAllowlist);
+  let assembly: CordisAssembly | undefined;
+  const mounted = new Set<string>();
   let app: FastifyInstance | undefined;
   let webUi: WebUiHandle | undefined;
   let application: ConfigurationApplication | undefined;
@@ -244,43 +320,73 @@ export async function startKaguyaServer(
   let runtime: KaguyaRuntime | undefined;
   let failedRuntime: KaguyaRuntime | undefined;
   let database: KaguyaDatabase | undefined;
-  const memoryIngestion = new MemoryIngestionService(() =>
-    runtime &&
-    database &&
-    memoryConfigFromModules(moduleConfigs).enabled &&
-    memoryConfigFromModules(moduleConfigs).knowledgeEnabled
-      ? {
-          store: new PostgresMemoryIngestionStore(database.sql),
-          generate: createMemoryIngestionGenerator(
-            createRuntimeModelSelectionResolver(selectedProfile),
-          ),
-        }
-      : undefined,
-  );
-
   const close = (): Promise<void> => {
     unregisterShutdown?.();
     shuttingDown = true;
     adapterHost.beginStopping();
     closePromise ??= (async () => {
       await application?.beginShutdown();
-      await memoryIngestion.close();
-      await closeResources({
-        app,
-        webUi,
-        adapterHost,
-        runtime: runtime ?? failedRuntime,
-        database,
-        rootLogger,
-        serverLogger,
-      });
+      if (!assembly) {
+        await closeResources({
+          app,
+          webUi,
+          adapterHost,
+          runtime: runtime ?? failedRuntime,
+          database,
+          rootLogger,
+          serverLogger,
+        });
+        return;
+      }
+      serverLogger.info({ event: "server.stopping" }, "Kaguya server stopping");
+      const failures: unknown[] = [];
+      try {
+        await adapterHost.stop();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await assembly.dispose();
+      } catch (error) {
+        failures.push(error);
+      }
+      const leftovers = await Promise.allSettled([
+        mounted.has("web-ui") ? undefined : webUi?.close(),
+        mounted.has("http") ? undefined : app?.close(),
+        mounted.has("runtime")
+          ? undefined
+          : (runtime ?? failedRuntime)?.close(),
+        mounted.has("adapter") ? undefined : adapterHost.stop(),
+        mounted.has("database") ? undefined : database?.close(),
+        mounted.has("logging") ? undefined : closeLogger(rootLogger),
+      ]);
+      collectFailures(leftovers, failures);
+      if (failures.length)
+        throw new AggregateError(failures, "Kaguya server shutdown failed");
     })();
     return closePromise;
   };
 
   try {
     const effectiveConfig = config;
-    adapterHost = createServerAdapterHost(config, rootLogger);
+    assembly = await CordisAssembly.create(bootTree);
+    await assembly.mount("configuration", [], () => configuration);
+    mounted.add("configuration");
+    await assembly.mount(
+      "logging",
+      ["configuration"],
+      () => rootLogger,
+      closeLogger,
+    );
+    mounted.add("logging");
+    await assembly.mount("catalog", ["logging"], () =>
+      Object.freeze({
+        get definitions() {
+          return catalog.definitions;
+        },
+      }),
+    );
+    mounted.add("catalog");
     const degradationReports: DegradationReport[] = [];
     const degradationReasons: RuntimeUnavailableReason[] = [];
     let resolveModelSelection: RuntimeModelSelectionResolver | undefined;
@@ -297,10 +403,33 @@ export async function startKaguyaServer(
     }
     // Database preflight runs even when AI configuration is incomplete.
     try {
-      database = await connectInformationDatabase(effectiveConfig.databaseUrl);
-      await prepareConfigurationDatabase(database);
+      database = await assembly.mount(
+        "database",
+        ["catalog"],
+        async () => {
+          const connection = await connectInformationDatabase(
+            effectiveConfig.databaseUrl,
+          );
+          try {
+            await prepareConfigurationDatabase(
+              connection,
+              pluginSnapshot.kindRegistry,
+            );
+            return connection;
+          } catch (error) {
+            await connection.close().catch(() => undefined);
+            throw error;
+          }
+        },
+        (connection) => connection.close(),
+      );
+      mounted.add("database");
     } catch (error) {
-      if (error instanceof UnsupportedDatabaseSchemaError) throw error;
+      if (
+        error instanceof UnsupportedDatabaseSchemaError ||
+        error instanceof InformationKindContractConflictError
+      )
+        throw error;
       degradationReports.push({
         reason: "database_unavailable",
         phase: "database",
@@ -308,6 +437,13 @@ export async function startKaguyaServer(
       });
       degradationReasons.push("database_unavailable");
     }
+    adapterHost = await assembly.mount(
+      "adapter",
+      ["logging", "catalog"],
+      () => createServerAdapterHost(config, rootLogger),
+      (host) => host.stop(),
+    );
+    mounted.add("adapter");
     if (
       resolveModelSelection &&
       database &&
@@ -315,20 +451,32 @@ export async function startKaguyaServer(
     ) {
       try {
         runtime = new KaguyaRuntime({
+          kindRegistry: pluginSnapshot.kindRegistry,
+          moduleLifecycle: assembly.moduleLifecycle,
           outboundAllowlist: new GatewayAllowlist(config.outboundAllowlist),
           targetDirectory: adapterHost,
           database,
           logger: rootLogger,
           ...createMessageComposition(resolveModelSelection, {
+            pluginModelTasks: pluginSnapshot.modelTasks,
             ...createMemoryCompositionOptions(
               memoryConfigFromModules(moduleConfigs),
             ),
             moduleConfigs,
+            catalog,
             agentIdentity: selectedProfile.identity,
+            ai: selectedProfile.ai,
           }),
         });
         adapterHost.registerTransports(runtime);
         await startInformationRuntime(runtime);
+        await assembly.mount(
+          "runtime",
+          ["adapter", "catalog", "database"],
+          () => runtime!,
+          (current) => current.close({ drain: true }),
+        );
+        mounted.add("runtime");
       } catch (error) {
         const databaseFailure =
           error instanceof InformationDatabaseConnectionError;
@@ -359,9 +507,11 @@ export async function startKaguyaServer(
     }
     if (!runtime && database) {
       try {
-        await database.close();
+        await assembly.unmount("database");
+        mounted.delete("database");
         database = undefined;
       } catch {
+        mounted.delete("database");
         serverLogger.warn(
           {
             event: "server.degraded.cleanup.failed",
@@ -393,7 +543,9 @@ export async function startKaguyaServer(
     const initialSnapshot: ConfigurationSnapshot = {
       profile: selectedProfile,
       moduleConfigs,
+      pluginTree: bootTree,
     };
+    pluginSnapshots.set(pluginSnapshotKey(initialSnapshot), pluginSnapshot);
     const refreshInspection = () => {
       const activeRuntime = runtime;
       inspection =
@@ -407,7 +559,6 @@ export async function startKaguyaServer(
           : undefined;
     };
     refreshInspection();
-    memoryIngestion.start();
     application = new ConfigurationApplication({
       initial: initialSnapshot,
       initiallyReady: runtime !== undefined,
@@ -417,6 +568,11 @@ export async function startKaguyaServer(
         const profile = await configuration.getRuntimeProfile(
           status.selectedProfileId,
         );
+        const pluginTree = await loadCordisTree({
+          rootDir: bootstrap.configRoot,
+          modules: createFirstPartyModuleConfigDefaults(),
+          initialize: false,
+        });
         const configs = await loadModuleInstanceConfigs({
           rootDir: bootstrap.configRoot,
           defaults: createFirstPartyModuleConfigDefaults(
@@ -424,10 +580,40 @@ export async function startKaguyaServer(
             workspaceIdentity(),
           ),
           initialize: false,
+          treeSnapshot: pluginTree,
         });
-        return { profile, moduleConfigs: configs };
+        return {
+          profile,
+          pluginTree,
+          moduleConfigs: configs.map((item) =>
+            ["memory.native", "adapter.napcat"].includes(item.definitionId)
+              ? (moduleConfigs.find(
+                  (current) => current.instanceId === item.instanceId,
+                ) ?? item)
+              : item,
+          ),
+        };
       },
-      validate: (snapshot) => {
+      validate: async (snapshot) => {
+        const nextPlugins = await loadModulePlugins({
+          rootDir: bootstrap.configRoot,
+          tree: snapshot.pluginTree ?? bootTree,
+          configs: snapshot.moduleConfigs,
+          catalog: createMessageCatalog(
+            snapshot.profile.identity,
+            undefined,
+            snapshot.moduleConfigs.some(
+              (item) =>
+                item.definitionId === "plugin.qq-expression" && item.enabled,
+            ),
+          ),
+        });
+        pluginSnapshots.set(pluginSnapshotKey(snapshot), nextPlugins);
+        if (database)
+          await prepareConfigurationDatabase(
+            database,
+            nextPlugins.kindRegistry,
+          );
         createServerConfig(
           snapshot.profile,
           bootstrap,
@@ -441,25 +627,33 @@ export async function startKaguyaServer(
             ...createMemoryCompositionOptions(
               memoryConfigFromModules(snapshot.moduleConfigs),
             ),
-            moduleConfigs: snapshot.moduleConfigs,
+            moduleConfigs: nextPlugins.configs,
+            catalog: nextPlugins.catalog,
+            pluginModelTasks: nextPlugins.modelTasks,
             agentIdentity: snapshot.profile.identity,
+            ai: snapshot.profile.ai,
           },
         );
       },
       stop: async () => {
-        await memoryIngestion.pause();
         adapterHost.beginStopping();
         inspection = undefined;
         const failures: unknown[] = [];
         try {
-          await (runtime ?? failedRuntime)?.close({ drain: true });
+          await assembly!.unmount("runtime");
+          await assembly!.unmountModules();
+          if (failedRuntime) await failedRuntime.close({ drain: true });
         } catch (error) {
           failures.push(error);
+        } finally {
+          mounted.delete("runtime");
         }
         try {
-          await adapterHost.stop();
+          await assembly!.unmount("adapter");
         } catch (error) {
           failures.push(error);
+        } finally {
+          mounted.delete("adapter");
         }
         if (failures.length) {
           failedRuntime = runtime ?? failedRuntime;
@@ -470,6 +664,9 @@ export async function startKaguyaServer(
         failedRuntime = undefined;
       },
       start: async (snapshot) => {
+        const nextPlugins = pluginSnapshots.get(pluginSnapshotKey(snapshot));
+        if (!nextPlugins)
+          throw new Error("Module plugin snapshot was not prepared");
         const nextConfig = {
           ...config,
           inboundAllowlist: snapshot.profile.runtime!.inboundAllowlist,
@@ -479,12 +676,43 @@ export async function startKaguyaServer(
         const nextHost = createServerAdapterHost(nextConfig, rootLogger);
         nextHost.pauseIngress();
         let nextRuntime: KaguyaRuntime | undefined;
+        let nextHostMounted = false;
+        let nextRuntimeMounted = false;
         try {
           if (!database) {
-            database = await connectInformationDatabase(config.databaseUrl);
-            await prepareConfigurationDatabase(database);
+            database = await assembly!.mount(
+              "database",
+              ["catalog"],
+              async () => {
+                const connection = await connectInformationDatabase(
+                  config.databaseUrl,
+                );
+                try {
+                  await prepareConfigurationDatabase(
+                    connection,
+                    nextPlugins.kindRegistry,
+                  );
+                  return connection;
+                } catch (error) {
+                  await connection.close().catch(() => undefined);
+                  throw error;
+                }
+              },
+              (connection) => connection.close(),
+            );
+            mounted.add("database");
           }
+          await assembly!.mount(
+            "adapter",
+            ["logging", "catalog"],
+            () => nextHost,
+            (host) => host.stop(),
+          );
+          mounted.add("adapter");
+          nextHostMounted = true;
           nextRuntime = new KaguyaRuntime({
+            kindRegistry: nextPlugins.kindRegistry,
+            moduleLifecycle: assembly!.moduleLifecycle,
             outboundAllowlist: new GatewayAllowlist(
               nextConfig.outboundAllowlist,
             ),
@@ -497,8 +725,11 @@ export async function startKaguyaServer(
                 ...createMemoryCompositionOptions(
                   memoryConfigFromModules(snapshot.moduleConfigs),
                 ),
-                moduleConfigs: snapshot.moduleConfigs,
+                moduleConfigs: nextPlugins.configs,
+                catalog: nextPlugins.catalog,
+                pluginModelTasks: nextPlugins.modelTasks,
                 agentIdentity: snapshot.profile.identity,
+                ai: snapshot.profile.ai,
               },
             ),
           });
@@ -514,6 +745,14 @@ export async function startKaguyaServer(
             throw new Error("Adapter startup failed");
           }
           await startInformationRuntime(nextRuntime);
+          await assembly!.mount(
+            "runtime",
+            ["adapter", "catalog", "database"],
+            () => nextRuntime!,
+            (current) => current.close({ drain: true }),
+          );
+          mounted.add("runtime");
+          nextRuntimeMounted = true;
           nextHost.finalizeRuntime(nextRuntime);
           if (shuttingDown) throw new Error("Server is stopping");
           // Publish all pointers together; no request can observe a mixed Runtime/adapter snapshot.
@@ -525,9 +764,10 @@ export async function startKaguyaServer(
           runtime = nextRuntime;
           adapterHost = nextHost;
           selectedProfile = snapshot.profile;
-          moduleConfigs = snapshot.moduleConfigs;
+          moduleConfigs = nextPlugins.configs;
+          pluginSnapshot = nextPlugins;
+          catalog = nextPlugins.catalog;
           refreshInspection();
-          memoryIngestion.start();
           nextHost.resumeIngress();
         } catch {
           nextHost.beginStopping();
@@ -536,9 +776,13 @@ export async function startKaguyaServer(
             inspection = undefined;
           }
           const results = await Promise.allSettled([
-            nextRuntime?.close(),
-            nextHost.stop(),
+            nextRuntimeMounted
+              ? assembly!.unmount("runtime")
+              : nextRuntime?.close(),
+            nextHostMounted ? assembly!.unmount("adapter") : nextHost.stop(),
           ]);
+          if (nextRuntimeMounted) mounted.delete("runtime");
+          if (nextHostMounted) mounted.delete("adapter");
           if (results.some((result) => result.status === "rejected")) {
             failedRuntime = nextRuntime;
             adapterHost = nextHost;
@@ -556,41 +800,6 @@ export async function startKaguyaServer(
       rootDir: bootstrap.configRoot,
       defaults: createFirstPartyModuleConfigDefaults(),
       exclusive: (operation) => configuration.exclusive(operation),
-      activateMemory: async (nextConfigs) => {
-        if (!runtime) throw new Error("Runtime is unavailable");
-        const memory = memoryConfigFromModules(nextConfigs);
-        const composition = createMessageComposition(
-          createRuntimeModelSelectionResolver(selectedProfile),
-          {
-            ...createMemoryCompositionOptions(memory),
-            moduleConfigs: nextConfigs,
-            agentIdentity: selectedProfile.identity,
-          },
-        );
-        await memoryIngestion.pause();
-        try {
-          await runtime.replaceMemoryFeatures({
-            memory: composition.memory,
-            activations: composition.activations,
-            capabilities: composition.capabilities,
-            ...(composition.memoryFeatureState.cognitionIdentity
-              ? {
-                  cognitionIdentity:
-                    composition.memoryFeatureState.cognitionIdentity,
-                }
-              : {}),
-          });
-        } catch (error) {
-          if (!(error instanceof AggregateError)) memoryIngestion.start();
-          throw error;
-        }
-      },
-      activateNapCat: (nextConfigs) => {
-        const napcat = inspectNapCatConfig(nextConfigs);
-        return adapterHost.replaceAdapter(
-          napCatPlugin.create(napcat, adapterHost, rootLogger!),
-        );
-      },
       activeMemory: () => {
         try {
           return (
@@ -614,19 +823,15 @@ export async function startKaguyaServer(
           }
         );
       },
-      committed: (nextConfigs) => {
-        moduleConfigs = nextConfigs;
-        application?.markModulesApplied(nextConfigs, FEATURE_IDS);
-        secretHistory.push({ moduleConfigs: nextConfigs });
-        memoryIngestion.start();
-      },
-      recovered: () => memoryIngestion.start(),
+      committed: (nextConfigs) =>
+        secretHistory.push({ moduleConfigs: nextConfigs }),
     });
     app = await inStartupPhase("http_application", () =>
       createHttpApplication({
         config: effectiveConfig,
         inspection: () => inspection,
-        memoryIngestion,
+        modelRequestMetrics: () => database?.modelRequestMetrics,
+        memoryGraph: () => database?.memoryGraph,
         messageTargets: () => runtime?.messageTargets,
         configurationApplication: application,
         featureManagement,
@@ -639,7 +844,9 @@ export async function startKaguyaServer(
         adapterHost: { status: () => adapterHost.status() },
         configuration,
         moduleTemplates: new ModuleTemplateManagement({
-          catalog: createMessageCatalog(),
+          get catalog() {
+            return catalog;
+          },
           exclusive: (operation) => configuration.exclusive(operation),
         }),
         identityPersona: new IdentityPersonaManagement({
@@ -647,18 +854,58 @@ export async function startKaguyaServer(
         }),
         moduleSettings: new ModuleSettingsManagement({
           rootDir: bootstrap.configRoot,
-          catalog: createMessageCatalog(),
+          get catalog() {
+            return catalog;
+          },
           defaults: createFirstPartyModuleConfigDefaults(),
           exclusive: (operation) => configuration.exclusive(operation),
+          running: (instanceId, definitionId) => {
+            if (definitionId === "adapter.web")
+              return adapterHost
+                .status()
+                .adapters.some(
+                  (item) => item.type === "web" && item.lifecycle === "running",
+                );
+            if (definitionId === "adapter.napcat")
+              return adapterHost
+                .status()
+                .adapters.some(
+                  (item) =>
+                    item.type === "napcat" && item.lifecycle === "running",
+                );
+            return (
+              runtime
+                ?.inspectModules()
+                .some((item) =>
+                  item.bindings.some(
+                    (binding) => binding.instanceId === instanceId,
+                  ),
+                ) ?? false
+            );
+          },
           replaceFeature: (current, next) =>
             featureManagement.replaceUnlocked(current, next),
         }),
         logger: httpLogger,
       }),
     );
+    await assembly.mount(
+      "http",
+      ["configuration", "logging"],
+      () => app!,
+      (current) => current.close(),
+    );
+    mounted.add("http");
     webUi = await inStartupPhase("web_ui", () =>
       registerWebUi(app!, effectiveConfig),
     );
+    await assembly.mount(
+      "web-ui",
+      ["http"],
+      () => webUi!,
+      (current) => current.close(),
+    );
+    mounted.add("web-ui");
     await inStartupPhase("listen", () =>
       app!.listen({
         host: effectiveConfig.host,
@@ -846,14 +1093,20 @@ async function connectInformationDatabase(
 
 async function prepareConfigurationDatabase(
   database: KaguyaDatabase,
+  registry: ReturnType<typeof createRuntimeKindRegistry>,
 ): Promise<void> {
   try {
     await database.prepareSchema();
     await database.information.synchronizeKinds(
-      runtimeInformationKindNames(createMessageCatalog()),
+      registry.definitions().map(({ kind }) => kind),
+      registry.definitions(),
     );
   } catch (error) {
-    if (error instanceof UnsupportedDatabaseSchemaError) throw error;
+    if (
+      error instanceof UnsupportedDatabaseSchemaError ||
+      error instanceof InformationKindContractConflictError
+    )
+      throw error;
     throw new InformationDatabaseConnectionError(error);
   }
 }

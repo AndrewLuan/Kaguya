@@ -167,22 +167,22 @@ async function projectRequest(
       ? await ledger.get(sourceId)
       : undefined;
   const expectedSource =
-    browser.mode === "planner"
-      ? "agent.turn.context.completed"
-      : "agent.message.intent.requested";
+    browser.mode === "light"
+      ? "agent.router.turn.context.completed"
+      : "agent.router.message.intent.requested";
   const validSource =
     source?.kind === expectedSource &&
     uniqueReference(source, "core:context", runtimeContextId)
       ? source
       : undefined;
   const turnId =
-    browser.mode === "planner"
+    browser.mode === "light"
       ? validSource?.informationId
       : validSource
         ? textAt(validSource.payload, "turn.contextInformationId")
         : undefined;
   const turnCandidate =
-    browser.mode === "planner"
+    browser.mode === "light"
       ? validSource
       : turnId &&
           validSource &&
@@ -190,18 +190,18 @@ async function projectRequest(
         ? await ledger.get(turnId)
         : undefined;
   const sourceTurn =
-    browser.mode === "planner"
+    browser.mode === "light"
       ? validSource?.payload
       : field(validSource?.payload, "turn");
   const turn =
-    turnCandidate?.kind === "agent.turn.context.completed" &&
+    turnCandidate?.kind === "agent.router.turn.context.completed" &&
     ["candidateInformationId", "claimInformationId"].every(
       (key) => field(sourceTurn, key) === field(turnCandidate.payload, key),
     )
       ? turnCandidate
       : undefined;
   const authorizationId =
-    browser.mode === "composer"
+    browser.mode === "heavy"
       ? validSource?.references.find(
           (r) => r.relation === "agent:target-authorization",
         )?.informationId
@@ -218,7 +218,7 @@ async function projectRequest(
       ? await ledger.get(authorizationId)
       : undefined;
   const authorization =
-    authorizationCandidate?.kind === "agent.message.target.authorized" &&
+    authorizationCandidate?.kind === "agent.router.message.target.authorized" &&
     uniqueReference(authorizationCandidate, "core:context", runtimeContextId) &&
     sameTarget(
       field(authorizationCandidate.payload, "target"),
@@ -264,7 +264,7 @@ async function projectRequest(
     });
   }
   add(turn, "冻结的入站上下文");
-  add(validSource, browser.mode === "planner" ? "注意力评估" : "消息生成意图");
+  add(validSource, browser.mode === "light" ? "注意力评估" : "消息生成意图");
   add(authorization, "跨会话授权指令");
   add(request, "模型请求", "requested");
   const terminals = await reverse(request, "core:status-of", terminalKinds);
@@ -317,10 +317,10 @@ async function projectRequest(
       "模型请求失败";
   if (status === "cancelled")
     result.reason = textAt(terminal!.payload, "reason") ?? "模型请求已取消";
-  if (browser.mode === "planner") {
+  if (browser.mode === "light") {
     const plans = terminal
       ? await reverse(terminal, "core:uses-context", [
-          "agent.turn.plan.completed",
+          "agent.light.decision.completed",
         ])
       : [];
     const plan = plans.find(
@@ -348,19 +348,21 @@ async function projectRequest(
             : result.action === "silent"
               ? "保持静默"
               : "已记录规划结果";
-      const topic = textAt(plan.payload, "action.composition.topic");
-      const replyAct = textAt(plan.payload, "action.composition.replyAct");
-      const guidance = textAt(plan.payload, "action.composition.guidance");
+      const targetKind = textAt(plan.payload, "action.target.kind");
       result.text =
-        [topic, replyAct, guidance].filter(Boolean).join("\n") || outcomeText;
+        result.action === "message"
+          ? targetKind && targetKind !== "current"
+            ? `交由 Heavy 判断；目标：${targetKind}`
+            : "交由 Heavy 根据原始对话判断"
+          : outcomeText;
       add(plan, "实际规划决定", result.action);
       if (detail && result.action === "message" && validSource && turn) {
         const linked = [
           ...(await reverse(validSource, "core:caused-by", [
-            "agent.message.intent.requested",
+            "agent.router.message.intent.requested",
           ])),
           ...(await reverse(plan, "core:caused-by", [
-            "agent.message.intent.requested",
+            "agent.router.message.intent.requested",
           ])),
         ];
         const intents = [
@@ -385,7 +387,7 @@ async function projectRequest(
             await reverse(intent, "core:caused-by", [requestedKind])
           ).filter(
             (atom) =>
-              field(atom.payload, "taskId") === "agent.message.compose" &&
+              field(atom.payload, "taskId") === "agent.heavy.respond" &&
               field(atom.payload, "sourceInformationId") ===
                 intent.informationId,
           );
@@ -397,7 +399,7 @@ async function projectRequest(
             followed++;
             const projection = await projectRequest(
               ledger,
-              { ...browser, taskId: "agent.message.compose", mode: "composer" },
+              { ...browser, taskId: "agent.heavy.respond", mode: "heavy" },
               downstream,
               true,
             );
@@ -425,8 +427,8 @@ async function projectRequest(
           referencedId: claimId,
           relation: "core:status-of",
           kinds: [
-            "agent.turn.decision.interrupted",
-            "agent.turn.decision.superseded",
+            "agent.router.turn.decision.interrupted",
+            "agent.router.turn.decision.superseded",
           ],
           limit: 2,
         });
@@ -442,6 +444,14 @@ async function projectRequest(
       }
     }
   } else if (terminal?.kind === "core.model.task.completed") {
+    const silent = (
+      await reverse(terminal, "core:caused-by", ["agent.heavy.response.silent"])
+    ).find(
+      (atom) =>
+        validSource &&
+        field(atom.payload, "intentInformationId") ===
+          validSource.informationId,
+    );
     const assistants = await reverse(terminal, "core:caused-by", [
       "core.message.assistant.text",
     ]);
@@ -459,9 +469,17 @@ async function projectRequest(
           field(validSource.payload, "target"),
         ),
     );
+    const output = field(terminal.payload, "output");
     const text = assistant
       ? textAt(assistant.payload, "text")
-      : string(field(terminal.payload, "output"));
+      : (textAt(terminal.payload, "output.text") ??
+        (typeof output === "string" ? output : undefined));
+    if (silent) {
+      result.action = "silent";
+      outcomeText = "Heavy 判断无需回复";
+      result.text = outcomeText;
+      add(silent, outcomeText, "silent");
+    }
     if (text !== undefined) {
       result.text = text;
       outcomeText = assistant
@@ -474,7 +492,7 @@ async function projectRequest(
     if (detail && assistant) {
       const confirmed = (
         await reverse(assistant, "core:caused-by", [
-          "agent.message.content.confirmed",
+          "agent.heavy.message.content.confirmed",
         ])
       ).filter(
         (atom) =>
@@ -543,12 +561,12 @@ async function projectRequest(
         referencedId: candidateId,
         relation: "core:status-of",
         kinds: [
-          "agent.turn.completed",
-          "agent.turn.waiting",
-          "agent.turn.silent",
-          "agent.turn.failed",
-          "agent.turn.superseded",
-          "agent.turn.interrupted",
+          "agent.router.turn.completed",
+          "agent.router.turn.waiting",
+          "agent.router.turn.silent",
+          "agent.router.turn.failed",
+          "agent.router.turn.superseded",
+          "agent.router.turn.interrupted",
         ],
         limit: 21,
       });
@@ -571,9 +589,9 @@ async function projectRequest(
         terminal &&
         terminalCause &&
         trace.some((item) => item.informationId === terminalCause) &&
-        (browser.mode === "composer" || adoptedPlan)
+        (browser.mode === "heavy" || adoptedPlan)
       ) {
-        const turnStatus = terminal.kind.slice("agent.turn.".length);
+        const turnStatus = terminal.kind.slice("agent.router.turn.".length);
         const labels: Record<string, string> = {
           completed: "回合已完成",
           waiting: "回合等待下次检查",

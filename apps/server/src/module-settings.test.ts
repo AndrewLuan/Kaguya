@@ -4,6 +4,12 @@
  * 代码库关系：直接使用 Catalog/Zod、配置文件和 createHttpApplication，不启动运行时。
  * 输入输出与副作用：只写临时目录，无真实消息或配置应用，结束清理所有文件。
  */
+/**
+ * 功能概述：验证模块编辑真正的文件替换、公开投影、并发冲突和 HTTP 认证边界。
+ * 主要职责：临时配置夹具保留隐藏值，竞争相同 revision 必须仅一次成功；非法输入不得落盘。
+ * 代码库关系：直接使用 Catalog/Zod、配置文件和 createHttpApplication，不启动运行时。
+ * 输入输出与副作用：只写临时目录，无真实消息或配置应用，结束清理所有文件。
+ */
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import {
   mkdtemp,
@@ -17,10 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { z } from "@kaguya/schema";
-import {
-  loadModuleInstanceConfigs,
-  writeModuleInstanceConfig,
-} from "@kaguya/config";
+import { loadModuleInstanceConfigs } from "@kaguya/config";
 import { createMessageCatalog } from "@kaguya/composition";
 import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
 import { ModuleSettingsManagement } from "./module-settings-management.js";
@@ -124,7 +127,6 @@ it("projects explicit metadata and atomically rejects stale concurrent replaceme
     reason: { status: 409 },
   });
   expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
-    enabled: false,
     settings: { count: 3, secret: "DO-NOT-EXPOSE" },
   });
 });
@@ -176,87 +178,28 @@ it("first-party editable schemas expose names, constraints and no invented insta
     catalog: createMessageCatalog(),
     exclusive: (op) => op(),
   });
-  const heartbeat = await service.get("agent.heartbeat.short");
-  expect(heartbeat.fields).toContainEqual(
-    expect.objectContaining({
-      key: "maxReplacementAttempts",
-      title: "最大替换次数",
-      maximum: 20,
-      default: 3,
-    }),
-  );
-  const arousal = await service.get("agent.attention.arousal");
-  expect(arousal.fields).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        key: "idleSleepEnabled",
-        title: "全局无消息休眠",
-        default: false,
-      }),
-      expect.objectContaining({
-        key: "idleSleepAfterMs",
-        default: 120_000,
-      }),
-      expect.objectContaining({
-        key: "periodicWakeEveryMs",
-        default: 300_000,
-      }),
-    ]),
-  );
+  const lifecycle = await service.get("agent.lifecycle");
+  expect(lifecycle.fields.map((f) => f.key)).toEqual([
+    "pulse",
+    "activity",
+    "sleep",
+    "observation",
+  ]);
+  expect(lifecycle.fields.map((f) => f.title)).toEqual([
+    "时间节拍",
+    "当前活动",
+    "睡眠与唤醒",
+    "观察调度",
+  ]);
   expect(
-    (await service.get("agent.heartflow.online")).fields.find(
+    (await service.get("agent.router")).fields.find(
       (f) => f.key === "botNames",
     ),
   ).toBeUndefined();
-  expect((await service.get("memory.cognition")).instances).toEqual([
-    expect.objectContaining({
-      enabled: false,
-      instanceId: "memory.cognition.default",
-    }),
-  ]);
-});
-it("hides stored Memory provider keys and preserves them when left blank", async () => {
-  const rootDir = await mkdtemp(join(tmpdir(), "module-memory-secret-"));
-  roots.push(rootDir);
-  const defaults = createFirstPartyModuleConfigDefaults("test").map((config) =>
-    config.definitionId === "memory.index"
-      ? { ...config, settings: { apiKey: "hidden-embedding-key" } }
-      : config,
+  expect((await service.get("memory.native")).fields.map((f) => f.key)).toEqual(
+    ["semanticEmbedding", "languageEmbedding"],
   );
-  await loadModuleInstanceConfigs({ rootDir, defaults, initialize: true });
-  const service = new ModuleSettingsManagement({
-    rootDir,
-    catalog: createMessageCatalog(),
-    defaults,
-    exclusive: (operation) => operation(),
-    replaceFeature: async (_current, next) => {
-      await writeModuleInstanceConfig(
-        rootDir,
-        next.find((config) => config.definitionId === "memory.index")!,
-      );
-    },
-  });
-  const before = await service.get("memory.index");
-  expect(before.fields.find((field) => field.key === "apiKey")?.secret).toBe(
-    true,
-  );
-  expect(JSON.stringify(before)).not.toContain("hidden-embedding-key");
-  await service.replace("memory.index", "memory.index.default", {
-    revision: before.instances[0]!.revision,
-    enabled: false,
-    settings: { apiKey: "" },
-  });
-  const after = await loadModuleInstanceConfigs({
-    rootDir,
-    defaults,
-    initialize: false,
-  });
-  expect(
-    after.find((config) => config.definitionId === "memory.index")?.settings
-      .apiKey,
-  ).toBe("hidden-embedding-key");
 });
-
 it("maps an invalid array element to its public field path", async () => {
   const rootDir = await mkdtemp(join(tmpdir(), "module-array-"));
   roots.push(rootDir);

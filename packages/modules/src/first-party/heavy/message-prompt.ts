@@ -1,0 +1,583 @@
+/**
+ * 原始消息记忆沿用字符预算，不注入 persona 或行为规则。
+ * context_bootstrap 仅统计预算裁剪后实际展示的历史与记忆，不因隐藏证据将新参与者视为熟人。
+ * 嵌套模板的变量与 partial 直接复用模块静态声明，管理保存与运行编译保持同一约束。
+ * 功能概述：将消息意图和冻结 turn 编译为分层 Handlebars Prompt，所有本轮输入拥有相同模板地位；积压时向 Heavy 提供年龄供自然衔接。
+ * 主要职责：createMessagePromptCompiler 预编译模板并返回纯函数；compileMessagePrompt 提供一次性入口；
+ * frozenTurnInputs 核对 turn 身份与目标范围，重建冻结消息；历史与记忆预算函数只限制辅助上下文。
+ * 代码库关系：message-context 选择账本事实，Node 模板加载器提供 HeavyPromptTemplates；场景与积压规则由 scene 模板决定，背景和表达后缀由模块入口独立编译。
+ * 编译结果携带模板源码与变量溯源；scene 只引用模板实际使用的目标或冻结时间事实，不包含尚未追加的上下文后缀。
+ * 输入输出与副作用：意图没有正文，正文从 turn.inputs 读取；每条输入保留引用上下文及成功回执、请求、assistant 的原始溯源且不裁剪，不特殊处理末条。
+ * 缺少冻结 turn 或身份不一致即抛错；不写账本、不调用模型、不创建出站引用标记。
+ */
+/**
+ * 原始消息记忆沿用字符预算，不注入 persona 或行为规则。
+ * context_bootstrap 仅统计预算裁剪后实际展示的历史与记忆，不因隐藏证据将新参与者视为熟人。
+ * 嵌套模板的变量与 partial 直接复用模块静态声明，管理保存与运行编译保持同一约束。
+ * 功能概述：将消息意图和冻结 turn 编译为分层 Handlebars Prompt，所有本轮输入拥有相同模板地位；积压时向 Heavy 提供年龄供自然衔接。
+ * 主要职责：createMessagePromptCompiler 预编译模板并返回纯函数；compileMessagePrompt 提供一次性入口；
+ * frozenTurnInputs 核对 turn 身份与目标范围，重建冻结消息；历史与记忆预算函数只限制辅助上下文。
+ * 代码库关系：message-context 选择账本事实，Node 模板加载器提供 HeavyPromptTemplates；场景与积压规则由 scene 模板决定，背景和表达后缀由模块入口独立编译。
+ * 编译结果携带模板源码与变量溯源；scene 只引用模板实际使用的目标或冻结时间事实，不包含尚未追加的上下文后缀。
+ * 输入输出与副作用：意图没有正文，正文从 turn.inputs 读取；每条输入保留引用上下文及成功回执、请求、assistant 的原始溯源且不裁剪，不特殊处理末条。
+ * 缺少冻结 turn 或身份不一致即抛错；不写账本、不调用模型、不创建出站引用标记。
+ */
+import { contextBootstrapVariable } from "../context-bootstrap.js";
+import { displayPersonName, frozenSpeakerName } from "../person-name.js";
+import {
+  messageTemplateDeclarations,
+  outerVariables,
+} from "../../prompt-declarations.js";
+import type {
+  CompiledPrompt,
+  DeepReadonly,
+  InformationAtom,
+  InformationId,
+  PromptVariable,
+} from "@kaguya/schema";
+
+import {
+  compilePromptTemplateSet,
+  createPromptTemplateRenderer,
+  type CompiledPromptTemplateSet,
+  type RestrictedPromptTemplate,
+} from "../../prompt-template.js";
+import { selectPlatformPromptResource } from "@kaguya/prompt";
+import {
+  assistantTextInformationKind,
+  inboundTextInformationKind,
+  messageIntentRequestedInformationKind,
+  messageIntentRequestedInformationPayloadSchema,
+  turnContextCompletedInformationKind,
+  normalizeTurnBootstrap,
+} from "../information-kinds.js";
+
+import { beforeQuoteCutoff, sameMessageTarget } from "./message-quote.js";
+import { formatZonedInstant } from "../temporal-context.js";
+import { frozenRawContextInformationKind } from "../router/raw-context.js";
+
+export interface AgentIdentity {
+  readonly name: string;
+  readonly aliases: readonly string[];
+  readonly persona: string;
+  readonly timeZone: string;
+}
+
+export interface HeavyPromptTemplates {
+  readonly behavior: string;
+  readonly platformStyles: Readonly<Record<"default" | "qq" | "web", string>>;
+  readonly main: string;
+  readonly scene: string;
+  readonly conversationBackground: string;
+  readonly historyInbound: string;
+  readonly historyAssistant: string;
+  readonly memory: string;
+  readonly bootstrap: string;
+  readonly memoryItem: string;
+}
+
+export const ZH_CN_MESSAGE_PROMPT = Object.freeze({
+  historyMessageLimit: 30,
+  historyCharacterLimit: 12_000,
+  memoryCharacterLimit: 4_000,
+} as const);
+
+export function createMessagePromptCompiler(
+  templates: HeavyPromptTemplates,
+  identity: AgentIdentity,
+): (
+  atoms: readonly DeepReadonly<InformationAtom>[],
+  sourceInformationId: InformationId,
+) => CompiledPrompt {
+  assertAgentIdentity(identity);
+  const nested = compileNested(templates);
+  const sceneVariables = nested.usedVariables("scene");
+  const sceneUsesTurn = [
+    "is_backlog",
+    "oldest_input_age",
+    "newest_input_age",
+  ].some((name) => sceneVariables.has(name));
+  const renderOuter = createPromptTemplateRenderer({
+    kind: "message",
+    templateId: "kaguya.heavy.zh-CN",
+    main: template("heavy", templates.main, outerVariables),
+  });
+  const outerTemplates = renderOuter(emptyVariables(outerVariables)).templates;
+  const allTemplates = [...outerTemplates, ...nested.templates].map(
+    (entry) => ({
+      ...entry,
+    }),
+  );
+
+  return (atoms, sourceInformationId) => {
+    const message = atoms.find(
+      ({ informationId }) => informationId === sourceInformationId,
+    );
+    if (message?.kind !== messageIntentRequestedInformationKind.kind)
+      throw new Error("Message selection must include the current input");
+    const payload = messageIntentRequestedInformationPayloadSchema.parse(
+      message.payload,
+    );
+    const inputs = frozenTurnInputs(atoms, payload);
+    const selfIds = [
+      ...new Set(
+        inputs
+          .map(
+            (input) => (messagePayload(input).source as MessageSource).selfId,
+          )
+          .filter((id): id is string => typeof id === "string"),
+      ),
+    ];
+    if (selfIds.length > 1)
+      throw new Error("Frozen turn self accounts are inconsistent");
+    const turnContext = atoms.find(
+      (atom) => atom.informationId === payload.turn.contextInformationId,
+    );
+    const personNames = (turnContext?.payload as any)?.personNames ?? [];
+    const speakerName = (source: MessageSource) =>
+      frozenSpeakerName(source, personNames);
+    const backlog = (turnContext?.payload as any)?.backlog as {
+      isBacklog: boolean;
+      evaluatedAt: string;
+      oldestInputAgeMs: number;
+      newestInputAgeMs: number;
+    };
+    if (!backlog) throw new Error("Frozen turn requires backlog timing");
+    const bootstrap = normalizeTurnBootstrap(
+      turnContext!.payload as Readonly<Record<string, unknown>>,
+    );
+    const currentTime = formatZonedInstant(
+      backlog.evaluatedAt,
+      identity.timeZone,
+    );
+    const asOf = String(
+      atoms.find(
+        (atom) => atom.informationId === payload.turn.contextInformationId,
+      )!.payload.asOf,
+    );
+    const inputIds = new Set(inputs.map(({ informationId }) => informationId));
+    const memoryInformationIds = new Set(payload.memoryInformationIds);
+    const historyAtoms = atoms.filter(
+      (atom) =>
+        sameMessageTarget(atom.payload.source, payload.target) &&
+        beforeQuoteCutoff(atom, asOf) &&
+        !inputIds.has(atom.informationId) &&
+        !memoryInformationIds.has(atom.informationId) &&
+        (atom.kind === inboundTextInformationKind.kind ||
+          atom.kind === assistantTextInformationKind.kind),
+    );
+    const boundedHistory = fitHistoryBudget(historyAtoms);
+    const memories = renderMemories(
+      nested,
+      payload.memoryInformationIds.map((id) => {
+        const atom = atoms.find((atom) => atom.informationId === id);
+        if (!atom) throw new Error(`Missing selected memory: ${id}`);
+        return atom;
+      }),
+      identity,
+      speakerName,
+    );
+    const raw = atoms.find(
+      (atom) =>
+        atom.kind === frozenRawContextInformationKind.kind &&
+        atom.payload.turnInformationId === turnContext!.informationId,
+    );
+    if (!raw) throw new Error("Heavy requires frozen raw Memory context");
+    const rawSnapshot = frozenRawContextInformationKind.payloadSchema.parse(
+      raw.payload,
+    );
+    const prompt = renderOuter([
+      contextBootstrapVariable(
+        turnContext!,
+        boundedHistory,
+        atoms.filter((atom) =>
+          memories.informationIds.includes(atom.informationId),
+        ),
+      ),
+      variable("persona", identity.persona),
+      variable("behavior_policy", templates.behavior),
+      variable(
+        "platform_style",
+        selectPlatformPromptResource(
+          templates.platformStyles,
+          payload.target.platform,
+        ),
+      ),
+      variable("name", identity.name),
+      variable("aliases", identity.aliases.join("、")),
+      variable(
+        "self_account",
+        selfIds[0] ?? "",
+        inputs.map((input) => input.informationId),
+      ),
+      variable(
+        "scene",
+        nested.render("scene", {
+          is_group: payload.target.destination.kind === "group",
+          is_backlog: backlog.isBacklog,
+          oldest_input_age: formatBacklogAge(backlog.oldestInputAgeMs),
+          newest_input_age: formatBacklogAge(backlog.newestInputAgeMs),
+        }),
+        [
+          ...(sceneVariables.has("is_group") ? [message.informationId] : []),
+          ...(sceneUsesTurn ? [turnContext!.informationId] : []),
+        ],
+      ),
+      variable(
+        "current_time",
+        `${currentTime.local} (${currentTime.timeZone}; ${currentTime.iso})`,
+        [turnContext!.informationId],
+      ),
+      variable("global_context", rawSnapshot.global.text, [raw.informationId]),
+      variable("scope_context", rawSnapshot.currentScope.text, [
+        raw.informationId,
+      ]),
+      variable("memory", memories.content, memories.informationIds),
+      variable(
+        "bootstrap",
+        nested.render("bootstrap", { bootstrap: JSON.stringify(bootstrap) }),
+        [turnContext!.informationId],
+      ),
+    ]);
+    const situation = atoms.find(
+      (a) =>
+        a.kind === "agent.situation.frozen" &&
+        a.payload.turnInformationId === turnContext!.informationId,
+    );
+    const continuity = situation
+      ? JSON.stringify(situation.payload.continuity ?? [])
+      : "";
+    return {
+      ...prompt,
+      templates: allTemplates,
+      ...(situation
+        ? {
+            text: `${prompt.text}\n\n已记录的行动状态与实际结果：\n${continuity}`,
+            variables: [
+              ...prompt.variables,
+              variable("action_records", continuity, [situation.informationId]),
+            ],
+          }
+        : {}),
+    };
+  };
+}
+
+function formatBacklogAge(ageMs: number): string {
+  if (ageMs < 60_000) return `${Math.ceil(ageMs / 1_000)} 秒`;
+  if (ageMs < 3_600_000) return `${Math.ceil(ageMs / 60_000)} 分钟`;
+  if (ageMs < 86_400_000) return `${Math.ceil(ageMs / 3_600_000)} 小时`;
+  return `${Math.ceil(ageMs / 86_400_000)} 天`;
+}
+
+function assertAgentIdentity(identity: AgentIdentity): void {
+  const name = identity.name.trim();
+  if (
+    name.length === 0 ||
+    identity.persona.trim().length === 0 ||
+    identity.aliases.length === 0 ||
+    identity.timeZone.trim().length === 0
+  )
+    throw new Error("Agent identity is incomplete");
+  const aliases = identity.aliases.map((alias) => alias.trim());
+  if (
+    aliases.some((alias) => alias.length === 0 || alias === name) ||
+    new Set(aliases).size !== aliases.length
+  )
+    throw new Error("Agent identity aliases are invalid");
+}
+
+export function compileMessagePrompt(
+  templates: HeavyPromptTemplates,
+  identity: AgentIdentity,
+  atoms: readonly DeepReadonly<InformationAtom>[],
+  sourceInformationId: InformationId,
+): CompiledPrompt {
+  return createMessagePromptCompiler(templates, identity)(
+    atoms,
+    sourceInformationId,
+  );
+}
+export function renderHistoryAtom(
+  atom: DeepReadonly<InformationAtom>,
+  identity: AgentIdentity,
+): string {
+  const context = messageContext(atom, identity);
+  return `[${String(context.occurred_at)}] ${String(context.sender_name)}：${String(context.content)}`;
+}
+
+export function fitHistoryBudget(
+  atoms: readonly DeepReadonly<InformationAtom>[],
+): readonly DeepReadonly<InformationAtom>[] {
+  const newestFirst = [...atoms].sort(compareAtoms).reverse();
+  const kept: DeepReadonly<InformationAtom>[] = [];
+  let characters = 0;
+  for (const atom of newestFirst) {
+    if (kept.length === ZH_CN_MESSAGE_PROMPT.historyMessageLimit) break;
+    if (characters >= ZH_CN_MESSAGE_PROMPT.historyCharacterLimit) break;
+    const cost = Array.from(messagePayload(atom).text).length;
+    kept.push(atom);
+    characters += Math.min(
+      cost,
+      ZH_CN_MESSAGE_PROMPT.historyCharacterLimit - characters,
+    );
+  }
+  return kept.sort(compareAtoms);
+}
+
+export function fitMemoryBudget(
+  atoms: readonly DeepReadonly<InformationAtom>[],
+): readonly DeepReadonly<InformationAtom>[] {
+  const kept: DeepReadonly<InformationAtom>[] = [];
+  let characters = 0;
+  for (const atom of atoms) {
+    if (characters >= ZH_CN_MESSAGE_PROMPT.memoryCharacterLimit) break;
+    kept.push(atom);
+    characters += Math.min(
+      Array.from(memoryText(atom)).length,
+      ZH_CN_MESSAGE_PROMPT.memoryCharacterLimit - characters,
+    );
+  }
+  return kept;
+}
+
+function compileNested(templates: HeavyPromptTemplates) {
+  return compilePromptTemplateSet(
+    messageTemplateDeclarations
+      .filter((d) => d.key !== "main" && d.key !== "conversationBackground")
+      .map((d) => ({ ...d, content: templates[d.key] })),
+  );
+}
+
+function renderMemories(
+  renderer: CompiledPromptTemplateSet,
+  atoms: readonly DeepReadonly<InformationAtom>[],
+  identity: AgentIdentity,
+  speakerName: (source: MessageSource) => string = displayName,
+): { content: string; informationIds: InformationId[] } {
+  let remaining = ZH_CN_MESSAGE_PROMPT.memoryCharacterLimit;
+  const items: { content: string }[] = [];
+  const informationIds: InformationId[] = [];
+  for (const atom of atoms) {
+    if (remaining <= 0) break;
+    const raw = renderMessage(renderer, atom, identity, speakerName);
+    const context = boundRenderedContext(
+      renderer,
+      "memory-item",
+      { content: raw },
+      remaining,
+    );
+    const cost = Array.from(renderer.render("memory-item", context)).length;
+    if (cost > remaining) continue;
+    remaining -= cost;
+    items.push({ content: String(context.content ?? "") });
+    informationIds.push(atom.informationId);
+  }
+  return {
+    content: renderer.render("memory", { items }),
+    informationIds,
+  };
+}
+
+function boundRenderedContext(
+  renderer: CompiledPromptTemplateSet,
+  name: string,
+  context: Record<string, unknown>,
+  maximum: number,
+): Record<string, unknown> {
+  const content = String(context.content ?? "");
+  if (Array.from(renderer.render(name, context)).length <= maximum)
+    return context;
+  const points = Array.from(content);
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = { ...context, content: points.slice(0, middle).join("") };
+    if (Array.from(renderer.render(name, candidate)).length <= maximum)
+      low = middle;
+    else high = middle - 1;
+  }
+  if (low === 0) return { ...context, content: "" };
+  return {
+    ...context,
+    content: `${points.slice(0, Math.max(0, low - 1)).join("")}…`,
+  };
+}
+
+function renderMessage(
+  renderer: CompiledPromptTemplateSet,
+  atom: DeepReadonly<InformationAtom>,
+  identity: AgentIdentity,
+  speakerName: (source: MessageSource) => string = displayName,
+): string {
+  const context = messageContext(atom, identity, speakerName);
+  return renderer.render(
+    context.is_assistant ? "history-assistant" : "history-inbound",
+    context,
+  );
+}
+
+function messageContext(
+  atom: DeepReadonly<InformationAtom>,
+  identity: AgentIdentity,
+  speakerName: (source: MessageSource) => string = displayName,
+): Record<string, unknown> {
+  const payload = messagePayload(atom);
+  const source = payload.source as MessageSource;
+  const occurredAt = formatZonedInstant(atom.occurredAt, identity.timeZone);
+  return {
+    is_assistant: atom.kind === assistantTextInformationKind.kind,
+    occurred_at: occurredAt.local,
+    occurred_at_iso: occurredAt.iso,
+    sender_name:
+      atom.kind === assistantTextInformationKind.kind
+        ? identity.name
+        : speakerName(source),
+    sender_id:
+      atom.kind === assistantTextInformationKind.kind
+        ? (source.selfId ?? "")
+        : source.senderId,
+    platform: source.platform,
+    adapter_id: source.adapterId,
+    destination: destinationLabel(source.destination),
+    message_id: source.platformMessageId,
+    mentions: (source.mentions ?? [])
+      .map((mention: { kind: "all" } | { kind: "user"; id: string }) =>
+        mention.kind === "all" ? "@全体成员" : `@${mention.id}`,
+      )
+      .join("、"),
+    reply_to: source.replyTo?.platformMessageId ?? "",
+    quoted_message: "",
+    content: payload.text,
+    self_account: source.selfId ?? "",
+    name: identity.name,
+  };
+}
+
+function messagePayload(atom: DeepReadonly<InformationAtom>) {
+  if (atom.kind === inboundTextInformationKind.kind)
+    return inboundTextInformationKind.payloadSchema.parse(atom.payload);
+  if (atom.kind === assistantTextInformationKind.kind)
+    return assistantTextInformationKind.payloadSchema.parse(atom.payload);
+  throw new Error(`Unsupported message information kind: ${atom.kind}`);
+}
+
+function memoryText(atom: DeepReadonly<InformationAtom>): string {
+  return messagePayload(atom).text;
+}
+
+type MessageSource = ReturnType<
+  typeof inboundTextInformationKind.payloadSchema.parse
+>["source"];
+
+function destinationLabel(destination: MessageSource["destination"]): string {
+  return destination.kind === "group"
+    ? `群聊 ${destination.groupId}`
+    : destination.kind === "private"
+      ? `私聊 ${destination.userId}`
+      : "网页会话";
+}
+
+function displayName(source: MessageSource): string {
+  return displayPersonName(
+    source.sender?.nickname ?? source.senderId,
+    source.senderId,
+  );
+}
+
+function compareAtoms(
+  left: DeepReadonly<InformationAtom>,
+  right: DeepReadonly<InformationAtom>,
+): number {
+  return (
+    Date.parse(left.occurredAt) - Date.parse(right.occurredAt) ||
+    left.informationId.localeCompare(right.informationId)
+  );
+}
+
+function template(
+  name: string,
+  content: string,
+  allowedVariables: readonly string[],
+  allowedPartials: readonly string[] = [],
+): RestrictedPromptTemplate {
+  return { name, content, allowedVariables, allowedPartials };
+}
+
+function variable(
+  name: string,
+  content: string,
+  informationIds: readonly InformationId[] = [],
+): PromptVariable {
+  return { name, content, informationIds: [...informationIds] };
+}
+
+function emptyVariables(names: readonly string[]): PromptVariable[] {
+  return names.map((name) => variable(name, ""));
+}
+
+/** 将冻结输入恢复为消息视图，不读取 turn.text/source 的旧版末条摘要。 */
+export function frozenTurnInputs(
+  atoms: readonly DeepReadonly<InformationAtom>[],
+  intent: ReturnType<
+    typeof messageIntentRequestedInformationPayloadSchema.parse
+  >,
+): readonly DeepReadonly<InformationAtom>[] {
+  const turn = atoms.find(
+    (atom) => atom.informationId === intent.turn.contextInformationId,
+  );
+  if (turn?.kind !== turnContextCompletedInformationKind.kind)
+    throw new Error("Message selection must include the frozen turn context");
+  const payload = turnContextCompletedInformationKind.payloadSchema.parse(
+    turn.payload,
+  ) as {
+    candidateInformationId: string;
+    claimInformationId: string;
+    inputs: {
+      informationId: string;
+      occurredAt: string;
+      text: string;
+      source: MessageSource;
+    }[];
+  };
+  if (
+    payload.candidateInformationId !== intent.turn.candidateInformationId ||
+    payload.claimInformationId !== intent.turn.claimInformationId
+  )
+    throw new Error("Frozen turn provenance does not match message intent");
+  const seen = new Set<string>();
+  return payload.inputs.map(
+    (input: {
+      informationId: string;
+      occurredAt: string;
+      text: string;
+      source: MessageSource;
+    }) => {
+      if (seen.has(input.informationId))
+        throw new Error("Duplicate frozen turn input");
+      seen.add(input.informationId);
+      const source = input.source;
+      if (
+        source.adapterId !== intent.target.adapterId ||
+        source.platform !== intent.target.platform ||
+        JSON.stringify(source.destination) !==
+          JSON.stringify(intent.target.destination)
+      )
+        throw new Error(
+          "Frozen turn input target does not match message intent",
+        );
+      return {
+        informationId: input.informationId as InformationId,
+        kind: inboundTextInformationKind.kind,
+        occurredAt: input.occurredAt,
+        source: turn.source,
+        payload: inboundTextInformationKind.payloadSchema.parse({
+          text: input.text,
+          source,
+        }),
+        references: [],
+      };
+    },
+  );
+}

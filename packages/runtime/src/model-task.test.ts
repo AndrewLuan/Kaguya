@@ -123,7 +123,6 @@ async function fixture(durable = false) {
   const request = {
     task: {
       taskId: "test.reply",
-      version: "1",
       outputMode: "object" as const,
       outputSchema: z.object({ text: z.string() }).strict(),
       allowedTiers: ["heavy"] as const,
@@ -167,7 +166,6 @@ it("reuses requested identity across instances and canonical key order, with onl
   );
   expect(requested.payload).toMatchObject({
     taskId: "test.reply",
-    version: "1",
     activation: f.request.activation,
     selectionPolicy: { tier: "heavy" },
     resolvedModel: { providerId: "test", modelId: "test-heavy" },
@@ -513,6 +511,51 @@ it("projects the same provider diagnosis to JSON and Pretty logs on replay", asy
   for (const value of [first, failed.payload, projected, pretty])
     expect(JSON.stringify(value)).not.toContain(secret);
   expect(await f.client.execute(f.request)).toEqual(first);
+  expect(f.generate).toHaveBeenCalledTimes(1);
+});
+
+it("reports HTTP 402 as insufficient balance in the failed task and logs", async () => {
+  const f = await fixture();
+  f.generate.mockRejectedValue(
+    new KaguyaLlmError("Model task generation failed", {
+      kind: "non-retryable",
+      stage: "provider-request",
+      cause: new Error(secret),
+      providerFailure: {
+        statusCode: 402,
+        code: "invalid_request_error",
+        reason: "insufficient-balance",
+      },
+    }),
+  );
+  const result = await f.client.execute(f.request);
+  expect(result).toMatchObject({
+    status: "failed",
+    error: {
+      providerFailure: {
+        statusCode: 402,
+        code: "invalid_request_error",
+        reason: "insufficient-balance",
+      },
+    },
+  });
+  const failed = (await f.atoms()).find(
+    (atom) => atom.kind === "core.model.task.failed",
+  )!;
+  if (!modelTaskFailedInformationKind.log.enabled)
+    throw new Error("Model task failure log projection disabled");
+  const projected = modelTaskFailedInformationKind.log.project!(
+    failed as never,
+  );
+  expect(projected).toMatchObject({
+    providerStatusCode: 402,
+    providerFailureReason: "insufficient-balance",
+    providerAction: "检查 Provider 账户余额",
+  });
+  expect(formatPrettyMessage(projected)).toContain(
+    "处理建议=检查 Provider 账户余额",
+  );
+  expect(await f.client.execute(f.request)).toEqual(result);
   expect(f.generate).toHaveBeenCalledTimes(1);
 });
 
@@ -902,7 +945,6 @@ it("returns the persisted winner output without applying a transform again", asy
 
 it.each([
   "task",
-  "version",
   "source",
   "kind",
   "content",
@@ -921,7 +963,6 @@ it.each([
     task: { ...f.request.task, allowedTiers: ["light", "heavy"] as const },
   };
   if (mode === "task") changed.task.taskId = "test.another";
-  if (mode === "version") changed.task.version = "2";
   if (mode === "source")
     changed.sourceInformationId = f.request.contextAtoms[1]!.informationId;
   if (mode === "kind")
@@ -959,4 +1000,49 @@ it.each([
   expect(
     (await f.atoms()).filter((a) => a.kind === "core.model.task.requested"),
   ).toHaveLength(2);
+});
+
+it("persists native input before dispatch and restores the same native return on replay", async () => {
+  const f = await fixture();
+  const messages = [
+    {
+      role: "assistant" as const,
+      content: [
+        {
+          type: "reasoning",
+          text: "provided",
+          providerOptions: { fixture: { signature: "opaque" } },
+        },
+      ],
+    },
+  ];
+  const native = {
+    version: 1 as const,
+    messages,
+    reasoning: [{ type: "reasoning", text: "provided" }],
+    providerMetadata: { fixture: { id: "response" } },
+  };
+  f.generate.mockImplementation(async (actual) => {
+    const requested = (await f.atoms()).find(
+      (a) => a.kind === "core.model.task.requested",
+    )!;
+    expect(requested.payload.messages).toEqual(actual.messages);
+    expect(actual).not.toHaveProperty("prompt");
+    expect(actual.messages[0]).toEqual(messages[0]);
+    return {
+      output: { text: "hello" },
+      native,
+      usage: { totalTokens: 7 },
+      durationMs: 5,
+    };
+  });
+  const request = { ...f.request, messages };
+  const first = await f.client.execute(request);
+  const replayed = await new ModelTaskClient(f.options).execute(request);
+  expect(replayed).toEqual(first);
+  expect(f.generate).toHaveBeenCalledTimes(1);
+  const completed = (await f.atoms()).find(
+    (a) => a.kind === "core.model.task.completed",
+  )!;
+  expect(completed.payload.native).toEqual(native);
 });

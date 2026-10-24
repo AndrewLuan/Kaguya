@@ -6,6 +6,14 @@
  * 输入输出与副作用：消息和记忆正文仅经 shared.contentPreview 生成脱敏、限长的日志字段；
  * coreMemoryTextInformationKind 的正文仍只在原有 debug 等级投影，不改变记忆载荷或写回流程。
  */
+/**
+ * 可选草稿与结构化表情是展示插件扩展点；assistant 保留原目标、回合和来源因果链。
+ * 功能概述：message 领域的 Information schema 与不可变定义，独立维护本领域引用和日志投影。
+ * 主要职责：下列 schema 校验入账载荷，各 kind 声明因果关系、上下文和诊断元数据；无 I/O。
+ * 代码库关系：information-kinds.ts 稳定重导出公共对象；跨领域只复用相邻文件定义，保持 Registry 对象身份。
+ * 输入输出与副作用：消息和记忆正文仅经 shared.contentPreview 生成脱敏、限长的日志字段；
+ * coreMemoryTextInformationKind 的正文仍只在原有 debug 等级投影，不改变记忆载荷或写回流程。
+ */
 import {
   outboundMessageContentSchema,
   outboundExpressionSchema,
@@ -38,57 +46,30 @@ export const messageTargetSchema = z
 
 export type MessageTarget = z.infer<typeof messageTargetSchema>;
 
-const focusInformationIdsSchema = z
-  .array(nonBlankString)
-  .min(1)
-  .max(3)
-  .superRefine((ids, context) => {
-    if (new Set(ids).size !== ids.length)
-      context.addIssue({
-        code: "custom",
-        message: "Composition focusInformationIds must be unique",
-      });
-  });
-
-const messageCompositionShape = {
-  focusInformationIds: focusInformationIdsSchema,
-  topic: z.string().trim().min(1).max(200),
-  replyAct: z.string().trim().min(1).max(120),
-};
-export const messageCompositionSchema = z.union([
-  z
-    .object({
-      ...messageCompositionShape,
-      tone: z.enum(["neutral", "humorous", "teasing"]),
-    })
-    .strict(),
-  z
-    .object({
-      ...messageCompositionShape,
-      tone: z.enum(["neutral", "humorous", "teasing"]),
-      guidance: z.string().trim().min(1).max(500),
-    })
-    .strict(),
-  z.object(messageCompositionShape).strict(),
-  z
-    .object({
-      ...messageCompositionShape,
-      guidance: z.string().trim().min(1).max(500),
-    })
-    .strict(),
-]);
+/** 同一次表达中的独立生成与投递步骤。缺省表示旧版单条消息。 */
+export const speechStepSchema = z
+  .object({
+    intentInformationId: nonBlankString,
+    stepInformationId: nonBlankString,
+    stepIndex: z.int().nonnegative(),
+    completedInformationId: nonBlankString,
+    continuation: nonBlankString.nullable(),
+    readyAt: z.iso.datetime(),
+  })
+  .strict();
+export type SpeechStep = z.infer<typeof speechStepSchema>;
 
 export const inboundTextInformationPayloadSchema = z
   .object({ text: z.string(), source: messageSourceSchema })
   .strict();
 
+const messageIntentShape = {
+  target: messageTargetSchema,
+  turn: turnProvenanceSchema,
+  memoryInformationIds: z.array(nonBlankString),
+};
 export const messageIntentRequestedInformationPayloadSchema = z
-  .object({
-    target: messageTargetSchema,
-    turn: turnProvenanceSchema,
-    memoryInformationIds: z.array(nonBlankString),
-    composition: messageCompositionSchema,
-  })
+  .object(messageIntentShape)
   .strict();
 
 export type MessageIntentRequestedInformationPayload = z.infer<
@@ -124,7 +105,7 @@ export const inboundTextInformationKind = defineInformationKind({
 });
 
 export const messageIntentRequestedInformationKind = defineInformationKind({
-  kind: "agent.message.intent.requested",
+  kind: "agent.router.message.intent.requested",
   displayName: "消息生成意图",
   description:
     "回合规划选择发言后提出的生成请求，固定目标、回合来源和获准记忆；联想模块据此召回记忆，消息合成模块据此选择上下文并生成正文。",
@@ -133,14 +114,14 @@ export const messageIntentRequestedInformationKind = defineInformationKind({
     "agent:target-authorization": {
       required: false,
       multiple: false,
-      targetKinds: ["agent.message.target.authorized"],
+      targetKinds: ["agent.router.message.target.authorized"],
     },
     "core:caused-by": {
       required: true,
       multiple: false,
       targetKinds: [
-        "agent.turn.plan.completed",
-        "agent.message.target.authorized",
+        "agent.light.decision.completed",
+        "agent.router.message.target.authorized",
       ],
     },
     "core:context": {
@@ -152,19 +133,19 @@ export const messageIntentRequestedInformationKind = defineInformationKind({
       required: true,
       multiple: true,
       targetKinds: [
-        "agent.turn.context.completed",
-        "agent.message.target.authorized",
+        "agent.router.turn.context.completed",
+        "agent.router.message.target.authorized",
       ],
     },
     "agent:turn-claim": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.claimed"],
+      targetKinds: ["agent.router.turn.claimed"],
     },
     "agent:turn-candidate": {
       required: true,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate"],
     },
   },
   log: {
@@ -178,6 +159,56 @@ export const messageIntentRequestedInformationKind = defineInformationKind({
         platform: input.target.platform,
       };
     },
+  },
+});
+
+export const heavyResponseSilentInformationKind = defineInformationKind({
+  kind: "agent.heavy.response.silent",
+  displayName: "Heavy 决定静默",
+  description:
+    "Heavy 阅读冻结原始对话后放弃本次发言；Router 据此闭合回合，不产生助手消息或投递。",
+  payloadSchema: z
+    .object({
+      intentInformationId: nonBlankString,
+      turn: turnProvenanceSchema,
+      previousDeliveryInformationId: nonBlankString.optional(),
+    })
+    .strict() as z.ZodType<{
+    intentInformationId: string;
+    turn: z.infer<typeof turnProvenanceSchema>;
+    previousDeliveryInformationId?: string;
+  }>,
+  references: {
+    "core:caused-by": {
+      required: true,
+      multiple: false,
+      targetKinds: ["core.model.task.completed"],
+    },
+    "core:context": {
+      required: true,
+      multiple: false,
+      targetKinds: ["core.runtime.context"],
+    },
+    "core:uses-context": {
+      required: true,
+      multiple: false,
+      targetKinds: ["agent.router.message.intent.requested"],
+    },
+    "agent:turn-claim": {
+      required: true,
+      multiple: false,
+      targetKinds: ["agent.router.turn.claimed"],
+    },
+    "agent:turn-candidate": {
+      required: true,
+      multiple: false,
+      targetKinds: ["agent.heartbeat.candidate"],
+    },
+  },
+  log: {
+    enabled: true,
+    level: "info",
+    project: () => ({ event: "heavy.response", action: "silent" }),
   },
 });
 
@@ -217,37 +248,6 @@ export const filterDecisionInformationKind = defineInformationKind({
   },
 });
 
-export const coreMemoryTextInformationKind = defineInformationKind({
-  kind: "memory.text",
-  displayName: "记忆文本",
-  description:
-    "带显式来源引用的记忆正文，登记后供联想检索及 Prompt 上下文选择使用，来源可沿引用追溯。",
-  payloadSchema: z.object({ text: z.string().trim().min(1) }).strict(),
-  references: {
-    "core:caused-by": {
-      required: true,
-      multiple: false,
-    },
-    "core:context": {
-      required: true,
-      multiple: false,
-      targetKinds: ["core.runtime.context"],
-    },
-    "core:uses-context": {
-      required: true,
-      multiple: true,
-    },
-  },
-  log: {
-    enabled: true,
-    level: "debug",
-    project: ({ payload }) => ({
-      event: "memory.text.registered",
-      ...contentPreview(payload.text),
-    }),
-  },
-});
-
 export const assistantTextInformationKind = defineInformationKind({
   kind: "core.message.assistant.text",
   displayName: "生成的助手消息",
@@ -270,6 +270,7 @@ export const assistantTextInformationKind = defineInformationKind({
       expression: outboundExpressionSchema.optional(),
       originatingModuleInstanceId: nonBlankString,
       turn: turnProvenanceSchema.nullable(),
+      speech: speechStepSchema.optional(),
     })
     .strict() as z.ZodType<{
     text: string;
@@ -277,12 +278,19 @@ export const assistantTextInformationKind = defineInformationKind({
     expression?: OutboundExpression;
     originatingModuleInstanceId: string;
     turn: z.infer<typeof turnProvenanceSchema> | null;
+    speech?: SpeechStep;
   }>,
   references: {
+    "core:uses-context": { required: false, multiple: true },
     "core:caused-by": {
       required: true,
       multiple: false,
-      targetKinds: ["core.model.task.completed", "agent.message.prepared"],
+      targetKinds: [
+        "core.model.task.completed",
+        "agent.heavy.message.prepared",
+        "agent.heavy.message.ready",
+        "core.schedule.one-shot.due",
+      ],
     },
     "core:context": {
       required: true,
@@ -304,27 +312,34 @@ export const assistantTextInformationKind = defineInformationKind({
   },
 });
 
+const deliveryRequestedPayloadSchema = z
+  .object({
+    adapterId: nonBlankString,
+    platform: nonBlankString,
+    destination: platformDestinationSchema,
+    message: outboundMessageContentSchema,
+    turn: turnProvenanceSchema.nullable(),
+    speech: speechStepSchema.optional(),
+  })
+  .strict();
+
 export const deliveryRequestedInformationKind = defineInformationKind({
   kind: "core.delivery.requested",
   displayName: "平台投递请求",
   description:
     "助手正文进入发送阶段时记录明确目标、消息内容和回合来源；Runtime 调用对应适配器并产生成功或失败结果。",
-  payloadSchema: z
-    .object({
-      adapterId: nonBlankString,
-      platform: nonBlankString,
-      destination: platformDestinationSchema,
-      message: outboundMessageContentSchema,
-      turn: turnProvenanceSchema.nullable(),
-    })
-    .strict(),
+  payloadSchema: deliveryRequestedPayloadSchema as z.ZodType<
+    Omit<z.infer<typeof deliveryRequestedPayloadSchema>, "speech"> & {
+      speech?: SpeechStep;
+    }
+  >,
   references: {
     "core:caused-by": {
       required: true,
       multiple: false,
       targetKinds: [
         assistantTextInformationKind.kind,
-        "agent.message.content.confirmed",
+        "agent.heavy.message.content.confirmed",
       ],
     },
     "core:context": {
@@ -335,12 +350,12 @@ export const deliveryRequestedInformationKind = defineInformationKind({
     "agent:turn-claim": {
       required: false,
       multiple: false,
-      targetKinds: ["agent.turn.claimed"],
+      targetKinds: ["agent.router.turn.claimed"],
     },
     "agent:turn-candidate": {
       required: false,
       multiple: false,
-      targetKinds: ["agent.turn.candidate"],
+      targetKinds: ["agent.heartbeat.candidate"],
     },
   },
   log: {
@@ -358,9 +373,9 @@ export const deliveryRequestedInformationKind = defineInformationKind({
   },
 });
 
-/** 独立展示插件的可选草稿入口；未启用插件时 Composer 直接保存 assistant。 */
+/** 独立展示插件的可选草稿入口；未启用插件时 Heavy 直接保存 assistant。 */
 export const messageDraftInformationKind = defineInformationKind({
-  kind: "agent.message.draft",
+  kind: "agent.heavy.message.draft",
   displayName: "消息展示草稿",
   description: "正文生成后的可选展示处理，保持原消息目标、回合与生成来源。",
   payloadSchema: assistantTextInformationKind.payloadSchema,
@@ -379,9 +394,9 @@ export const messageDraftInformationKind = defineInformationKind({
   log: { enabled: false },
 });
 
-/** 可选展示插件的完成入口；Composer 在此之后登记正式 assistant 并执行既有授权。 */
+/** 可选展示插件的完成入口；Heavy 在此之后登记正式 assistant 并执行既有授权。 */
 export const messagePreparedInformationKind = defineInformationKind({
-  kind: "agent.message.prepared",
+  kind: "agent.heavy.message.prepared",
   displayName: "已处理的消息草稿",
   description: "展示插件完成后返回正文与可选素材，不代表已发送。",
   payloadSchema: assistantTextInformationKind.payloadSchema,

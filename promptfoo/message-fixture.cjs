@@ -29,7 +29,7 @@ function messageFixture(texts) {
       },
     }),
   );
-  const turn = make("turn-1", "agent.turn.context.completed", {
+  const turn = make("turn-1", "agent.router.turn.context.completed", {
     candidateInformationId: "candidate-1",
     claimInformationId: "claim-1",
     scopeKey: "eval-scope",
@@ -45,6 +45,15 @@ function messageFixture(texts) {
       },
     })),
     observedThroughInformationId: messages.at(-1).informationId,
+    bootstrap: {
+      version: 2,
+      conversation: { scopeMode: "ephemeral", registration: null },
+      participants: messages.map((message) => ({
+        inputInformationId: message.informationId,
+        ownerId: null,
+        registration: null,
+      })),
+    },
     text: "LEGACY_COPIED_BODY",
     source: messages[0]?.payload.source,
     messageCount: messages.length,
@@ -66,7 +75,7 @@ function messageFixture(texts) {
       thresholdMs: 120000,
     },
   });
-  const intent = make("intent-1", "agent.message.intent.requested", {
+  const intent = make("intent-1", "agent.router.message.intent.requested", {
     target,
     turn: {
       candidateInformationId: "candidate-1",
@@ -74,12 +83,26 @@ function messageFixture(texts) {
       contextInformationId: "turn-1",
     },
     memoryInformationIds: [],
-    composition: {
-      focusInformationIds: [messages[0].informationId],
-      topic: "评测输入",
-      replyAct: "回应输入",
-    },
   });
-  return { atoms: [intent, turn, ...messages], intentId: intent.informationId };
+  const scopeText = messages
+    .map(
+      (message) =>
+        `[未读] ${message.payload.source.senderId}：${message.payload.text}`,
+    )
+    .join("\n");
+  const raw = make("raw-1", "agent.router.memory.context.frozen", {
+    turnInformationId: turn.informationId,
+    global: { text: "", informationIds: [] },
+    currentScope: {
+      text: scopeText,
+      informationIds: messages.map((message) => message.informationId),
+    },
+    overBudget: false,
+    characterCount: scopeText.length,
+  });
+  return {
+    atoms: [intent, turn, raw, ...messages],
+    intentId: intent.informationId,
+  };
 }
 module.exports = { messageFixture };

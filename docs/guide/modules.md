@@ -11,31 +11,29 @@ description: 在网页中调整模块参数、启用状态和 Prompt 模板。
 
 1. 打开“检查 → 模块”，选择目标模块。
 2. 在全局配置中修改参数，按页面显示的范围填写。
-3. 保存后，到“配置生效管理”点击“应用当前配置”。Memory 四项能力的设置和启停会立即生效。
+3. 普通参数或启停变更保存后，到“配置生效管理”点击“应用当前配置”。长期记忆索引和 NapCat 的专用开关及设置仍需要重启。
 
 模块配置属于工作区，切换顶栏 Profile 不会切换这些值。模板的保存与恢复默认需要重启，详见[角色与回复风格](./persona)。
 
 ## 常用模块
 
-**消息编写 `message-composer.default`** — 生成回复正文。`modelTier` 默认 `heavy`，也可以选择 `light`，实际模型在 Profile 中指定。
+**Heavy `heavy.default`** — 生成回复正文，固定使用 Profile 的 `heavy` 档位。
 
-**对话参与 `heartflow.default`** — 管理群聊、私聊频率及等待或静默的判断。
+**Router `router.default`** — 认领并冻结观察后的输入，调用内部 Light 决定发送、等待或静默，并管理 Focus 租约。Light 固定使用 Profile 的 `light` 档位；两个档位可以指向同一实际模型。
 
-**注意力 `attention-arousal.default`** — 控制 @、叫名和持续关注相关设置。
+**Lifecycle `lifecycle.default`** — 统一管理时间节拍、当前活动、睡眠唤醒和观察调度。内部子模块共用状态，不能独立启停。
 
-**短心跳 `heartbeat.default`** — 等待连续输入，处理延期和重新规划的时间。
+Router 与 Lifecycle 的参数见[发言、休眠与等待](./reply-settings)。
 
-以上三个模块的参数见[发言频率与等待](./reply-settings)。
+**统一记忆 `memory.native.default`** — 人物关系、会话属性、自身、经历和表达共用版本化记忆图。按作用域积累 8 条来源或等待 60 秒形成一批，单批最多 24 条。语义与语言 embedding 独立配置，默认关闭。
 
-**表达学习 `memory.expression.default`** — 从聊天中学习并选择表达习惯。`batchSize` 默认 `8`，范围 `2–24`，控制一次学习所需的消息批次大小；调大通常需要积累更多消息。
-
-**联想 `memory.association.default`、身份 `memory.identity.default`、关注 `attention-focus.default`** — 默认无可调 settings，通常保留启用。是否使用实际记忆由 [Memory 开关](./memory)控制。
+**身份 `memory.identity.default`** — 维护人物实体、账号和会话绑定，默认无可调 settings。人物关系与经历在记忆工作台编辑。旧表达、Raw 文档和 Mem0 模块已删除，不再提供配置或查询入口。
 
 ## 启用与停用
 
-`enabled` 决定模块是否参加运行，保存并应用后生效。模块之间存在依赖，不能把关闭任意模块当成关闭单项功能：例如默认消息编写依赖表达模块，关闭表达实例可能使配置无法应用。
+网页中的启停开关写入 `cordis.yml` 的 `disabled`，普通模块经显式应用后生效。页面分别显示期望状态与当前运行状态。模块之间存在依赖，不能把关闭任意模块当成关闭单项功能：统一 Memory 关闭后普通回复仍可工作。应用失败会尝试恢复先前运行的模块集合。
 
-若只想让机器人安静一些，先调整频率或静默模式；若不想使用历史记忆，在概览关闭“原始记忆”。该操作同时关闭事件与 Wiki、向量索引和认知记忆，再次开启原始记忆不会自动开启它们。
+若只想让机器人安静一些，先调整频率或静默模式；若不需要记忆形成与读取，在概览关闭“Memory”。近期事件背景仍会写入并供 Light/Heavy 使用。
 
 ## 保存冲突或应用失败
 
@@ -47,6 +45,6 @@ description: 在网页中调整模块参数、启用状态和 Prompt 模板。
 
 ## 手工编辑文件
 
-配置保存在 `<KAGUYA_CONFIG_ROOT>/modules/<instanceId>/config.json`，每个文件包含 `version`、`instanceId`、`definitionId`、`enabled` 和 `settings`。手工修改前停止服务并备份，完成后重新启动。
+启停配置保存在 `<KAGUYA_CONFIG_ROOT>/cordis.yml`。内置条目保留固定身份，必需服务不可禁用。内置实例参数保存在 `modules/<instanceId>/config.json`，每个文件只包含 `version: 1`、`instanceId`、`definitionId` 和 `settings`；外部包和附加实例直接在插件树中声明 `definitionId` 与 `settings`。修改前备份，完成后显式应用或重启。
 
-首次启动会在整个模块目录缺失时生成默认配置；已有目录不会自动补齐缺失实例或迁移旧结构。升级出错时按[更新与备份](./maintenance)处理。
+新建配置目录会生成默认插件树与实例文件。安装外部模块包后，在树中添加包名和实例即可装载；具体步骤见[信息模块开发](../developers/information-modules)。应用期间入口会短暂暂停，旧实例排空后切换到新模块集合。停用或删除插件不会删除历史消息及 Kind 元数据；直接覆盖已加载的同一路径包代码需要重启进程。

@@ -3,6 +3,11 @@
  * 主要职责：下列 schema 校验入账载荷，各 kind 声明因果关系、上下文和诊断元数据；无 I/O。
  * 代码库关系：information-kinds.ts 稳定重导出公共对象；跨领域只复用相邻文件定义，保持 Registry 对象身份。
  */
+/**
+ * 功能概述：identity 领域的 Information schema 与不可变定义，独立维护本领域引用和日志投影。
+ * 主要职责：下列 schema 校验入账载荷，各 kind 声明因果关系、上下文和诊断元数据；无 I/O。
+ * 代码库关系：information-kinds.ts 稳定重导出公共对象；跨领域只复用相邻文件定义，保持 Registry 对象身份。
+ */
 import { platformDestinationSchema, z } from "@kaguya/schema";
 import { defineInformationKind } from "@kaguya/sdk";
 import { nonBlankString } from "./shared.js";
@@ -23,6 +28,7 @@ const identityTerminalSchema = z
     scopeInformationId: nonBlankString.optional(),
     accountInformationId: nonBlankString.optional(),
     personInformationId: nonBlankString.optional(),
+    initialName: nonBlankString.optional(),
   })
   .strict() as any;
 
@@ -132,8 +138,11 @@ export const platformAccountBindingInformationKind = defineInformationKind({
   description:
     "账号被关联到人物实体时记录绑定事实；后续人物解析据此复用人物身份并保留账号来源。",
   payloadSchema: z
-    .object({ accountId: nonBlankString, personInformationId: nonBlankString })
-    .strict(),
+    .object({
+      accountId: nonBlankString.optional(),
+      personInformationId: nonBlankString,
+    })
+    .strict() as any,
   references: {
     "core:caused-by": { required: true, multiple: false },
     "core:context": {
@@ -158,8 +167,15 @@ export const personEntityInformationKind = defineInformationKind({
   kind: "memory.identity.person.entity",
   displayName: "人物实体",
   description:
-    "身份归一需要建立人物身份时登记关联账号；人物解析和后续上下文以该实体引用表示人物。",
-  payloadSchema: z.object({ accountId: nonBlankString }).strict(),
+    "身份归一时建立人物身份和固定初始称呼；账号只由平台账号实体及绑定引用维护。",
+  payloadSchema: z
+    .object({
+      /** Legacy person atoms may carry the creating account. New atoms use account bindings. */
+      accountId: nonBlankString.optional(),
+      initialName: nonBlankString.optional(),
+      initialNameSource: z.enum(["platform_nickname", "account_id"]).optional(),
+    })
+    .strict() as any,
   references: {
     "core:caused-by": { required: true, multiple: false },
     "core:context": {
@@ -182,7 +198,7 @@ export const personObservedInformationKind = defineInformationKind({
     "处理入站消息时记录账号昵称、群名片和观察时间；下游可追溯当时看到的资料，不将展示名称直接作为稳定身份。",
   payloadSchema: z
     .object({
-      accountId: nonBlankString,
+      accountId: nonBlankString.optional(),
       nickname: nonBlankString.optional(),
       card: nonBlankString.optional(),
       observedAt: nonBlankString,
@@ -246,7 +262,7 @@ export const personContextCompletedInformationKind = defineInformationKind({
   kind: "memory.identity.person.context.completed",
   displayName: "消息身份上下文就绪",
   description:
-    "单条入站消息的身份处理结束后登记状态和实体引用；释放 Heartflow 身份屏障并触发独立原始记忆写回。",
+    "单条入站消息的身份处理结束后登记状态和实体引用；释放 Router 身份屏障并向统一 Memory 提供来源。",
   payloadSchema: identityTerminalSchema,
   references: {
     "core:caused-by": { required: true, multiple: false },

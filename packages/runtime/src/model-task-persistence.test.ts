@@ -13,7 +13,6 @@
  * 沿用 Model Task 的 8 秒预算；settleOnCleanup 立即观察所有执行结果，失败路径释放 provider/gate
  * 并等待每个后台任务后再关闭数据库，afterEach 汇总清理错误而不跳过后续资源。
  */
-import { existsSync } from "node:fs";
 import {
   createPostgresTestingDatabaseScope,
   createTestingDatabase,
@@ -31,7 +30,6 @@ import {
   createRepeatingDeterministicModel,
 } from "@kaguya/llm/testing";
 import { createLogger, closeLogger } from "@kaguya/logger";
-import * as modules from "@kaguya/modules";
 import { z } from "@kaguya/schema";
 import {
   defineInformationKind,
@@ -40,7 +38,6 @@ import {
   type ModuleCapabilityImplementation,
 } from "@kaguya/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import * as runtimeExports from "./index.js";
 import {
   modelTaskInformationKinds,
   runtimeContextInformationKind,
@@ -249,7 +246,6 @@ async function fixture(backend: Backend, provider = model()) {
   let request: ModelTaskRequest<{ text: string }> = {
     task: {
       taskId: "test.extract",
-      version: "1",
       outputMode: "object",
       outputSchema: z.object({ text: z.string() }).strict(),
       allowedTiers: ["heavy"],
@@ -345,7 +341,7 @@ async function assertLedger(f: Fixture, result?: ModelTaskResult<unknown>) {
   expect(requested).toHaveLength(1);
   expect(terminals).toHaveLength(result ? 1 : 0);
   const slots = await f.db.sql.query(
-    "SELECT slot_type, information_id FROM information_commit_slots WHERE namespace IN ('kaguya.model.task.requested.v1', 'kaguya.model.task.result.v1')",
+    "SELECT slot_type, information_id FROM information_commit_slots WHERE namespace IN ('kaguya.model.task.requested', 'kaguya.model.task.result')",
   );
   expect(slots.rows).toEqual(
     expect.arrayContaining([
@@ -364,7 +360,6 @@ async function assertLedger(f: Fixture, result?: ModelTaskResult<unknown>) {
   );
   expect(requested[0]!.payload).toMatchObject({
     taskId: "test.extract",
-    version: "1",
     activation,
     sourceInformationId: f.request.sourceInformationId,
     resolvedModel: { providerId: "test-provider", modelId: "test-heavy" },
@@ -394,15 +389,6 @@ async function assertLedger(f: Fixture, result?: ModelTaskResult<unknown>) {
   }
   return requested[0]!;
 }
-
-it("removes retired reply-only lifecycle files and public compatibility exports", () => {
-  for (const file of ["llm-lifecycle.ts", "llm-lifecycle.test.ts"])
-    expect(existsSync(new URL(file, import.meta.url))).toBe(false);
-  for (const exports of [runtimeExports, modules]) {
-    expect(exports).not.toHaveProperty("llmCompletedInformationPayloadSchema");
-    expect(exports).not.toHaveProperty("LlmLifecycleClient");
-  }
-});
 
 for (const backend of ["PGlite", "PostgreSQL"] as const) {
   describe.skipIf(backend === "PostgreSQL" && !pgUrl)(

@@ -1,7 +1,21 @@
-/** Immediate, revision-checked switches for global Memory and adapter plugins. */
+/**
+ * 功能概述：管理须重启生效的 Memory/NapCat 期望配置，revision 防止并发覆盖。
+ * 主要职责：toggle/updateNapCat/replaceUnlocked 在共享锁内验证、保存或回滚实例设置及插件树开关；
+ * view 区分磁盘期望与当前生命周期。NapCat 采集参数沿用相同验证与 400 配置错误契约。
+ * 代码库关系：管理 API 和配置应用共用此门面，committed 只回报磁盘状态，不启动采集或模型。
+ * 输入输出与副作用：读写私有配置；恢复失败设置 degraded 状态，输出不包含 token。
+ */
+/**
+ * 功能概述：管理须重启生效的 Memory/NapCat 期望配置，revision 防止并发覆盖。
+ * 主要职责：toggle/updateNapCat/replaceUnlocked 在共享锁内验证、保存或回滚实例设置及插件树开关；
+ * view 区分磁盘期望与当前生命周期。NapCat 采集参数沿用相同验证与 400 配置错误契约。
+ * 代码库关系：管理 API 和配置应用共用此门面，committed 只回报磁盘状态，不启动采集或模型。
+ * 输入输出与副作用：读写私有配置；恢复失败设置 degraded 状态，输出不包含 token。
+ */
 import { createHmac, randomBytes } from "node:crypto";
 import {
   loadModuleInstanceConfigs,
+  writeCordisModuleEnabled,
   writeModuleInstanceConfig,
   type ModuleInstanceConfig,
 } from "@kaguya/config";
@@ -11,13 +25,7 @@ import {
   type NapCatSettings,
 } from "./napcat-config.js";
 
-export const FEATURE_IDS = [
-  "memory.writeback",
-  "memory.knowledge",
-  "memory.index",
-  "memory.cognition",
-  "adapter.napcat",
-] as const;
+export const FEATURE_IDS = ["memory.native", "adapter.napcat"] as const;
 export type FeatureId = (typeof FEATURE_IDS)[number];
 
 export interface FeatureStatus {
@@ -48,13 +56,10 @@ export class FeatureManagement {
       rootDir: string;
       defaults: readonly ModuleInstanceConfig[];
       exclusive<T>(operation: () => Promise<T>): Promise<T>;
-      activateMemory(configs: readonly ModuleInstanceConfig[]): Promise<void>;
-      activateNapCat(configs: readonly ModuleInstanceConfig[]): Promise<void>;
       activeMemory(): readonly string[];
       napCatLifecycle():
         { lifecycle: string; connectivity: string } | undefined;
       committed(configs: readonly ModuleInstanceConfig[]): void;
-      recovered(): void;
     },
   ) {}
 
@@ -73,9 +78,6 @@ export class FeatureManagement {
   private view(configs: readonly ModuleInstanceConfig[]): FeatureView {
     const running = new Set(this.options.activeMemory());
     const napcat = this.options.napCatLifecycle();
-    const raw =
-      configs.find((config) => config.definitionId === "memory.writeback")
-        ?.enabled ?? false;
     return {
       revision: this.revision(configs),
       features: FEATURE_IDS.map((id) => {
@@ -88,7 +90,7 @@ export class FeatureManagement {
             : running.has(id)
               ? "running"
               : enabled
-                ? "failed"
+                ? "pending_restart"
                 : "disabled";
         const active =
           id === "adapter.napcat" ? lifecycle === "running" : running.has(id);
@@ -102,10 +104,11 @@ export class FeatureManagement {
             napcat?.connectivity === "retrying"
               ? "retrying"
               : lifecycle,
-          ...(!raw && id.startsWith("memory.") && id !== "memory.writeback"
-            ? { blocker: "memory.writeback" }
-            : {}),
-          ...(this.#degraded ? { blocker: "recovery_failed" } : {}),
+          ...(this.#degraded
+            ? { blocker: "recovery_failed" }
+            : enabled !== active
+              ? { blocker: "restart_required" }
+              : {}),
         };
       }),
     };
@@ -124,25 +127,8 @@ export class FeatureManagement {
       const current = await this.load();
       if (revision !== this.revision(current))
         throw new FeatureManagementError(409, "feature_configuration_changed");
-      const raw = current.find(
-        (config) => config.definitionId === "memory.writeback",
-      )?.enabled;
-      if (
-        enabled &&
-        id.startsWith("memory.") &&
-        id !== "memory.writeback" &&
-        !raw
-      )
-        throw new FeatureManagementError(409, "memory_writeback_required");
       const next = current.map((config) => {
-        if (
-          config.definitionId === id ||
-          (id === "memory.writeback" &&
-            !enabled &&
-            config.definitionId.startsWith("memory.") &&
-            FEATURE_IDS.includes(config.definitionId as FeatureId))
-        )
-          return { ...config, enabled };
+        if (config.definitionId === id) return { ...config, enabled };
         return config;
       });
       await this.replaceUnlocked(current, next);
@@ -157,7 +143,12 @@ export class FeatureManagement {
       const current = await this.load();
       if (revision !== this.revision(current))
         throw new FeatureManagementError(409, "feature_configuration_changed");
-      const parsed = validateNapCatSettings(settings);
+      let parsed: NapCatSettings;
+      try {
+        parsed = validateNapCatSettings(settings);
+      } catch {
+        throw new FeatureManagementError(400, "napcat_configuration_invalid");
+      }
       const next = current.map((config) => {
         if (config.definitionId !== "adapter.napcat") return config;
         const { enabled, ...rest } = parsed;
@@ -199,63 +190,47 @@ export class FeatureManagement {
     } catch {
       throw new FeatureManagementError(400, "napcat_configuration_invalid");
     }
-    const memoryChanged = changed.some((config) =>
-      config.definitionId.startsWith("memory."),
-    );
-    const napcatChanged = changed.some(
-      (config) => config.definitionId === "adapter.napcat",
-    );
-    let appliedMemory = false;
-    let appliedNapCat = false;
-    const written: ModuleInstanceConfig[] = [];
+    const writtenSettings: ModuleInstanceConfig[] = [];
+    const writtenSwitches: ModuleInstanceConfig[] = [];
     try {
-      if (memoryChanged) {
-        await this.options.activateMemory(next);
-        appliedMemory = true;
-      }
-      if (napcatChanged) {
-        await this.options.activateNapCat(next);
-        appliedNapCat = true;
-      }
-      // Dependents are disabled before raw Memory, so a crash never leaves enabled children with raw off.
-      const ordered = [...changed].sort((a, b) =>
-        a.definitionId === "memory.writeback" && !a.enabled
-          ? 1
-          : b.definitionId === "memory.writeback" && !b.enabled
-            ? -1
-            : 0,
-      );
-      for (const config of ordered) {
-        await writeModuleInstanceConfig(this.options.rootDir, config);
-        written.push(
-          current.find((item) => item.instanceId === config.instanceId)!,
-        );
+      for (const config of changed) {
+        const previous = current.find(
+          (item) => item.instanceId === config.instanceId,
+        )!;
+        if (
+          JSON.stringify(config.settings) !== JSON.stringify(previous.settings)
+        ) {
+          await writeModuleInstanceConfig(this.options.rootDir, config);
+          writtenSettings.push(previous);
+        }
+        if (config.enabled !== previous.enabled) {
+          await writeCordisModuleEnabled(
+            this.options.rootDir,
+            this.options.defaults,
+            config.instanceId,
+            config.enabled,
+          );
+          writtenSwitches.push(previous);
+        }
       }
       this.options.committed(next);
       this.#degraded = false;
     } catch (error) {
       const failures: unknown[] = [];
-      for (const config of written.reverse())
+      for (const config of writtenSwitches.reverse())
+        try {
+          await writeCordisModuleEnabled(
+            this.options.rootDir,
+            this.options.defaults,
+            config.instanceId,
+            config.enabled,
+          );
+        } catch (failure) {
+          failures.push(failure);
+        }
+      for (const config of writtenSettings.reverse())
         try {
           await writeModuleInstanceConfig(this.options.rootDir, config);
-        } catch (failure) {
-          failures.push(failure);
-        }
-      if (appliedNapCat)
-        try {
-          await this.options.activateNapCat(current);
-        } catch (failure) {
-          failures.push(failure);
-        }
-      if (appliedMemory)
-        try {
-          await this.options.activateMemory(current);
-        } catch (failure) {
-          failures.push(failure);
-        }
-      if (!failures.length)
-        try {
-          this.options.recovered();
         } catch (failure) {
           failures.push(failure);
         }

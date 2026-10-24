@@ -15,9 +15,9 @@ description: 按用途找到 Kaguya 的设置，并了解保存、应用和重�
 
 **连接 QQ、限定聊天范围** — 设置 NapCat 和双向白名单，见[接入 QQ](./napcat)。
 
-**控制唤醒、休眠和等待** — 在“检查 → 模块”调整 Attention Arousal、Heartflow 和 Heartbeat，见[发言、休眠与等待](./reply-settings)。
+**控制唤醒、休眠和等待** — 在“检查 → 模块”调整 Attention Arousal、Router 和 Heartbeat，见[发言、休眠与等待](./reply-settings)。
 
-**使用历史记忆** — 在“概览”分别开启原始记忆、事件与 Wiki、向量索引和认知记忆，见[记忆配置](./memory)。
+**长期记忆索引** — 在“概览”开启额外的入站原文索引和长期召回，见[记忆配置](./memory)。
 
 **管理模块** — 调整模块参数、模板与启用状态，见[模块配置](./modules)。
 
@@ -30,7 +30,7 @@ description: 按用途找到 Kaguya 的设置，并了解保存、应用和重�
 3. 进入“配置生效管理”，核对所选配置，点击“应用当前配置”。
 4. 确认页面显示已生效；如果提示需要重启，则停止并重新启动 Kaguya。
 
-模型、白名单和普通模块参数可通过显式应用更新。Memory 与 NapCat 的概览开关及其设置保存后立即生效。**名称、人设及其他 Prompt 模板需要重启**；端口、数据库和日志等进程参数也需要重启。
+模型、白名单以及普通模块的参数和启停可通过显式应用更新。Memory 与 NapCat 的专用开关及设置保存后仍需要重启。**名称、人设及其他 Prompt 模板需要重启**；端口、数据库和日志等进程参数也需要重启。
 
 “保存成功”表示内容已写入文件，不代表机器人已经使用新配置。应用失败时查看页面原因，修正后再试。
 
@@ -56,12 +56,14 @@ Profile 可以保存不同的模型、时区和运行设置，例如为测试和
 
 **`profiles/profile_<id>.json`** — 保存该方案的模型、时区和运行参数。初始方案为 `profiles/profile_default.json`；Profile 文件不含版本字段。
 
-**`modules/<instanceId>/config.json`** — 保存工作区模块与适配器的开关和设置，包括 Memory 与 NapCat。
+**`cordis.yml`** — 保存宿主服务、内置及外部模块实例条目；附加实例可直接携带 `definitionId` 和 `settings`。普通模块的变更经显式应用生效，Memory/NapCat 专用开关仍需重启。
+
+**`modules/<instanceId>/config.json`** — 保存工作区模块与适配器的身份及 `settings`，不含启停字段。
 
 **`packages/modules/templates/*.local.hbs`** — 保存本地角色与 Prompt 修改，位于源码目录，不在配置目录中。
 
 配置文件包含模型和平台凭据。备份时同时保留配置目录、本地模板和数据库，方法见[更新与备份](./maintenance)。
 
-## 从旧版配置升级
+## 当前配置格式
 
-旧版 Profile 中的 `version`、`memory`、`platforms`，以及缺少新版 Memory 和适配器实例的模块目录不会自动迁移。启动时会明确报配置错误。先备份配置目录和数据库，再建立无版本字段的 Profile 与完整的新模块配置，在网页重新填写 Memory provider 和 NapCat 连接设置。继续指向原有 PostgreSQL 数据库即可保留原始消息、索引和记忆记录；停用开关不会删除这些数据。
+Profile 不含 `version` 字段。配置根需要完整的宿主服务条目和内置实例文件；外部实例在插件树中声明，无需修改默认列表。格式、Kind 契约或身份不匹配会报告错误。停用或卸载保留历史消息、Kind 元数据和记忆数据。外部包安装步骤见[信息模块开发](../developers/information-modules)。

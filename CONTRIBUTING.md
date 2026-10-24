@@ -111,7 +111,7 @@ pnpm --dir docs --ignore-workspace docs:check
 - **Schema 与 SDK**：校验 Information Atom、Kind definition、payload、引用规则与模块 API。
 - **Engine**：验证 Kind Registry、提交先于广播、同 Kind 消费者并发、因果引用，以及 `consumer.failed` 的隔离和递归保护。
 - **Modules 与 Runtime**：验证过滤 DAG、LLM requested/completed/failed、assistant、delivery requested/delivered/failed、关闭 drain 与 ingress 生命周期。
-- **Database**：普通测试使用 PGlite；`test:postgres` 收集所有读取测试 URL 的真实 PostgreSQL suite，覆盖账本、索引、可靠执行、Memory、one-shot schedule 与 Model Task persistence，并以扫描门禁防止遗漏；不清空应用 schema、容器或数据卷。
+- **Database**：普通测试使用 PGlite；`test:postgres` 收集所有读取测试 URL 的真实 PostgreSQL suite，覆盖账本、索引、可靠执行、Memory、one-shot schedule 与 Model Task persistence，并以扫描门禁防止遗漏；不清空应用 schema、容器或数据卷。当前产品与开发测试的兼容边界见 `docs/developers/testing-compatibility.md`。
 - **Config、Server 与 Web**：验证全局 `selectedProfileId`、Profile management、认证、HTTP 响应、窄 ingress 和 setup mode。
 - **平台适配器与 demo**：验证平台内容正规化、transport receipt 与 PostgreSQL demo。
 
@@ -142,6 +142,8 @@ PostgreSQL 模式迁移位于 `packages/database/src/migrations.ts`，由 `Kaguy
 
 公开 API、Information Kind、模块边界、环境变量、数据库或依赖方向变化时，同一提交更新 README 和相关文档。架构变更更新 `docs/developers/architecture.md`，模块 SDK 变更更新 `docs/developers/information-modules.md`，HTTP/Profile 变更更新 `docs/reference/http-api.md`。文档只陈述当前代码已实现的能力，不把内部设计稿或计划加入公开导航。
 
+Prompt 模板正文由 `docs/developers/prompt-assembly.md` 直接嵌入源码，修改现有 `.hbs` 内容无需复制到文档。新增、删除或重命名模板，或调整 Light/Heavy 的变量来源、装配顺序、追加分支与 Model Task 输出协议时，同一提交更新该页的说明和片段列表，并运行文档检查。
+
 配置校验模块的变更必须同时覆盖正常配置、Registry 读取失败、Profile schema 错误、平台适配器参数错误和敏感字段脱敏。测试日志或错误断言不得包含 API key、access token、数据库 URL 或完整 Profile 正文。
 
 提交前从仓库根目录运行：
@@ -171,4 +173,4 @@ Kaguya 是观察式系统。入站信息先经过廉价过滤，再由快模型�
 
 Heartbeat 在创建阶段防积压：每 scope 通过事务开放槽共享一个 candidate，开放期间的新消息推进账本水位。普通群消息保持稀疏节奏；私聊、@、回复机器人和高显著信号提升当前观察。已经冻结或执行中的模型任务不因新消息重复启动，终态后按最新水位最多安排一次必要的后续观察。
 
-恢复阶段执行一次爬楼：旧积压先合并尚未消费的来源，再冻结一个认领的输入并终结其他 candidate；身份信息迟到时仍复用冻结来源。不得按历史顺序逐个调用模型或发送。冻结上下文记录积压年龄；`staleAfterMs` 是交给 Planner 判断语义时效的分类阈值，不是统一丢弃期限。修改 Heartbeat、Heartflow、Planner 或 Message Composer 时，必须覆盖开放期间来消息、即时唤醒、旧积压与身份屏障恢复、操作重放、迟到结果、快慢模型及最终动作唯一性，并验证在线查询成本不随历史 candidate/claim 数量线性增长。历史规模测试应同时检查结果与查询范围或索引计划，不能仅以少量样本的耗时作为证明。
+恢复阶段执行一次爬楼：旧积压先合并尚未消费的来源，再冻结一个认领的输入并终结其他 candidate；身份信息迟到时仍复用冻结来源。不得按历史顺序逐个调用模型或发送。冻结上下文记录积压年龄；`staleAfterMs` 是交给 Light 判断语义时效的分类阈值，不是统一丢弃期限。修改 Heartbeat、Router、Light 或 Heavy 时，必须覆盖开放期间来消息、即时唤醒、旧积压与身份屏障恢复、操作重放、迟到结果、快慢模型及最终动作唯一性，并验证在线查询成本不随历史 candidate/claim 数量线性增长。历史规模测试应同时检查结果与查询范围或索引计划，不能仅以少量样本的耗时作为证明。

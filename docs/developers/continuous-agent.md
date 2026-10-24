@@ -79,24 +79,26 @@ flowchart LR
 
 **Attention Arousal** — 在读取正文前决定 `observe | defer`。这证明被唤醒与完成观察是两个阶段。
 
-**Heartflow turn context** — 在 `observe` 后按上下水位读取多条未读并冻结完整输入，接近当前实现中的 observation snapshot。
+**Router turn context** — 在 `observe` 后按上下水位读取多条未读并冻结完整输入，接近当前实现中的 observation snapshot。
 
-**Planner 与 Composer** — Planner 面向冻结输入选择 `message | wait | silent`，Composer 只为已经获准的 message 编写正文。收到 Information 与生成消息之间没有逐条直连旁路。
+**Light 与 Heavy** — Light 面向冻结输入选择 `message | wait | silent`，Heavy 只为已经获准的 message 编写正文。收到 Information 与生成消息之间没有逐条直连旁路。
 
 **Memory writeback** — 逐条保存原始 inbound，是证据层行为，不应仅因处理单位为单条消息而被移除。
 
 **Memory cognition** — 当前由每条 writeback 完成触发，再读取同场景最近最多 32 条消息形成有界快照。它没有只读触发消息，但会随每条新消息产生高度重叠的窗口；长期认知应如何形成仍是待讨论设计。
 
-**Knowledge 与 Expression** — Knowledge 已能保存 event、claim 与 episode，但在线消息主要仍先投影为单个 event；Expression 已按多条来源批次学习。它们说明不同 Memory 职责可以选择不同的业务输入单位。
+**Expression** — Expression 按多条来源批次学习，说明派生记忆可以选择与逐条原始消息不同的业务输入单位。
 
 现有实现细节以[运行时架构](./architecture)、[信息模块 SDK](./information-modules)和[Memory 认知层](./memory)为准。本页定义项目故事和设计检查项，不把待讨论方向描述为已经交付的协议。TML Interaction Models、GPT-Live 与 MaiBot 的可借鉴部分和适用边界集中记录在[外部设计参考](./design-references)。
 
 ## 领域设计入口
 
+[情境—行动上下文模型](./situation-model/)独立介绍总背景与当前情境、冻结请求、连续性检查点和近期行动轨迹。它定义跨情境的同一条 Agent 主行动线。Kaguya 与 DSH 通过分别实现和共同样例对齐契约，支持状态见[实现映射](./situation-model/implementations)。
+
 [#241](https://github.com/posanbu/Kaguya/issues/241) 的具体设计见[持续情境、记忆与行动契约](./continuous/)。该设计分别定义观察进度、Memory 形成进度和行动状态，给出冻结输入、经历修订、失败恢复与新信息干预的边界；这些规则仍待实现，当前映射不因文档增加而改变。
 
 ## 术语迁移边界
 
-本轮只调整文档语言，不重命名 `agent.turn.*` Information Kind、Heartbeat、Heartflow、数据库结构或模块配置。旧术语继续精确描述当前接口；新的项目讨论不再用 `session` 或单条“回合”暗示请求—回复模型。
+当前实现使用 `agent.heartbeat.candidate`、`agent.router.turn.*` 与 `agent.light.decision.completed` 记录观察和决策生命周期。Router 合并了原回合编排与 Focus 租约职责；本页的 tick、observation 和 action 仍是领域设计语言，不额外承诺一套新的统一并发协议。
 
 如果后续 Issue 决定调整协议名称，应单独说明兼容、迁移、历史数据和检查界面影响，不能仅做字符串替换。

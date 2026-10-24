@@ -5,19 +5,33 @@ description: Kaguya 统一 Server 的路由、认证、Profile 与消息协议�
 
 # HTTP API
 
+## 记忆图管理
+
+`/api/v1/memory` 下的接口统一要求 Gateway management Bearer Token，并返回 `Cache-Control: no-store`。成功响应使用 `data` 包装；手动写入直接持久化，不触发模型调用。
+
+**图快照** — `GET /api/v1/memory/graph` 支持 `search` 正文子串、重复的 `tags`（全部匹配）、`occurredFrom`（包含）、`occurredBefore`（不包含）、`afterId`、`limit`（1–100，默认 50）和 `focusId`。时间输入需带时区。返回 `nodes`、`edges`、`hasMoreNodes` 和 `hasMoreEdges`，最多包含 100 个节点与 1000 条内部边。`focusId` 限定一跳邻域并优先返回中心节点。
+
+**记忆节点** — `POST /api/v1/memory/nodes` 接受 `metadata` 字典与 `content` 字符串；可指定 UUID `id`，重复 ID 完整替换正文与 metadata。metadata 的 `occurredAt` 必填，`tags` 为字符串数组，其他字段可保存 JSON 值。`GET /api/v1/memory/nodes/:id` 返回单个节点，`PUT /api/v1/memory/nodes/:id` 接受不带 ID 的完整正文与 metadata。`DELETE /api/v1/memory/nodes/:id` 返回 `deleted`，同时级联清理其全部边。
+
+**有向连结** — `POST /api/v1/memory/edges` 接受 `sourceId`、`targetId`、`relation`（默认 `related`）和 `metadata`（默认空字典）。同方向、同类型的连结重复写入时更新 metadata。`DELETE /api/v1/memory/edges` 使用相同请求正文，按两个端点和关系类型精确删除，返回 `deleted`。
+
+**错误** — 输入无效为 400 `invalid_memory_input`；检视或更新的节点不存在为 404 `memory_node_not_found`；连结端点不存在为 409 `memory_endpoint_missing`；数据库未挂载为 503 `memory_unavailable`。其他写入或读取故障为 500 `memory_operation_failed`，响应不回显记忆内容。
+
 ## 模块运行检查
 
 所有检查接口复用 Gateway Bearer 认证，响应使用 `Cache-Control: no-store`，只执行读取。运行时暂不可用返回 503。
 
+**情境工作台** — `GET /api/v1/inspection/situation` 返回 `version: 1`、冻结快照 `frames`、模型行动 `steps` 和 `truncated`。从最近 50 条冻结记录中读取有效快照，并查询最近 60 次 Light/Heavy 请求，并补入最新快照可关联的未完成行动。记录按账本登记顺序读取。响应区分模型终态与投递结果，只返回已保存的可读推理，不返回原生接续消息。运行时没有冻结记录时返回空数组，不写入或重建历史。
+
 **模块声明** — `GET /api/v1/inspection/modules` 返回 Manifest 名称、绑定与可选 `inspection`。其中 `mechanism` 描述机制，`views` 声明稳定视图 ID、Kind 集合及中文字段，`storage` 指定 Memory 或向量库。
 
-**领域记录** — `GET /api/v1/inspection/atoms?definitionId=agent.attention.arousal&view=gates` 先按声明的 Kind 集合过滤，再游标分页。可叠加 `kind`、`source`、`after`、`before`；指定实例时 source 使用当前 binding 的 `module:<instanceId>`。不指定 source 时包含历史来源。游标绑定查询条件，不能跨模块、视图或过滤条件复用。
+**领域记录** — `GET /api/v1/inspection/atoms?definitionId=agent.lifecycle&view=gates` 先按声明的 Kind 集合过滤，再游标分页。可叠加 `kind`、`source`、`after`、`before`；指定实例时 source 使用当前 binding 的 `module:<instanceId>`。不指定 source 时包含历史来源。游标绑定查询条件，不能跨模块、视图或过滤条件复用。
 
 **可读摘要** — Atom 页、详情及 Flow 节点附带 `presentation`：中文标题、明确记录的状态和带中文标签的字段。字段先脱敏再截断；详情 `payload` 保留完整脱敏内容。没有终态不能推断为失败。
 
 **实际存储** — `GET /api/v1/inspection/modules/:definitionId/storage` 仅对声明 storage 的模块开放。支持 `limit`（1–50，默认 20）和 `cursor`，返回 `available`、`items`、`nextCursor`。文档页按 memory ID 排序；向量页按文档、模型、版本与维度排序，不返回向量数值。库为全局共享，不随实例过滤；可选表不存在返回 available=false，数据库故障返回安全错误。
 
-**模型请求目录** — `GET /api/v1/inspection/modules/:definitionId/surfaces/:surfaceId` 对 `model-request-browser` Surface 返回逐次请求摘要。一行对应一条真实的 `core.model.task.requested`，按请求的模块归属与任务 ID 筛选，包含历史实例。支持 `limit`（1–50，默认 20）和绑定查询条件的 `cursor`；有界扫描可能返回空 `items` 与非空 `nextCursor`，此时仍可继续翻页。在线心流与消息组织分别使用 `planner-requests`、`composer-requests`。
+**模型请求目录** — `GET /api/v1/inspection/modules/:definitionId/surfaces/:surfaceId` 对 `model-request-browser` Surface 返回逐次请求摘要。一行对应一条真实的 `core.model.task.requested`，按请求的模块归属与任务 ID 筛选，包含历史实例。支持 `limit`（1–50，默认 20）和绑定查询条件的 `cursor`；有界扫描可能返回空 `items` 与非空 `nextCursor`，此时仍可继续翻页。Router 内部 Light 与 Heavy 分别使用 `light-requests`、`heavy-requests`。
 
 **单次请求详情** — `GET /api/v1/inspection/modules/:definitionId/surfaces/:surfaceId/requests/:requestId` 返回该请求关联的冻结输入或授权发送要求、模型终态、业务结果及来源链。完整 Prompt 来自请求落账时保存的文本，脱敏后返回，不用当前模板重新生成。缺失上下文、缺失 Prompt 和有界查询截断分别显式标记；模型调用完成不代表消息已经投递。
 
@@ -45,11 +59,23 @@ description: Kaguya 统一 Server 的路由、认证、Profile 与消息协议�
 
 **`POST /api/v1/models/discover`** — 需要 Bearer Token，使用请求中的 OpenAI-compatible `baseUrl` 与 `apiKey` 临时读取模型列表；不保存凭据或模型列表。
 
+**`GET /api/v1/metrics/model-requests?window=24h|7d|30d`** — 需要 Bearer Token，按 Model Task 请求时间聚合 light/heavy 调用频率、终态、延迟和 token。响应禁止缓存。
+
 **`POST /api/v1/messages`** — 需要 Bearer Token，校验并把一条 Web 文本消息交给 gateway 后台分发。
 
 **`GET /api/v1/messages`** — 需要 Bearer Token，按 `conversationId` 读取持久化的 Web 私聊消息与成功投递的回复。
 
 生产 SPA fallback 只处理接受 `text/html` 的 GET 页面请求，显式排除 `/api/*` 与 `/healthz`。未知 API 返回结构化 `404 not_found`。
+
+## 模型调用指标
+
+`GET /api/v1/metrics/model-requests` 的 `window` 必填，只接受 `24h`、`7d` 或 `30d`。三个窗口分别使用 1 小时、6 小时和 1 天时间桶。服务端返回确定的 `startedAt`、`endedAt` 与 `bucketDurationMs`，界面再按浏览器本地时区显示时间。
+
+一次调用由 `core.model.task.requested` 计数，并通过 `core:status-of` 关联 completed、failed 或 cancelled 终态。结构化输出的内部重试不会重复增加调用数。没有终态的请求计入 pending；所有已结束请求参与延迟统计。token 只统计终态中真实存在的 usage，`missingCount` 单独报告缺失样本，缺失值不会当作零。
+
+接口兼容 `inputTokens` / `outputTokens` 与旧的 `promptTokens` / `completionTokens`。缺少 `totalTokens` 时，仅在输入和输出均存在时求和。指标覆盖当前账本中的全部 Profile 与 Runtime 实例，只返回聚合值，不返回 Prompt、输出或平台消息。费用固定返回 `unavailable` 和 `pricing-not-configured`，因为当前没有可信的历史价格快照。
+
+未知查询参数、缺失窗口或非法窗口返回 `400 invalid_request`。数据库尚未就绪返回 `503 model_metrics_unavailable`，查询故障返回安全的 `500 internal_error`。
 
 ## Bearer 认证
 
@@ -184,9 +210,9 @@ HTTP 日志不记录 Authorization、body、query 或消息正文。生产部署
 
 以下接口使用 `management` Bearer 认证，响应设置 `Cache-Control: no-store`。实例设置与模板均为全局资源，不带 Profile ID；保存不会调用配置应用或重启。
 
-**读取配置** — `GET /api/v1/modules/:definitionId/settings` 返回公开字段元数据、真实持久化实例的 `enabled`、安全 `settings` 和不透明 `revision`，以及 `scope: global`、`effect: explicit_apply`。读取与替换均以模块 settings schema 为最终校验依据。
+**读取配置** — `GET /api/v1/modules/:definitionId/settings` 返回公开字段元数据、插件树中的期望 `enabled`、当前 `running`、安全 `settings` 和不透明 `revision`，以及 `scope: global`、`effect: explicit_apply | restart_required`。读取与替换均以模块 settings schema 为最终校验依据。
 
-**替换实例** — `PUT /api/v1/modules/:definitionId/instances/:instanceId/settings` 接受完整 `{ revision, enabled, settings }`。`settings` 应包含读取结果中的全部公开字段；隐藏字段由服务端保留，未知字段与只读字段变更被拒绝。字段错误返回 `error.fields`，每项具有 `path` 和固定安全 `message`；数组元素路径如 `names.0` 对应顶级控件。实例版本过期返回 `409 module_configuration_changed`。
+**替换实例** — `PUT /api/v1/modules/:definitionId/instances/:instanceId/settings` 接受完整 `{ revision, enabled, settings }`。启停修改 `cordis.yml`；内置实例设置保存在实例 JSON，附加实例设置保存在树条目内。普通模块的启停与设置由显式应用生效，Memory 与 NapCat 的专用开关及设置仍需重启。`settings` 应包含读取结果中的全部公开字段；隐藏字段由服务端保留，未知字段与只读字段变更被拒绝。字段错误返回 `error.fields`，每项具有 `path` 和固定安全 `message`；数组元素路径如 `names.0` 对应顶级控件。实例版本过期返回 `409 module_configuration_changed`。
 
 **读取模板** — `GET /api/v1/modules/:definitionId/templates` 返回静态模板声明、源码、默认源码、`source: default | local`、组级 `revision` 和 `effect: restart_required`。接口不返回运行时渲染结果。
 

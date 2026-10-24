@@ -11,6 +11,14 @@ Kaguya 将可观测性分成三个命名空间，避免把生命周期、临时�
 - `runtime:module:<definitionId>` 是模块声明的 best-effort 运行诊断。它不持久化，也不能作为业务事实。
 - `runtime:information` 是已提交 Information Atom 经 log outbox 生成的持久事实投影。
 
+## 从账本读取模型指标
+
+工作台的“模型调用”不是另一套埋点。Server 在读取时扫描所选窗口内的 `core.model.task.requested`，再用反向引用索引查找 `core:status-of` 终态。因此请求事实仍是调用频率的唯一基准，一次结构化输出任务即使在 Provider 内部重试，也只占一次调用。
+
+24 小时、7 天和 30 天窗口分别按 1 小时、6 小时和 1 天分桶。归属由请求发生时间决定，终态可以晚于请求。延迟来自所有已有终态；token 仅来自携带 usage 的终态，并同时公开缺失数量。旧的 `promptTokens` / `completionTokens` 字段继续可读，缺少总量时由完整的输入与输出相加。
+
+查询使用 Information Kind/时间索引与 `core:status-of` 反向引用索引，不新增统计表，也不回写账本。返回结果只有 light/heavy 聚合值，不含 Prompt、生成正文、模型凭据或平台消息。当前账本没有可靠的单价快照，费用保持“暂不可用”；未来若提供费用，应在调用终态固化当时价格，避免后来修改配置改变历史含义。
+
 ## 阅读终端日志
 
 Pretty 将时间缩短为本地 `HH:mm:ss`，保留明确的日志级别，并用中文模块标题与摘要突出当前发生的事情。模块输入、领域输出和记忆事件使用独立边框，框内把正文与业务字段分区，事件码／DAG 溯源放在框后。它参考的是 MaiBot 在统一 logger 之外使用的 Rich Panel：让一次模块执行的输入或结果有清楚的阅读边界。普通启动、连接状态和未知插件事件仍按日志行展示；调用方的具体描述与额外字段保留。
@@ -19,7 +27,7 @@ Pretty 将时间缩短为本地 `HH:mm:ss`，保留明确的日志级别，并�
 
 面板只渲染当前记录，不从账本补读正文，也不把并发请求合成一次调用。JSON 保留机器字段名、完整 ID 和引用；下述新增的 debug 查询文本与记忆正文投影也会出现在 JSON 中。Pretty 格式化本身不改变字段、日志级别或已有脱敏规则。
 
-可在仓库根目录运行以下虚构样例，无需启动服务、读取 Profile 或连接数据库。预览固定使用 debug，覆盖 Planner 输入输出、回复、记忆命中／空结果、写入终态、人物事实、表达习惯及模型失败；长中文和 emoji 用于查看边框换行与截断：
+可在仓库根目录运行以下虚构样例，无需启动服务、读取 Profile 或连接数据库。预览固定使用 debug，覆盖 Light 输入输出、回复、原始记忆写入终态、人物事实、表达习惯及模型失败；长中文和 emoji 用于查看边框换行与截断：
 
 ::: code-group
 
@@ -35,13 +43,11 @@ pnpm logs:preview --json
 
 ## 模块输入、输出与记忆框
 
-**Planner 与回复** — `model.task.prompt` 的 debug detail 显示完整输入 Prompt 与变量来源；`turn.plan` 显示实际投影出的动作和原因；`message.assistant` 显示生成的正文预览。模型任务失败另有红色结果框，保留失败阶段、错误分类和尝试次数。生成正文不代表平台已经送达，投递结果仍由 delivery 事件说明。
+**Light 与回复** — `model.task.prompt` 的 debug detail 显示完整输入 Prompt 与变量来源；`turn.plan` 显示实际投影出的动作和原因；`message.assistant` 显示生成的正文预览。模型任务失败另有红色结果框，保留失败阶段、错误分类和尝试次数。生成正文不代表平台已经送达，投递结果仍由 delivery 事件说明。
 
-**记忆联想** — debug 的 `memory.association.query` 显示检索方法、入口、上限及查询文本预览；`memory.association.candidate` 只显示排名、策略、入选原因和 `agent:canonical-source` 引用。候选日志没有命中正文，终端不会为它加载或补造正文。info 的 `memory.association.completed` 汇总命中、空结果或失败及候选数量。
+**记忆运行** — `memory.native` 的运行检查集中显示形成、整理、发布、索引和冻结状态。失败批次保留原因与重试记录。Raw 事件投影独立保存原始证据。
 
-**记忆登记与写入** — debug 的 `memory.text.registered` 显示受限的记忆正文预览。`memory.writeback.terminal` 单独展示 `completed`、`empty` 或 `failed`；原始 writeback 投影只有状态和来源引用，不包含写入正文。这两类框分别对应正文登记与写回终态。
-
-**人物事实与表达习惯** — `person.fact.extracted` 的 info 保留完成摘要，同一 Atom 的 debug detail 显示事实正文预览。debug 的 `memory.expression.learned` 和 `memory.expression.selected` 分别显示学习、选择的数量与状态或原因，并将 `habitSummaries` 逐条列为“情境 → 表达风格”。
+**记忆来源与版本** — 人物事实和表达习惯共用记忆节点与发布记录。检查来源、预期版本及实际发布结果，不从模型响应推断成功。
 
 所有框按对应事件的现有日志级别出现，不使用 MaiBot 的 `show_maisaka_thinking` 开关。查询与记忆正文是新增的 debug 内容投影，先脱敏，再截取最多 168 个 Unicode 码点；`contentLength` 记录原始长度，`contentTruncated` 标明是否截断。
 
@@ -58,18 +64,18 @@ KAGUYA_LOG_LEVELS=runtime:information=trace
 
 ## Prompt 显示
 
-`core.model.task.requested` 的 info 摘要包含 task/version、activation、tier、实际 provider/model、Prompt 字符数和 variable 数。除 `agent.turn.plan` 外，其他任务还包含最多 168 个 Unicode 字符的 `promptPreview`；Planner 的输入内容在 debug 展开。debug detail 额外包含完整 Prompt 以及按模块声明顺序排列的 variable provenance、informationIds 与 digest。Pretty 把它们放入输入框的 Prompt 与来源分区；JSON 把相同数据保存在 `promptFull` 和 `promptVariables` 字段。
+`core.model.task.requested` 的 info 摘要包含 taskId、activation、tier、实际 provider/model、Prompt 字符数和 variable 数。除 `agent.light.decide` 外，其他任务还包含最多 168 个 Unicode 字符的 `promptPreview`；Light 的输入内容在 debug 展开。debug detail 额外包含完整 Prompt 以及按模块声明顺序排列的 variable provenance、informationIds 与 digest。Pretty 把它们放入输入框的 Prompt 与来源分区；JSON 把相同数据保存在 `promptFull` 和 `promptVariables` 字段。
 
 ```dotenv
 # 只展开 Information DAG 和完整 Prompt
 KAGUYA_LOG_LEVELS=runtime:information=debug
 
 # 只展开一个模块的临时诊断
-KAGUYA_LOG_LEVELS=runtime:module:agent.message-composer=debug
+KAGUYA_LOG_LEVELS=runtime:module:agent.heavy=debug
 ```
 
 ::: warning 内容留存
-非 Planner 的 Prompt preview、入站内容和 assistant 预览在 info 可见；完整 Prompt 只在 debug 可见。debug 还包含查询文本、记忆正文、人物事实预览和表达习惯。已识别的凭据赋值、连接 URL 和私钥块仍会被替换。debug 内容会进入终端或 JSON destination，生产启用前必须确认访问权限、留存周期和下游采集策略。
+非 Light 的 Prompt preview、入站内容和 assistant 预览在 info 可见；完整 Prompt 只在 debug 可见。debug 还包含查询文本、记忆正文、人物事实预览和表达习惯。已识别的凭据赋值、连接 URL 和私钥块仍会被替换。debug 内容会进入终端或 JSON destination，生产启用前必须确认访问权限、留存周期和下游采集策略。
 :::
 
 ## 模块诊断边界

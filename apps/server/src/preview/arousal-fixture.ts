@@ -1,7 +1,7 @@
 /** 为正式注意力观察 Surface 提供不含正文的隔离预览账本。 */
 import {
   attentionArousalCompletedInformationKind,
-  attentionArousalModule,
+  createLifecycleModule,
   attentionArousalStateRecordedInformationKind,
   turnCandidateInformationKind,
 } from "@kaguya/modules";
@@ -14,7 +14,7 @@ import {
 import type { KaguyaDatabase } from "@kaguya/database";
 
 export const arousalPreviewModule = inspectionModuleSchema.parse({
-  ...attentionArousalModule.manifest,
+  ...createLifecycleModule({ timeZone: "Asia/Shanghai" }).manifest,
   settingsSchemaFingerprint: "preview",
   selectors: [],
   promptRenderers: [],
@@ -104,7 +104,7 @@ export async function seedArousalPreview(database: KaguyaDatabase) {
     turnCandidateInformationKind.kind,
     attentionArousalStateRecordedInformationKind.kind,
     attentionArousalCompletedInformationKind.kind,
-    "agent.attention.focus.opened",
+    "agent.router.focus.opened",
   ]);
   const append = async (
     informationId: string,
@@ -212,7 +212,7 @@ export async function seedArousalPreview(database: KaguyaDatabase) {
       focusExpiresAt = new Date(Date.parse(occurredAt) + 90_000).toISOString();
       await append(
         focusInformationId,
-        "agent.attention.focus.opened",
+        "agent.router.focus.opened",
         {
           scopeKey,
           generation: id,
