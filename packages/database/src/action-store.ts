@@ -241,19 +241,19 @@ export class PostgresActionStore {
     });
   }
   async invalidateRun(
-    runId: string,
+    runInformationId: string,
     scope: string,
     causeInformationId: string,
   ) {
     await this.transaction(async (tx) => {
       await tx.query(
         "INSERT INTO information_action_runs(run_id,scope) VALUES($1,$2) ON CONFLICT DO NOTHING",
-        [runId, scope],
+        [runInformationId, scope],
       );
       const run = (
         await tx.query<{ scope: string; invalidated_id: string | null }>(
           "SELECT * FROM information_action_runs WHERE run_id=$1 FOR UPDATE",
-          [runId],
+          [runInformationId],
         )
       ).rows[0]!;
       if (run.scope !== scope) throw new Error("run-scope-denied");
@@ -261,21 +261,21 @@ export class PostgresActionStore {
         const fact = await this.fact(
           tx,
           "core.action.run.invalidated.v1",
-          { runId, scope },
-          [runId, causeInformationId],
+          { runInformationId, scope },
+          [runInformationId, causeInformationId],
         );
         await tx.query(
           "UPDATE information_action_runs SET invalidated_id=$2 WHERE run_id=$1",
-          [runId, fact],
+          [runInformationId, fact],
         );
       }
     });
   }
-  async runValidity(runId: string, scope: string) {
+  async runValidity(runInformationId: string, scope: string) {
     const r = (
       await this.db.query<{ scope: string; invalidated_id: string | null }>(
         "SELECT scope,invalidated_id FROM information_action_runs WHERE run_id=$1",
-        [runId],
+        [runInformationId],
       )
     ).rows[0];
     if (r && r.scope !== scope) throw new Error("run-scope-denied");
