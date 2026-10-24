@@ -65,7 +65,11 @@ export function readDom() {
           .trim()
           .slice(0, 4096),
         href: element.tagName === "A" ? element.href : undefined,
-        disabled: !!element.disabled,
+        disabled:
+          !!element.disabled ||
+          element.getAttribute("aria-disabled") === "true" ||
+          !!element.closest("[inert]"),
+        box: { x: box.x, y: box.y, width: box.width, height: box.height },
         visible:
           box.width > 0 &&
           box.height > 0 &&
@@ -96,6 +100,11 @@ export const activateDomFunction = `function(args) {
   if (JSON.stringify(identity) !== JSON.stringify(args.expected)) return {dispatched:false,reason:'stale-observation'};
   const element = args.selector ? document.querySelector(args.selector) : null;
   if (args.action !== 'navigate' && (!element || element.disabled)) return {dispatched:false,reason:'node-unavailable'};
+  if (args.action !== 'navigate') {
+    const current = state.nodes.find(node=>node.selector===args.selector);
+    if (!current?.visible || !current.inViewport || current.disabled || JSON.stringify(current.box)!==JSON.stringify(args.expectedBox)) return {dispatched:false,reason:'node-actionability-changed'};
+    if (args.action==='fill' && element.readOnly) return {dispatched:false,reason:'read-only-control'};
+  }
   // 隔离 world 的 Date 不受页面脚本覆盖；此后无 await 或后台输入任务。
   if (Date.now() >= args.deadline) return {dispatched:false,reason:'permit-expired'};
   if (args.action === 'navigate') {

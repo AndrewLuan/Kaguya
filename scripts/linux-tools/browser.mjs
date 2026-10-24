@@ -101,6 +101,61 @@ export class BrowserComponent {
       }
     }
     this.initialTargetId = page.targetId;
+    await this.bootstrapNavigate(page, "chrome://sandbox");
+    const sandboxDeadline = Date.now() + 5000;
+    while (true) {
+      const current = await this.page();
+      const state = await this.state(current);
+      this.sandbox = state.text;
+      if (/You are adequately sandboxed\./.test(this.sandbox)) break;
+      if (Date.now() >= sandboxDeadline)
+        throw new Error("chromium-sandbox-unconfirmed:" + this.sandbox);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    for (const check of [
+      /Layer 1 Sandbox\s+Namespace/,
+      /PID namespaces\s+Yes/,
+      /Network namespaces\s+Yes/,
+      /Seccomp-BPF sandbox\s+Yes/,
+      /Seccomp-BPF sandbox supports TSYNC\s+Yes/,
+    ]) {
+      if (!check.test(this.sandbox))
+        throw new Error("chromium-sandbox-unconfirmed:" + this.sandbox);
+    }
+    await this.bootstrapNavigate(await this.page(), "about:blank");
+  }
+
+  async bootstrapNavigate(page, url) {
+    // 只在组件发布 ready 之前使用固定内部地址；模型不能调用此入口。
+    let timer;
+    const loaded = new Promise((resolve, reject) => {
+      const event = (message) => {
+        if (
+          message.method === "Page.loadEventFired" &&
+          message.sessionId === page.sessionId
+        ) {
+          cleanup();
+          resolve();
+        }
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.connection.off("event", event);
+      };
+      this.connection.on("event", event);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("bootstrap-navigation-timeout"));
+      }, 10000);
+    });
+    await Promise.all([
+      loaded,
+      this.connection.send(
+        "Page.navigate",
+        { url },
+        { sessionId: page.sessionId },
+      ),
+    ]);
   }
 
   async page(permit) {
@@ -241,8 +296,14 @@ export class BrowserComponent {
       throw new Error("invalid-browser-arguments");
     if (req.toolName === "browser.observe") return this.observe(req, permit);
     const record = this.current(req);
-    if (req.toolName === "browser.act") return this.act(req, record, permit);
-    return this.verify(req, record, permit);
+    const observedPermit = this.gate.permit(
+      new Date(
+        Math.min(record.expires, Date.parse(req.permit.expiresAt)),
+      ).toISOString(),
+    );
+    if (req.toolName === "browser.act")
+      return this.act(req, record, observedPermit);
+    return this.verify(req, record, observedPermit);
   }
 
   async observe(req, permit) {
@@ -325,6 +386,8 @@ export class BrowserComponent {
       operationId: req.operationId,
       attemptId: req.attemptId,
       frameId: page.frameId,
+      controlEpoch: this.gate.epoch,
+      deadline: Math.min(record.expires, Date.parse(req.permit.expiresAt)),
     };
     const result = await permit.send(() =>
       this.connection.send(
@@ -337,10 +400,14 @@ export class BrowserComponent {
               value: {
                 action: args.action,
                 selector: node?.selector,
+                expectedBox: node?.box,
                 value: args.value,
                 url: args.url,
                 expected: record.expected,
-                deadline: Date.parse(req.permit.expiresAt),
+                deadline: Math.min(
+                  record.expires,
+                  Date.parse(req.permit.expiresAt),
+                ),
               },
             },
           ],
@@ -426,7 +493,13 @@ export class BrowserComponent {
     } else if (method === "Browser.downloadWillBegin") {
       if (!uuid.test(params.guid)) return;
       const source =
-        this.lastInput?.frameId === params.frameId ? this.lastInput : undefined;
+        this.lastInput?.frameId === params.frameId &&
+        this.service.mode === "automation" &&
+        this.service.generation === this.lastInput.generation &&
+        this.gate.epoch === this.lastInput.controlEpoch &&
+        Date.now() < this.lastInput.deadline
+          ? this.lastInput
+          : undefined;
       const reportedMime = this.responses.get(params.url);
       const mime = [
         "image/png",
@@ -587,6 +660,7 @@ export class BrowserComponent {
 
   async isolate() {
     this.observations.clear();
+    this.lastInput = undefined;
     await this.gate.isolate();
     await this.connection.drain();
     return true;
@@ -601,6 +675,12 @@ export class BrowserComponent {
       connectionId: this.connection?.id,
       ownerPid: this.connection?.process.pid,
       version: this.version?.product,
+      sandbox: this.sandbox,
+      pending: this.connection
+        ? [...this.connection.pending.values()].map(
+            ({ method, sessionId }) => ({ method, sessionId }),
+          )
+        : [],
     };
   }
 }

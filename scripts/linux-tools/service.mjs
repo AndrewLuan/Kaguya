@@ -59,6 +59,11 @@ export class ToolService {
         helperProtocolVersion: 1,
         ready: !this.closed,
         generation: this.generation,
+        mode: this.mode,
+        serviceInstanceId: this.instanceId,
+        executors: this.components.map(
+          (component) => component.identity?.() ?? { kind: "component" },
+        ),
         capabilities: this.components.flatMap(
           (component) => component.capabilities ?? [],
         ),

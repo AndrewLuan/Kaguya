@@ -20,21 +20,39 @@ test("handoff waits for an actual browser response and permanently fences delaye
   const gate = new BrowserInputGate({ now: () => 0 });
   const active = gate.permit(new Date(1000).toISOString());
   const delayed = gate.permit(new Date(1000).toISOString());
-  const sent = active.send(() => response.promise);
-  let acknowledged = false;
+  let acknowledged = false,
+    browserResponded = false;
+  const sent = active.send(() =>
+    response.promise.then((value) => {
+      browserResponded = true;
+      return value;
+    }),
+  );
   const isolation = gate.isolate().then(() => {
+    assert.equal(
+      browserResponded,
+      true,
+      "ACK preceded the real browser response",
+    );
     acknowledged = true;
   });
-  await Promise.resolve();
-  assert.equal(acknowledged, false);
-  assert.throws(
-    () => delayed.send(() => assert.fail("old preparation sent input")),
-    /fenced/,
-  );
-  response.resolve("browser-response");
-  assert.equal(await sent, "browser-response");
-  await isolation;
-  assert.equal(acknowledged, true);
+  void isolation.catch(() => {});
+  try {
+    // 事件循环屏障让错误的空排空实现有机会发 ACK；不等待任何固定时长。
+    await new Promise(setImmediate);
+    assert.equal(acknowledged, false);
+    assert.throws(
+      () => delayed.send(() => assert.fail("old preparation sent input")),
+      /fenced/,
+    );
+    response.resolve("browser-response");
+    assert.equal(await sent, "browser-response");
+    await isolation;
+    assert.equal(acknowledged, true);
+  } finally {
+    response.resolve("cleanup");
+    await Promise.allSettled([sent, isolation]);
+  }
 });
 
 test("deadline is checked after preparation without relying on a timer callback", async () => {

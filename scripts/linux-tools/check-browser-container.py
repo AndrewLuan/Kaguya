@@ -15,6 +15,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'linux-environments'))
 from broker import Broker, PodmanBackend, digest
+from browser_checks import check_browser
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--archive', required=True)
@@ -69,8 +70,7 @@ with tempfile.TemporaryDirectory() as root:
         result = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60, diagnostics=True)
         selected_profile = backend.chromium_profile()
         print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'sandboxPolicy': internal['sandboxPolicy'], 'seccompProfile': selected_profile.name, 'seccompSha256': hashlib.sha256(selected_profile.read_bytes()).hexdigest(), 'browser': json.loads(result)}), flush=True)
-        provider = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/check-browser.mjs', timeout=120, diagnostics=True)
-        print(provider.decode(), flush=True)
+        check_browser(broker, key, command)
     except BaseException:
         for internal in broker.environments.values():
             try:
