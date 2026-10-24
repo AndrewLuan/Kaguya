@@ -227,6 +227,28 @@ class BrokerTest(unittest.TestCase):
         self.assertIn("--cap-drop=ALL", args)
         self.assertIn("--security-opt=no-new-privileges", args)
 
+    def test_chromium_profile_is_explicit_and_keeps_outer_isolation(self):
+        backend = PodmanBackend()
+        calls = []
+        def command(*args, **_kwargs):
+            calls.append(args)
+            return b'[{"State":{"Running":true}}]' if args[0] == "inspect" else b""
+        with patch.object(backend, "command", side_effect=command), patch.object(backend, "launch"), patch.object(backend, "collect", return_value={"helperProtocolVersion": 1, "ready": True, "generation": 0}):
+            backend.create({**self.env, "container": "controlled", "network": "none", "sandboxPolicy": "chromium-v1"})
+        args = calls[0]
+        profile_arg = next(a for a in args if a.startswith("--security-opt=seccomp="))
+        profile = json.loads(Path(profile_arg.split("=", 2)[2]).read_text())
+        self.assertEqual(profile["defaultAction"], "SCMP_ACT_ERRNO")
+        self.assertEqual([r for r in profile["syscalls"] if "chroot" in r["names"]], [{
+            "names": ["chroot"], "action": "SCMP_ACT_ALLOW", "args": [],
+            "comment": "Chromium sandbox chroot inside its own user namespace; outer container capabilities remain empty.",
+            "includes": {}, "excludes": {}}])
+        self.assertTrue(any(r["action"] == "SCMP_ACT_ERRNO" and "bpf" in r["names"] for r in profile["syscalls"]))
+        for option in ("--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--user=1000:1000", "--pid=private", "--ipc=private"):
+            self.assertIn(option, args)
+        with self.assertRaisesRegex(BrokerError, "sandbox-policy-not-allowed"):
+            self.broker.create({"environmentId": "bad", "image": "example.org/tools@sha256:" + "1" * 64, "sandboxPolicy": "unconfined"})
+
     def test_cancel_before_dispatch_persists_tombstone_across_restart(self):
         req = self.request()
         result = self.broker.cancel(self.control(req))

@@ -138,6 +138,7 @@ export class LinuxEnvironmentClient {
     resourceIds: string[];
     image: string;
     network?: "none" | "public-web";
+    sandboxPolicy?: "default" | "chromium-v1";
   }) {
     return this.#transport("environment.create", input);
   }

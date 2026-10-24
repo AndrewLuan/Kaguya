@@ -4,6 +4,7 @@
 输入输出与副作用：随机环境、临时 broker 根目录，finally 回收容器/volume，保留原始 Chromium 错误。
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,15 +23,18 @@ args = parser.parse_args()
 backend = PodmanBackend()
 backend.env = {k: v for k, v in os.environ.items() if k in ('HOME', 'PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS')}
 backend.env.setdefault('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
-def command(*parts, timeout=30):
+def command(*parts, timeout=30, diagnostics=False):
     result = subprocess.run(['/usr/bin/podman', *parts], env=backend.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    if result.returncode:
+    if result.returncode or diagnostics:
         print(result.stderr.decode(errors='replace'), file=sys.stderr)
+    if result.returncode:
         raise RuntimeError('podman-command-failed')
     return result.stdout
 backend.command = command
 info = json.loads(command('info', '--format=json'))
 assert info['host']['security']['rootless'] is True
+default_profile = Path(info['host']['security']['seccompProfilePath']).read_bytes()
+print(json.dumps({'runtimeSecurity': info['host']['security'], 'hostDefaultSeccompSha256': hashlib.sha256(default_profile).hexdigest(), 'hostDefaultChrootRules': [r for r in json.loads(default_profile)['syscalls'] if 'chroot' in r['names']]}), flush=True)
 command('load', '--input', str(Path(args.archive).resolve()), timeout=300)
 image = 'localhost/kaguya-chromium@' + args.digest
 assert json.loads(command('image', 'inspect', image))[0]['Digest'] == args.digest
@@ -39,12 +43,15 @@ with tempfile.TemporaryDirectory() as root:
     broker = Broker(root, backend)
     try:
         env = broker.create({'environmentId': key, 'scope': 'ci', 'workspaceId': key,
-                             'resourceIds': [key], 'image': image, 'network': 'none'})
+                             'resourceIds': [key], 'image': image, 'network': 'none', 'sandboxPolicy': 'chromium-v1'})
         internal = broker.environments[key]
-        result = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60)
-        print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'browser': json.loads(result)}), flush=True)
+        desktop = json.loads(command('inspect', internal['container']))[0]
+        oci = json.loads(command('unshare', '/bin/cat', desktop['OCIConfigPath']))
+        print(json.dumps({'desktopPolicy': oci['linux'], 'desktopProcess': oci['process']}), flush=True)
+        result = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60, diagnostics=True)
+        print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'sandboxPolicy': internal['sandboxPolicy'], 'seccompSha256': '8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f', 'browser': json.loads(result)}), flush=True)
     finally:
-        primary = sys.exc_info()[0] is not None
+        primary = sys.exc_info()[1]
         failures = []
         try:
             broker.close()
@@ -64,5 +71,5 @@ with tempfile.TemporaryDirectory() as root:
                 backend.shell.system('/usr/bin/systemctl', '--user', 'stop', backend.shell.slice(env))
             except Exception as error:
                 failures.append(error)
-        if failures and not primary:
-            raise ExceptionGroup('browser fixture cleanup failed', failures)
+        if failures:
+            raise BaseExceptionGroup('browser fixture cleanup failed', ([primary] if primary else []) + failures)

@@ -5,13 +5,15 @@
  */
 import { chromium } from '/opt/kaguya-browser/node_modules/playwright/index.mjs';
 import { writeFile } from 'node:fs/promises';
-const context = await chromium.launchPersistentContext('/private/sandbox-probe', { headless: true, chromiumSandbox: true, timeout: 15000 });
+const context = await chromium.launchPersistentContext('/private/sandbox-probe', { channel: 'chromium', headless: true, chromiumSandbox: true, timeout: 15000 });
 try {
   const page = context.pages()[0] ?? await context.newPage();
   await page.goto('chrome://sandbox');
   const sandbox = await page.locator('body').innerText();
   await writeFile('/private/sandbox-probe.txt', sandbox);
+  console.error(JSON.stringify({ chromium: context.browser().version(), sandbox }));
   if (!/PID namespaces\s+Yes/i.test(sandbox) || !/Seccomp-BPF sandbox\s+Yes/i.test(sandbox)) throw new Error('chromium-sandbox-not-proven:' + sandbox);
+  await page.goto('about:blank');
   await page.setContent('<button id="go">submit</button><output id="value"></output><script>go.onclick=()=>value.textContent="verified"</script>');
   await page.getByRole('button', { name: 'submit' }).click();
   if (await page.locator('#value').innerText() !== 'verified') throw new Error('dynamic-dom-not-verified');

@@ -38,6 +38,8 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 `environment.create` 固定 scope、workspace、resource 集合、镜像 digest 与 network policy。workspace/resource 不允许被另一环境重复注册。可信桌面容器与独立 shell job 是同一环境的不同成员；job 使用不可变名称和原代次。工作卷按 workspace 保留。没有任何可由请求指定的宿主 bind mount；shell 只取得命名工作卷，不取得 broker 程序、unit、journal、凭证或宿主仓库。可信桌面额外取得环境私有 `/private` 卷，browser profile/下载控制记录不得放入共享 workspace。
 
+Chromium 桌面由宿主创建时显式设置 `sandboxPolicy="chromium-v1"`。它使用同目录固定的 `chromium-seccomp.json`，SHA-256 为 `8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f`，broker 启动前校验文件。profile 来自 [containers/common v0.57.4](https://github.com/containers/common/blob/v0.57.4/pkg/seccomp/seccomp.json)（原文件 SHA-256 `cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c`）；语义差异仅为移除 chroot 的 capability 条件 allow/deny，替换为无条件 allow，让 Chromium 在其内层 user namespace 完成 sandbox chroot。外层仍为非 root、cap-drop ALL、no-new-privileges、只读 rootfs。shell job 保持默认 seccomp。CI 同时记录 runner 默认 profile 的 hash/原始 chroot 规则和实际 OCI 策略；生产系统另行验收。
+
 `lease.acquire` 返回公开 `ActionEnvironment` 与一次性秘密 token。公开引用可以进入 W3 intent；token 只保存在受信宿主内存，通过 `ActionExecution.leaseCredential` 传到实际入口。broker 仅持久化 token hash。lease 必须覆盖完整 observe → act → verify；浏览器和 GUI 共用同一环境 lease。过期不自动转授，需要显式恢复隔离旧执行者。已派发 permit 的截止时间固定为操作 deadline 与当次 lease 到期时间的较早者；后续 renew 不会延长旧 permit。helper 必须在每次实际输入前核验 permit，并在到期时停止旧自动化输入。broker 的 collect 超时会停止 shell 成员、排空 GUI/browser 自动化输入并保留 unknown；桌面进程继续运行。
 
 `operation.execute` 在实际启动入口再次检查 scope、workspace/resources、workflow、lease、generation、fencing、token 和 deadline。固定 `intentId/attemptId/operationId/digest` 与参数的内部 hash；同 operation 换参数、attempt 或 generation 会被拒绝。已派发但无结果的记录返回 unknown，不再次执行。

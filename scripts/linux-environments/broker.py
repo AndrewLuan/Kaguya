@@ -1,6 +1,7 @@
 """功能概述：Linux 工具环境的唯一租约/代次权威，持久保存操作事实而不重试未知副作用。
 主要职责：Journal 原子追加 fsync 事件；Broker 管理 acquire/renew/release/takeover、
 实际入口 fencing、取消 tombstone、历史核对及内容寻址产物；PodmanBackend 固定容器参数。
+可信 Chromium 桌面可显式选择固定 seccomp profile，仅调整内层 sandbox 所需 chroot。
 代码库关系：server.py 验 SO_PEERCRED 后调用；TypeScript provider 消费 ActionExecution。
 shell_jobs/job_runner 在宿主监督独立命令容器；GUI/browser helper 从不执行任意 shell。
 输入输出与副作用：按环境锁串行 admission/启动，外部完成等待不占全局锁；接管先隔离容器。
@@ -240,6 +241,8 @@ class Broker:
             raise BrokerError("immutable-image-required")
         if req.get("network", "none") not in ("none", "public-web"):
             raise BrokerError("network-policy-not-allowed")
+        if req.get("sandboxPolicy", "default") not in ("default", "chromium-v1"):
+            raise BrokerError("sandbox-policy-not-allowed")
         resources = req["resourceIds"]
         if not isinstance(resources, list) or not 0 < len(resources) <= 16 or len(set(resources)) != len(resources):
             raise BrokerError("invalid-resources")
@@ -259,6 +262,7 @@ class Broker:
                     raise BrokerError("resource-already-owned")
                 env = {"environmentId": env_id, "scope": text(req["scope"]), "workspaceId": workspace,
                        "resourceIds": resources, "image": image, "network": req.get("network", "none"),
+                       "sandboxPolicy": req.get("sandboxPolicy", "default"),
                        "generation": 0, "fencing": "0", "lease": None, "state": "preparing",
                        "container": "kaguya-" + digest(env_id)[:20] + "-0"}
                 self._save_env(env)
@@ -695,8 +699,13 @@ class PodmanBackend:
         volume = "kaguya-workspace-" + digest(env["workspaceId"])[:24]
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
         member_args = []
+        if env.get("sandboxPolicy") == "chromium-v1":
+            profile = Path(__file__).resolve().with_name("chromium-seccomp.json")
+            if profile.is_symlink() or hashlib.sha256(profile.read_bytes()).hexdigest() != "8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f":
+                raise BrokerError("chromium-seccomp-integrity")
+            member_args += ["--security-opt=seccomp=" + str(profile)]
         if self.shell is not None:
-            member_args = ["--cgroup-parent=" + self.shell.configure_environment(env),
+            member_args += ["--cgroup-parent=" + self.shell.configure_environment(env),
                            "--label=kaguya.role=desktop", "--volume",
                            "kaguya-private-" + digest(env["environmentId"])[:24] + ":/private:rw"]
         self.command("run", "--detach", "--pull=never", "--name", env["container"],
