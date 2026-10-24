@@ -617,6 +617,7 @@ describe("Web private chat through the production information DAG", () => {
               if (mode === "unknown") throw new Error("Synthetic receipt lost");
               return {
                 ok: false,
+                outcome: "rejected-before-effect",
                 adapterId,
                 platform: "web",
                 target,

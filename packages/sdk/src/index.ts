@@ -35,3 +35,5 @@ export * from "./modules.js";
 export * from "./module-plugin.js";
 
 export * from "./observation.js";
+
+export * from "./action.js";

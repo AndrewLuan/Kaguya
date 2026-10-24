@@ -9,7 +9,11 @@ import {
   type NativeMemorySnapshot,
   type MemoryPublication,
 } from "@kaguya/schema";
-import { defineModuleCapability } from "@kaguya/sdk";
+import {
+  defineModuleCapability,
+  type ActionDependencies,
+  type MemoryDependencyCheck,
+} from "@kaguya/sdk";
 import { z } from "@kaguya/schema";
 import type { EmbeddingProvider } from "./vector.js";
 export const nativeEmbeddingSettingsSchema = z
@@ -107,6 +111,7 @@ export interface BasicMemoryObservation {
   name?: string;
 }
 export interface NativeMemoryStore {
+  checkDependencies?(input: ActionDependencies): Promise<MemoryDependencyCheck>;
   cutoff?(input: MemoryReadContext): Promise<{ publicationPosition: string }>;
   pendingEvidence?(input: MemoryReadContext): Promise<{
     pendingEvidence: NonNullable<NativeMemorySnapshot["pendingEvidence"]>;
@@ -160,6 +165,7 @@ export interface MemoryAuxiliaryRetriever {
   index?(signal?: AbortSignal): Promise<void>;
 }
 export interface NativeMemoryAccess {
+  checkDependencies?(input: ActionDependencies): Promise<MemoryDependencyCheck>;
   readonly enabled: boolean;
   ensureBasicSummaries?(
     input: MemoryReadContext,
@@ -391,6 +397,11 @@ export function createNativeMemoryAccess(
 ): NativeMemoryAccess {
   return {
     enabled: options.enabled,
+    checkDependencies: async (input) => {
+      if (!options.store.checkDependencies)
+        throw new Error("Memory dependency validation unavailable");
+      return options.store.checkDependencies(input);
+    },
     async ensureBasicSummaries(input, observations) {
       if (options.enabled)
         await options.store.ensureBasicSummaries?.(input, observations);

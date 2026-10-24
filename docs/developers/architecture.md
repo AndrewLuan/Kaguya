@@ -11,6 +11,8 @@ Core 中每项运行事实都是不可变 `InformationAtom`，且只以 `informa
 
 在项目的持续 Agent 语义中，相关 Information 到达可以形成一次 wake tick：它提醒系统某个场景发生了变化，但不自动构成 turn、回复或长期记忆。`InformationAtom` 是证据与触发载体，模块订阅的原子也不自动等于模块需要理解的完整业务输入。术语和模块检查项见[持续 Agent 设计原则](./continuous-agent)。
 
+行动仓储在 Memory 发布锁与 action 行锁内裁决开始资格，事务提交后由 Runtime 调用 provider。授权绑定完整执行规格，回执保留原 intent/attempt；运行中的恢复扫描将过期且未确认的 attempt 记为 `unknown`。实际送入后继模型提示的 Memory 补充证据也参与发送前检查，见[持久执行接口](./continuous/action-lifecycle#持久执行接口)。
+
 ## 运行形态
 
 ```mermaid

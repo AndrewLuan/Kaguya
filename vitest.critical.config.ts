@@ -18,6 +18,8 @@ const criticalTests = [
   "packages/config/src/startup-validation.test.ts",
   "packages/database/src/schema.test.ts",
   "packages/database/src/observation-store.test.ts",
+  "packages/runtime/src/action.test.ts",
+  "packages/platform-adapters/src/napcat.test.ts",
   "packages/database/src/native-memory.test.ts",
   "packages/database/src/native-memory-revisions.test.ts",
   "packages/modules/src/first-party/memory-native/index.test.ts",

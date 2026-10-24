@@ -89,6 +89,12 @@ import type {
   OutboundMessageContent,
   PlatformDestination,
 } from "@kaguya/schema";
+import { ActionExecutor, type ActionExecutorOptions } from "./action.js";
+import {
+  actionCapability,
+  actionRunValidityCapability,
+  type ActionProvider,
+} from "@kaguya/sdk";
 import { defineInformationSelector, observationCapability } from "@kaguya/sdk";
 import type {
   InformationKindDefinition,
@@ -159,6 +165,11 @@ function isMemoryCapability(id: string): boolean {
 }
 
 type KaguyaRuntimeBaseOptions = {
+  readonly actionProviders?: readonly ActionProvider[];
+  readonly actionEnvironment?: Pick<
+    ActionExecutorOptions,
+    "resolveLeaseCredential" | "validateEnvironment"
+  >;
   /** 由 composition 注入已选择 default/local 的授权消息渲染器。 */
   readonly authorizedMessagePromptRenderer?: AuthorizedMessagePromptRenderer;
   /** 当前生效的出站策略；未注入时非 Web 默认拒绝。 */
@@ -328,6 +339,10 @@ export class KaguyaRuntime implements InformationIngress {
   #hostCapabilities: readonly ModuleCapabilityImplementation[] = [];
   #memoryOptions: RuntimeMemoryOptions = { enabled: false };
   #nativeAccess: NativeMemoryAccess | undefined;
+  #actionExecutor: ActionExecutor | undefined;
+  get actions(): ActionExecutor {
+    return required(this.#actionExecutor, "action executor");
+  }
   #nativeFacade(access: NativeMemoryAccess): NativeMemoryAccess {
     this.#nativeAccess = access;
     return new Proxy(access, {
@@ -676,7 +691,22 @@ export class KaguyaRuntime implements InformationIngress {
             })
           : this.options.capabilities;
       const enabledSuppliedCapabilities = suppliedCapabilities ?? [];
+      await database.actions.recoverExpired();
+      this.#actionExecutor = new ActionExecutor({
+        store: database.actions,
+        providers: this.options.actionProviders ?? [],
+        core,
+        ...this.options.actionEnvironment,
+        onRecoveryError: () =>
+          this.#runtimeLogger?.error(
+            { event: "action.recovery.failed" },
+            "Action recovery failed; the next bounded scan will retry",
+          ),
+      });
+      this.#actionExecutor.startRecovery();
       const capabilities = [
+        { capability: actionCapability, value: this.#actionExecutor },
+        { capability: actionRunValidityCapability, value: database.actions },
         { capability: observationCapability, value: database.observations },
         { capability: rawContextCapability, value: database.rawEvents },
         {
@@ -846,6 +876,7 @@ export class KaguyaRuntime implements InformationIngress {
       this.#state === "starting" ? this.#startPromise : undefined;
     this.#state = "closing";
     this.#closePromise = (async () => {
+      await this.#actionExecutor?.close();
       // scheduler 必须先停止，随后再让 ModuleHost abort 正在等待的启动或 handler。
       await this.#oneShotScheduler?.stop().catch(() => undefined);
       if (options.drain) {
@@ -878,6 +909,11 @@ export class KaguyaRuntime implements InformationIngress {
     if (this.#cleanupPromise !== undefined) return this.#cleanupPromise;
     this.#cleanupPromise = (async () => {
       const failures: unknown[] = [];
+      try {
+        await this.#actionExecutor?.close();
+      } catch (error) {
+        failures.push(error);
+      }
       if (this.#rawProjectionTimer) clearInterval(this.#rawProjectionTimer);
       this.#rawProjectionTimer = undefined;
       if (this.#rawProjectionPromise)
@@ -1073,6 +1109,37 @@ export class KaguyaRuntime implements InformationIngress {
     )
       return;
     const context = uniqueContextReference(request);
+    const durableOutcome = await required(
+      this.#database,
+      "database",
+    ).actions.deliveryResult(request.informationId);
+    if (durableOutcome) {
+      if (durableOutcome.status === "succeeded")
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryDeliveredInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: deliveryDeliveredInformationKind.payloadSchema.parse(
+              durableOutcome.result,
+            ),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      else
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Recovered durable action result",
+          durableOutcome.evidence === "not-executed" ? "failed" : "unknown",
+        );
+      return;
+    }
     // Old versions had no started marker. A recovered delivery may already have
     // reached the platform, so an earlier lease is evidence of an unknown result.
     const attempts = await required(this.#database, "database").sql.query<{
@@ -1103,8 +1170,7 @@ export class KaguyaRuntime implements InformationIngress {
         request.payload.platform,
         request.payload.destination,
       ) ||
-      !targetAuthorized ||
-      !this.#messageTargets!.deliveryStillCurrent(request.informationId)
+      !targetAuthorized
     ) {
       await core.commitTerminal(
         "kaguya.delivery.result.v1",
@@ -1152,85 +1218,197 @@ export class KaguyaRuntime implements InformationIngress {
       throw error;
     }
 
-    const attemptId = randomUUID();
-    const started = await core.registerOnce(
-      "kaguya.delivery.started.v1",
+    const actionStore = required(this.#database, "database").actions;
+    const action = await actionStore.prepareDelivery(
       request.informationId,
-      deliveryStartedInformationKind,
-      {
-        occurredAt: this.#now().toISOString(),
-        source: "runtime:delivery",
-        payload: { attemptId },
-        references: [
-          { relation: "core:caused-by", informationId: request.informationId },
-          { relation: "core:context", informationId: context.informationId },
-        ],
-      },
+      core.executionClaim,
     );
-    if (started.payload.attemptId !== attemptId) {
-      await this.#registerDeliveryFailure(
-        request,
-        context.informationId,
-        "Delivery result is unknown after recovery",
-        "unknown",
-      );
+    const admission = await actionStore.admit(
+      action.intentId,
+      action.intent.scope,
+      300000,
+      core.executionClaim,
+    );
+    if (!admission.claim) {
+      if (
+        admission.view.state === "rejected" ||
+        admission.view.state === "cancelled" ||
+        admission.view.state === "superseded"
+      ) {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Action admission rejected",
+        );
+      } else {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Action result is unknown after recovery",
+          "unknown",
+        );
+      }
       return;
     }
-    let receipt: PlatformDeliveryReceipt;
+    const actionClaim = admission.claim;
     try {
-      receipt = await registration.transport.sendMessage(
-        request.payload.destination,
-        request.payload.message,
-        { rootInformationId: context.informationId },
+      const attemptId = actionClaim.attemptId;
+      const started = await core.registerOnce(
+        "kaguya.delivery.started.v1",
+        request.informationId,
+        deliveryStartedInformationKind,
+        {
+          occurredAt: this.#now().toISOString(),
+          source: "runtime:delivery",
+          payload: { attemptId },
+          references: [
+            {
+              relation: "core:caused-by",
+              informationId: request.informationId,
+            },
+            { relation: "core:context", informationId: context.informationId },
+          ],
+        },
       );
-    } catch (cause) {
-      await this.#registerDeliveryFailure(
-        request,
-        context.informationId,
-        "Platform transport result is unknown",
-        "unknown",
+      if (started.payload.attemptId !== attemptId) {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Delivery result is unknown after recovery",
+          "unknown",
+        );
+        return;
+      }
+      let receipt: PlatformDeliveryReceipt;
+      const allowed = await actionStore.canInvoke(
+        actionClaim,
+        action.intent.scope,
       );
-      throw new OutboundTransportError(
-        request.payload.adapterId,
-        request.payload.platform,
-        cause,
-      );
-    }
+      if (
+        !allowed ||
+        !(
+          this.options.outboundAllowlist ?? new GatewayAllowlist()
+        ).allowsDestination(
+          request.payload.platform,
+          request.payload.destination,
+        ) ||
+        !this.#messageTargets!.deliveryStillCurrent(request.informationId)
+      ) {
+        await actionStore.finish(
+          actionClaim,
+          action.intent.scope,
+          {
+            status: "cancelled",
+            evidence: "not-executed",
+            result: { reason: "delivery-authority-changed" },
+            artifacts: [],
+            truncated: false,
+          },
+          false,
+          core.executionClaim,
+        );
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Delivery authority changed before transport",
+        );
+        return;
+      }
+      core.executionSignal?.throwIfAborted();
+      try {
+        receipt = await registration.transport.sendMessage(
+          request.payload.destination,
+          request.payload.message,
+          { rootInformationId: context.informationId },
+        );
+      } catch (cause) {
+        await actionStore.finish(
+          actionClaim,
+          action.intent.scope,
+          {
+            status: "unknown",
+            evidence: "unconfirmed",
+            result: { reason: "transport-unconfirmed" },
+            artifacts: [],
+            truncated: false,
+          },
+          false,
+          core.executionClaim,
+        );
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Platform transport result is unknown",
+          "unknown",
+        );
+        throw new OutboundTransportError(
+          request.payload.adapterId,
+          request.payload.platform,
+          cause,
+        );
+      }
 
-    if (receipt.ok) {
-      await core.commitTerminal(
-        "kaguya.delivery.result.v1",
-        request.informationId,
-        deliveryDeliveredInformationKind,
+      await actionStore.finish(
+        actionClaim,
+        action.intent.scope,
         {
-          occurredAt: this.#now().toISOString(),
-          source: "runtime:delivery",
-          payload: safeDeliveredPayload(receipt),
-          references: deliveryResultReferences(
-            request.informationId,
-            context.informationId,
-          ),
+          status: receipt.ok
+            ? "succeeded"
+            : receipt.outcome === "rejected-before-effect"
+              ? "rejected"
+              : "unknown",
+          evidence: receipt.ok
+            ? "effect-verified"
+            : receipt.outcome === "rejected-before-effect"
+              ? "not-executed"
+              : "unconfirmed",
+          result: receipt.ok
+            ? safeDeliveredPayload(receipt)
+            : safeFailedDeliveryPayload(receipt),
+          artifacts: [],
+          truncated: false,
         },
+        false,
+        core.executionClaim,
       );
-    } else {
-      await core.commitTerminal(
-        "kaguya.delivery.result.v1",
-        request.informationId,
-        deliveryFailedInformationKind,
-        {
-          occurredAt: this.#now().toISOString(),
-          source: "runtime:delivery",
-          payload: safeFailedDeliveryPayload(receipt),
-          references: deliveryResultReferences(
-            request.informationId,
-            context.informationId,
-          ),
-        },
-      );
+      await actionStore.acknowledge(action.intentId, action.intent.scope);
+      if (receipt.ok) {
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryDeliveredInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: safeDeliveredPayload(receipt),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      } else {
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryFailedInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: safeFailedDeliveryPayload(receipt),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      }
+      this.#deliveriesByContext
+        .get(context.informationId)
+        ?.push(safeRuntimeReceipt(receipt));
+    } finally {
+      await actionStore.release(actionClaim, action.intent.scope);
     }
-    this.#deliveriesByContext
-      .get(context.informationId)
-      ?.push(safeRuntimeReceipt(receipt));
   }
 
   async #registerDeliveryFailure(
@@ -1504,6 +1682,9 @@ function safeFailedDeliveryPayload(receipt: PlatformDeliveryReceipt) {
     platform: receipt.platform,
     target: receipt.target,
     error: "Platform delivery failed",
+    ...(receipt.outcome === "rejected-before-effect"
+      ? {}
+      : { outcome: "unknown" as const }),
   };
 }
 
@@ -1512,6 +1693,7 @@ function safeRuntimeReceipt(
 ): PlatformDeliveryReceipt {
   return {
     ok: receipt.ok,
+    ...(receipt.outcome ? { outcome: receipt.outcome } : {}),
     adapterId: receipt.adapterId,
     platform: receipt.platform,
     target: receipt.target,

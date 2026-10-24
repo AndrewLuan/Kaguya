@@ -141,7 +141,7 @@ pnpm dev
 - **社区交流**：加入 [Discord 群组](https://discord.gg/PwvtanURJV)，交流使用体验、分享想法并讨论开发。
 - **问题与建议**：前往 [GitHub Issues](https://github.com/posanbu/Kaguya/issues)，描述预期行为、实际表现和复现步骤。
 - **参与开发**：先阅读[贡献指南](CONTRIBUTING.md)，了解环境准备、模块边界和验证要求。
-- **编写模块**：从[信息模块开发](docs/developers/information-modules.md)开始，了解如何订阅信息、产生结果并接入运行时。
+- **编写模块**：从[信息模块开发](docs/developers/information-modules.md)开始，了解如何订阅信息、产生结果并接入运行时；外部副作用使用[持久行动与回执接口](docs/developers/continuous/action-lifecycle.md#持久执行接口)。
 - **查阅文档**：访问 [Kaguya 文档站](https://posanbu.github.io/Kaguya/)，或直接阅读仓库中的[文档索引](docs/README.md)。
 
 提交问题时，请隐去 API Key、管理访问链接和私人聊天内容。

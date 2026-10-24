@@ -7,6 +7,8 @@ description: 用显式 Catalog、能力声明与 Information DAG 组合可检查
 
 模块通过不可变 Information Atom 协作。Catalog 声明哪些受信代码可用，activation 决定哪些实例启用以及各自的设置；新增文件不会自动取得执行权限。Server 从 `cordis.yml` 发现明确启用的外部插件，将其声明与内置 Catalog 合并。Server 与 Demo 共用 `@kaguya/composition` 的 `createMessageComposition()`，把 Catalog、activations 与宿主 capabilities 传给 `KaguyaRuntime`；直接嵌入 Runtime 的调用方也可显式合并 Catalog。
 
+模块通过 `agent:action` 引用宿主批准的行动授权，登记固定 intent，并分别执行、取消、核对和读取不可变回执。`agent:action-validity` 提供持久 run 有效性检查；普通新消息不会自动取消旧规划。完整契约与恢复边界见[决策与行动生命周期](./continuous/action-lifecycle#持久执行接口)。
+
 ## 唯一模块协议
 
 `defineInformationModule()` 的 manifest 必须包含 `protocolVersion: 1`、稳定 `definitionId`、语义版本 `moduleVersion`、非空 `displayName`、单行 `summary`、完整 `description`、`settingsSchema`，以及 `consumes`、`produces`、`selectors`、`promptRenderers`、`requires`、`provides` 六组声明。可选 `tags` 使用唯一的小写短标签表达管理界面分类，不参与激活或执行；第一方 Memory 域统一声明 `memory`。每个模块目录还必须携带相邻 `README.md`。Runtime 不读取 Markdown。协议只接受当前 v1，其他版本直接失败。
