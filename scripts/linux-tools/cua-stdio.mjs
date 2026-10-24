@@ -120,6 +120,9 @@ export class CuaStdio {
     if (!READ.has(name) && !INPUT.has(name)) throw new Error("cua-tool-denied");
     if (INPUT.has(name) && typeof gate !== "function")
       throw new Error("cua-input-gate-required");
+    // 收尾只证明 core buttons 1–5；水平滚动会使用 6/7，尚未接入全 XI2 状态验证。
+    if (name === "scroll" && !["up", "down"].includes(args.direction))
+      throw new Error("cua-horizontal-scroll-denied");
     return this.#rpc("tools/call", { name, arguments: args }, gate);
   }
   #rpc(method, params, gate) {

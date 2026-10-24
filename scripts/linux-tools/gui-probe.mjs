@@ -4,7 +4,7 @@
  * 代码库关系：check-gui-container.py 启动 GTK fixture 后调用；后续动作验收共用此通道。
  * 输入输出与副作用：证据写入可信 HOME，stdout 只含摘要；finally 等待 Driver 进程组消失。
  */
-import { mkdir, writeFile, stat } from "node:fs/promises";
+import { mkdir, writeFile, stat, rename } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -48,8 +48,12 @@ try {
   evidence.wishExcluded = true;
   const discovery = (evidence.discovery = await driver.start());
   await writeFile(
-    "/home/tool/gui-probe-driver.json",
+    "/home/tool/gui-probe-driver.pending",
     JSON.stringify(driver.identity()),
+  );
+  await rename(
+    "/home/tool/gui-probe-driver.pending",
+    "/home/tool/gui-probe-driver.json",
   );
   const admissionDeadline = Date.now() + 30000;
   while (true) {

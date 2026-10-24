@@ -77,7 +77,7 @@ def reset(x, xt, d, before, expected_keysyms):
         if any(original) or not any(now):
             continue
         # 固定 Cua reserve_spare_keycode 仅借全空槽，并把一个 keysym 写入每列。
-        symbols = set(now) - {0}
+        symbols = set(now)
         if len(symbols) != 1 or not symbols.issubset(expected_keysyms):
             unexpected = True
             continue

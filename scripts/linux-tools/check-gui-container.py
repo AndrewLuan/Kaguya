@@ -22,8 +22,8 @@ name = "kaguya-gui-ci-" + uuid.uuid4().hex
 probe_process = None
 
 
-def command(*parts, timeout=30, check=True):
-    result = subprocess.run(["/usr/bin/podman", *parts], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+def command(*parts, timeout=30, check=True, input=None):
+    result = subprocess.run(["/usr/bin/podman", *parts], input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError(result.stderr.decode(errors="replace"))
     return result
@@ -86,6 +86,9 @@ try:
     assert ledger["uid"] == 1001
     probe_process = subprocess.Popen(["/usr/bin/podman", "exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     driver = json.loads(until(["exec", name, "/bin/cat", "/home/tool/gui-probe-driver.json"]))
+    health = json.loads(command("exec", "-i", name, "/opt/kaguya-tools/helper", input=b'{"helperProtocolVersion":1,"kind":"health"}').stdout)
+    assert health["ready"] is True and health["generation"] == 0 and health["serviceInstanceId"]
+    print(json.dumps({"controlHealth": health}), flush=True)
     isolation = command("exec", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-isolation-probe.py", str(driver["pid"]))
     print(isolation.stdout.decode(), flush=True)
     command("exec", name, "/usr/bin/touch", "/home/tool/gui-probe-continue")
@@ -96,6 +99,10 @@ try:
     after = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json"], lambda value: value["text"] == "W8 暂存" and value["count"] == 1)
     assert after == {"uid": 1001, "pid": ledger["pid"], "text": "W8 暂存", "count": 1}, after
     print(json.dumps({"independentApplicationLedger": after}), flush=True)
+    drain = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-drain-probe.mjs", timeout=180)
+    print(drain.stdout.decode(), flush=True)
+    preserved = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
+    assert preserved == after, preserved
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
     Path("gui-packages.txt").write_bytes(command("exec", name, "/bin/cat", "/usr/share/kaguya-gui-packages.txt").stdout)
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)

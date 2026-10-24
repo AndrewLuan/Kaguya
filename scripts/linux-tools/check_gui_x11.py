@@ -57,6 +57,16 @@ class ResetTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "reset-unconfirmed"):
                 gui.reset(Mock(), Mock(), "display", before, set())
 
+    def test_partial_row_is_not_attributed_to_cua(self):
+        before = self.baseline()
+        current = copy.deepcopy(before)
+        current["mapping"][245] = [0x1004e2d, 0]
+        x = Mock()
+        with patch.object(gui, "snapshot", side_effect=[current, current]):
+            with self.assertRaisesRegex(RuntimeError, "reset-unconfirmed"):
+                gui.reset(x, Mock(), "display", before, {0x1004e2d})
+        x.XChangeKeyboardMapping.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
