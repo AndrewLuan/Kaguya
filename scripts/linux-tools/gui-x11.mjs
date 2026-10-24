@@ -13,6 +13,7 @@ export function x11State(request) {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "",
+      stderr = "",
       size = 0,
       failure;
     const fail = (reason) => {
@@ -25,13 +26,20 @@ export function x11State(request) {
       if (size > 262144) fail("x11-response-limit");
       else stdout += data;
     });
-    child.stderr.on("data", () => {});
+    child.stderr.on("data", (data) => {
+      stderr = (stderr + data.toString()).slice(-8192);
+    });
     child.on("error", () => fail("x11-state-unavailable"));
     child.stdin.on("error", () => fail("x11-state-write-failed"));
-    child.once("close", (code) => {
+    child.once("close", (code, signal) => {
       clearTimeout(timer);
       if (failure || code !== 0) {
-        reject(failure ?? new Error("x11-state-unconfirmed"));
+        reject(
+          failure ??
+            new Error("x11-state-unconfirmed", {
+              cause: { code, signal, stderr },
+            }),
+        );
         return;
       }
       try {

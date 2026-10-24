@@ -5,6 +5,7 @@
 输入输出与副作用：仅临时命名容器与 HOME，finally 清理；有界条件检查总线/GTK，不固定 sleep 猜就绪。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -12,7 +13,11 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import traceback
 import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linux-environments"))
+from broker import chromium_profile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--archive", required=True)
@@ -92,6 +97,11 @@ def until_json(parts, predicate, seconds=15):
 
 info = json.loads(command("info", "--format=json").stdout)
 assert info["host"]["security"]["rootless"] is True
+security = info["host"]["security"]
+assert security["seccompEnabled"] is True
+default_profile = Path(security["seccompProfilePath"])
+assert not default_profile.is_symlink()
+selected_profile = chromium_profile(info["version"]["Version"], hashlib.sha256(default_profile.read_bytes()).hexdigest())
 command("load", "--input", str(Path(args.archive).resolve()), timeout=300)
 image = "localhost/kaguya-gui@" + args.digest
 assert json.loads(command("image", "inspect", image).stdout)[0]["Digest"] == args.digest
@@ -99,6 +109,7 @@ try:
     command("run", "--detach", "--pull=never", "--name", name,
             "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--read-only", "--network=none",
+            "--security-opt=seccomp=" + str(selected_profile),
             "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
             "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
             "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
@@ -113,6 +124,7 @@ try:
     assert oci["process"]["noNewPrivileges"] is True
     assert all(not caps for caps in oci["process"]["capabilities"].values())
     assert oci["root"]["readonly"] is True
+    assert oci["linux"]["seccomp"]["defaultAction"] == "SCMP_ACT_ERRNO"
     command("exec", "--detach", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
     address_result = until(["exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
     address = re.search(r'string "([^"]+)"', address_result.decode()).group(1)
@@ -142,6 +154,15 @@ try:
     print(drain.stdout.decode(), flush=True)
     preserved = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
     assert preserved == after, preserved
+    command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-fixture.mjs")
+    browser = json.loads(until(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-fixture.json"]))
+    browser_status = command("exec", name, "/bin/cat", f'/proc/{browser["pid"]}/status').stdout.decode()
+    assert re.search(r"^Uid:\s+1001\s+1001\s+1001\s+1001$", browser_status, re.M)
+    browser_result = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-probe.mjs", str(browser["pid"]), timeout=120)
+    print(browser_result.stdout.decode(), flush=True)
+    browser_after = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-ledger.json"], lambda value: value["text"] == "W8 browser ASCII" and value["count"] == 1)
+    assert browser_after == {"uid": 1001, "pid": browser["pid"], "text": "W8 browser ASCII", "count": 1}, browser_after
+    print(json.dumps({"independentBrowserLedger": browser_after, "sandboxPolicy": "chromium-v1", "seccompSha256": hashlib.sha256(selected_profile.read_bytes()).hexdigest()}), flush=True)
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
     Path("gui-packages.txt").write_bytes(command("exec", name, "/bin/cat", "/usr/share/kaguya-gui-packages.txt").stdout)
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
@@ -149,10 +170,14 @@ finally:
     primary = sys.exc_info()[1]
     if primary:
         print(f"Primary GUI failure: {primary!r}", file=sys.stderr, flush=True)
+        Path("gui-failure.txt").write_text("".join(traceback.format_exception(primary)))
     cleanup_errors = []
     for source, destination in [("/home/tool/gui-probe.json", "gui-probe.json"),
                                 ("/home/tool/gui-gtk.png", "gui-gtk.png"),
                                 ("/home/tool/gui-desktop.png", "gui-desktop.png"),
+                                ("/home/tool/gui-chromium.png", "gui-chromium.png"),
+                                ("/home/tool/gui-chromium-probe.json", "gui-chromium-probe.json"),
+                                ("/home/app/session/chromium.log", "gui-chromium.log"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
         if podman_unresponsive:
             break

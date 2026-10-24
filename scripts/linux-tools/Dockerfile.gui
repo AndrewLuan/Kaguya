@@ -3,6 +3,8 @@
 FROM node:24.18.0-bookworm-slim@sha256:d45d78e7929b46875bbd4e29bea672d5bc48186c6c3588306521c815e78352d6 AS node
 FROM mcr.microsoft.com/playwright@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
 COPY --from=node /usr/local/ /usr/local/
+COPY scripts/linux-tools/browser-runtime/ /opt/kaguya-browser/
+RUN cd /opt/kaguya-browser && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --ignore-scripts --no-audit --no-fund
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb=2:21.1.12-1ubuntu1.9 openbox=3.6.1-12build5 dbus-x11=1.14.10-4ubuntu4.1 \
     at-spi2-core=2.52.0-1build1 python3-gi=3.48.2-1 gir1.2-gtk-3.0=3.24.41-4ubuntu1.3 \
@@ -22,7 +24,7 @@ RUN (getent passwd 1001 || useradd --uid 1001 --create-home --home-dir /home/app
     && cp /opt/kaguya-tools/gui-accessibility.conf /usr/share/defaults/at-spi2/accessibility.conf \
     && chmod 0555 /opt/kaguya-tools/gui-app-session.py /opt/kaguya-tools/helper /opt/cua/helpers
 USER 1000:1000
-ENV HOME=/home/tool DISPLAY=:99 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kaguya-app/session/bus \
+ENV HOME=/home/tool DISPLAY=:99 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kaguya-app/session/bus \
     CUA_DRIVER_RS_TELEMETRY_ENABLED=false DO_NOT_TRACK=1 CUA_TELEMETRY=0
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/node", "/opt/kaguya-tools/gui-init.mjs"]
