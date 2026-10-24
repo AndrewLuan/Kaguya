@@ -21,6 +21,7 @@
  * ledger；所有创建 PGlite 的用例共享 15 秒跨平台超时，测试结束显式关闭注入数据库，
  * 并检查持久化 payload 不包含 raw/provider secret。
  * Memory 重挂载测试通过真实 native 模块验证能力唯一性及重挂载后的观察；清理汇总错误并释放所有数据库。
+ * 受控 gate 的前置等待有界；finally 释放阻塞并等待已启动任务收敛，断言失败也不会阻塞资源清理。
  * 观察 DAG 明确包含 completed/progress 两种事实，保留完整因果链和上下文引用断言。
  */
 import {
@@ -282,15 +283,32 @@ async function settleDeliveries(database: KaguyaDatabase): Promise<void> {
 
 async function createGatedRuntime() {
   const base = await createTestingDatabase();
+  const resource: (typeof resources)[number] = { database: base };
+  resources.push(resource);
   const database = new GatedSchemaDatabase(base.sql);
+  resource.database = database;
   const runtime = new KaguyaRuntime({
     ...createMessageComposition(),
     database,
     catalog: defineInformationModuleCatalog(...[]),
     activations: [],
   });
-  resources.push({ runtime, database });
+  resource.runtime = runtime;
   return { runtime, database };
+}
+
+async function waitForTestSignal(signal: Promise<void>): Promise<void> {
+  let settled = false;
+  void signal.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await vi.waitFor(() => expect(settled).toBe(true), PERSISTENCE_WAIT);
+  await signal;
 }
 
 async function flushMicrotasks(turns = 10): Promise<void> {
@@ -738,13 +756,19 @@ describe("KaguyaRuntime", () => {
       const { runtime, database } = await createGatedRuntime();
 
       const firstStart = runtime.start();
-      await database.schemaPreparationStarted;
-      const secondStart = runtime.start();
-
-      expect(secondStart).toBe(firstStart);
-      expect(database.prepareSchemaCalls).toBe(1);
-      database.releaseSchemaPreparation();
-      await Promise.all([firstStart, secondStart]);
+      const starts = [firstStart];
+      void firstStart.catch(() => undefined);
+      try {
+        await waitForTestSignal(database.schemaPreparationStarted);
+        const secondStart = runtime.start();
+        starts.push(secondStart);
+        expect(secondStart).toBe(firstStart);
+        expect(database.prepareSchemaCalls).toBe(1);
+      } finally {
+        database.releaseSchemaPreparation();
+        await Promise.allSettled(starts);
+      }
+      await Promise.all(starts);
       expect(database.prepareSchemaCalls).toBe(1);
     },
     TEST_TIMEOUT,
@@ -755,24 +779,27 @@ describe("KaguyaRuntime", () => {
     async () => {
       const { runtime, database } = await createGatedRuntime();
       const starting = runtime.start();
-      await database.schemaPreparationStarted;
-
-      expect(() =>
-        runtime.registerTransport({
-          adapterId: "late.web",
-          platform: "web",
-          transport: {
-            sendMessage: async (target) => ({
-              ok: true,
-              adapterId: "late.web",
-              platform: "web",
-              target,
-            }),
-          },
-        }),
-      ).toThrow(RuntimeUnavailableError);
-
-      database.releaseSchemaPreparation();
+      void starting.catch(() => undefined);
+      try {
+        await waitForTestSignal(database.schemaPreparationStarted);
+        expect(() =>
+          runtime.registerTransport({
+            adapterId: "late.web",
+            platform: "web",
+            transport: {
+              sendMessage: async (target) => ({
+                ok: true,
+                adapterId: "late.web",
+                platform: "web",
+                target,
+              }),
+            },
+          }),
+        ).toThrow(RuntimeUnavailableError);
+      } finally {
+        database.releaseSchemaPreparation();
+        await Promise.allSettled([starting]);
+      }
       await starting;
     },
     TEST_TIMEOUT,
@@ -834,15 +861,16 @@ describe("KaguyaRuntime", () => {
     });
     const starting = runtime.start();
     void starting.catch(() => undefined);
-    await creating;
-    const closing = runtime.close();
+    let closing: Promise<void> | undefined;
     try {
+      await waitForTestSignal(creating);
+      closing = runtime.close();
       await vi.waitFor(() => expect(aborted).toBe(true));
     } finally {
       release();
-      await starting.catch(() => undefined);
-      await closing;
+      await Promise.allSettled([starting, closing]);
     }
+    await closing;
   });
 
   it(
@@ -897,15 +925,20 @@ describe("KaguyaRuntime", () => {
       });
 
       const starting = runtime.start();
-      await creating;
+      void starting.catch(() => undefined);
       let closeSettled = false;
-      const closing = runtime.close().then(() => {
-        closeSettled = true;
-      });
-      await flushMicrotasks();
-      expect(closeSettled).toBe(false);
-
-      releaseCreation();
+      let closing: Promise<void> | undefined;
+      try {
+        await waitForTestSignal(creating);
+        closing = runtime.close().then(() => {
+          closeSettled = true;
+        });
+        await flushMicrotasks();
+        expect(closeSettled).toBe(false);
+      } finally {
+        releaseCreation();
+        await Promise.allSettled([starting, closing]);
+      }
       await expect(starting).rejects.toBeInstanceOf(RuntimeUnavailableError);
       await closing;
       expect(disposeCalls).toBe(1);
@@ -1415,9 +1448,14 @@ describe("KaguyaRuntime", () => {
       await runtime.start();
 
       const submission = runtime.submit(webMessage());
-      await bothStarted;
-      expect(starts).toBe(2);
-      release();
+      void submission.catch(() => undefined);
+      try {
+        await waitForTestSignal(bothStarted);
+        expect(starts).toBe(2);
+      } finally {
+        release();
+        await Promise.allSettled([submission]);
+      }
       await submission;
     },
     TEST_TIMEOUT,
@@ -1436,18 +1474,23 @@ describe("KaguyaRuntime", () => {
       });
       await runtime.start();
       const submission = runtime.submit(platformMessage());
-      await deferred.started;
-
+      void submission.catch(() => undefined);
       let closed = false;
-      const close = runtime.close().then(() => {
-        closed = true;
-      });
-      await expect(runtime.submit(platformMessage())).rejects.toBeInstanceOf(
-        RuntimeUnavailableError,
-      );
-      await Promise.resolve();
-      expect(closed).toBe(false);
-      deferred.release();
+      let close: Promise<void> | undefined;
+      try {
+        await waitForTestSignal(deferred.started);
+        close = runtime.close().then(() => {
+          closed = true;
+        });
+        await expect(runtime.submit(platformMessage())).rejects.toBeInstanceOf(
+          RuntimeUnavailableError,
+        );
+        await Promise.resolve();
+        expect(closed).toBe(false);
+      } finally {
+        deferred.release();
+        await Promise.allSettled([submission, close]);
+      }
       const result = await submission;
       await close;
 
@@ -1771,12 +1814,14 @@ it(
     });
     await runtime.start();
     const submitting = runtime.submit(webMessage());
-    await started;
+    void submitting.catch(() => undefined);
     let closed = false;
-    const closing = runtime.close().then(() => {
-      closed = true;
-    });
+    let closing: Promise<void> | undefined;
     try {
+      await waitForTestSignal(started);
+      closing = runtime.close().then(() => {
+        closed = true;
+      });
       await vi.waitFor(() => expect(closed).toBe(true), {
         timeout: 400,
         interval: 10,
@@ -1788,6 +1833,7 @@ it(
       release();
       await Promise.allSettled([submitting, closing]);
     }
+    await Promise.all([submitting, closing]);
   },
   TEST_TIMEOUT,
 );
