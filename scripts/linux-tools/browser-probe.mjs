@@ -12,7 +12,9 @@ try {
   const sandbox = await page.locator('body').innerText();
   await writeFile('/private/sandbox-probe.txt', sandbox);
   console.error(JSON.stringify({ chromium: context.browser().version(), sandbox }));
-  if (!/PID namespaces\s+Yes/i.test(sandbox) || !/Seccomp-BPF sandbox\s+Yes/i.test(sandbox)) throw new Error('chromium-sandbox-not-proven:' + sandbox);
+  for (const check of [/Layer 1 Sandbox\s+Namespace/i, /PID namespaces\s+Yes/i, /Network namespaces\s+Yes/i, /Seccomp-BPF sandbox\s+Yes/i, /Seccomp-BPF sandbox supports TSYNC\s+Yes/i, /You are adequately sandboxed\./i]) {
+    if (!check.test(sandbox)) throw new Error('chromium-sandbox-not-proven:' + sandbox);
+  }
   await page.goto('about:blank');
   await page.setContent('<button id="go">submit</button><output id="value"></output><script>go.onclick=()=>value.textContent="verified"</script>');
   await page.getByRole('button', { name: 'submit' }).click();

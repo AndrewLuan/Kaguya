@@ -23,12 +23,16 @@ args = parser.parse_args()
 backend = PodmanBackend()
 backend.env = {k: v for k, v in os.environ.items() if k in ('HOME', 'PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS')}
 backend.env.setdefault('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
+class PodmanCommandError(RuntimeError):
+    def __init__(self, stderr):
+        super().__init__('podman-command-failed')
+        self.stderr = stderr.decode(errors='replace')
 def command(*parts, timeout=30, diagnostics=False):
     result = subprocess.run(['/usr/bin/podman', *parts], env=backend.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if result.returncode or diagnostics:
         print(result.stderr.decode(errors='replace'), file=sys.stderr)
     if result.returncode:
-        raise RuntimeError('podman-command-failed')
+        raise PodmanCommandError(result.stderr)
     return result.stdout
 backend.command = command
 info = json.loads(command('info', '--format=json'))
@@ -42,11 +46,25 @@ key = 'browser-ci-' + uuid.uuid4().hex
 with tempfile.TemporaryDirectory() as root:
     broker = Broker(root, backend)
     try:
+        default_key = key + '-default'
+        broker.create({'environmentId': default_key, 'scope': 'ci', 'workspaceId': default_key,
+                       'resourceIds': [default_key], 'image': image, 'network': 'none'})
+        baseline = broker.environments[default_key]
+        try:
+            command('exec', baseline['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60, diagnostics=True)
+        except PodmanCommandError as error:
+            assert 'sys_chroot("/proc/self/fdinfo/") == 0' in error.stderr, error.stderr
+            print(json.dumps({'defaultPolicy': 'failed-at-chroot', 'imageDigest': args.digest}), flush=True)
+        else:
+            raise AssertionError('default policy unexpectedly passed; review the A/B premise')
         env = broker.create({'environmentId': key, 'scope': 'ci', 'workspaceId': key,
                              'resourceIds': [key], 'image': image, 'network': 'none', 'sandboxPolicy': 'chromium-v1'})
         internal = broker.environments[key]
         desktop = json.loads(command('inspect', internal['container']))[0]
         oci = json.loads(command('unshare', '/bin/cat', desktop['OCIConfigPath']))
+        assert oci['process']['user']['uid'] == 1000 and oci['process']['noNewPrivileges'] is True
+        assert all(not values for values in oci['process']['capabilities'].values())
+        assert oci['root']['readonly'] is True and oci['linux']['seccomp']['defaultAction'] == 'SCMP_ACT_ERRNO'
         print(json.dumps({'desktopPolicy': oci['linux'], 'desktopProcess': oci['process']}), flush=True)
         result = command('exec', internal['container'], '/usr/local/bin/node', '/opt/kaguya-tools/browser-probe.mjs', timeout=60, diagnostics=True)
         print(json.dumps({'imageDigest': args.digest, 'runtime': info['version'], 'sandboxPolicy': internal['sandboxPolicy'], 'seccompSha256': '8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f', 'browser': json.loads(result)}), flush=True)
