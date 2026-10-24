@@ -71,7 +71,7 @@ def reset(x, xt, d, before, expected_keysyms):
         if not xt.XTestFakeButtonEvent(d, button, 0, 0):
             raise RuntimeError("gui-button-release-failed")
     restore = []
-    unexpected = False
+    unexpected = []
     for index, original in enumerate(before["mapping"]):
         now = current["mapping"][index]
         if any(original) or not any(now):
@@ -79,7 +79,7 @@ def reset(x, xt, d, before, expected_keysyms):
         # 固定 Cua reserve_spare_keycode 仅借全空槽，并把一个 keysym 写入每列。
         symbols = set(now)
         if len(symbols) != 1 or not symbols.issubset(expected_keysyms):
-            unexpected = True
+            unexpected.append({"keycode": index + 8, "mapping": now})
             continue
         array = (C.c_ulong * before["per"])(*original)
         x.XChangeKeyboardMapping(d, index + 8, before["per"], array, 1)
@@ -87,7 +87,12 @@ def reset(x, xt, d, before, expected_keysyms):
     x.XSync(d, 0)
     after = snapshot(x, d)
     if after["keys"] or after["buttons"] or any(any(after["mapping"][i]) for i in restore) or unexpected:
-        raise RuntimeError("gui-input-reset-unconfirmed")
+        raise RuntimeError("gui-input-reset-unconfirmed:" + json.dumps({
+            "keysBefore": current["keys"], "buttonsBefore": current["buttons"],
+            "keysAfter": after["keys"], "buttonsAfter": after["buttons"],
+            "restoredKeycodes": [i + 8 for i in restore], "unexpectedMappings": unexpected,
+            "unrestoredMappings": [{"keycode": i + 8, "mapping": after["mapping"][i]} for i in restore if any(after["mapping"][i])],
+        }))
     return {"keys": [], "buttons": [], "restoredKeycodes": [i + 8 for i in restore], "roundTrip": True}
 
 

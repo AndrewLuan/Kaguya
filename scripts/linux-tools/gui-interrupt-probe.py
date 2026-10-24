@@ -38,6 +38,7 @@ try:
         state = x11.snapshot(x, display)
         matched = bool(state["keys"]) if mode == "held" else any(0x1004e2d in row for row in state["mapping"])
         if matched:
+            validate()
             os.killpg(pid, signal.SIGSTOP)
             try:
                 validate()
@@ -47,6 +48,8 @@ try:
                     raise RuntimeError("input-state-ended-before-freeze")
                 print(json.dumps({"mode": mode, "observed": frozen}), flush=True)
             finally:
+                # 冻结后身份变化也不能据旧 PID 清理其他进程组；保留未确认失败。
+                validate()
                 os.killpg(pid, signal.SIGKILL)
             break
         if time.monotonic() >= deadline:

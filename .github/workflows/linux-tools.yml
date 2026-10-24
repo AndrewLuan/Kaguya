@@ -147,6 +147,7 @@ jobs:
             gui-packages.txt
             gui-host-diagnostics.jsonl
             gui-failure.txt
+            gui-drain-*.json
             gui-gtk.png
             gui-desktop.png
             gui-chromium.png

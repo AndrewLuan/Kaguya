@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { writeFile } from "node:fs/promises";
 import { CuaStdio } from "./cua-stdio.mjs";
 const exec = promisify(execFile);
 import { x11State as keyboard } from "./gui-x11.mjs";
@@ -116,6 +117,10 @@ for (const mode of ["held", "unicode"]) {
     assert.equal(await settled, "interrupted");
     const interruption = JSON.parse(output.split("\n")[1]);
     const residual = await keyboard({ mode: "snapshot" });
+    await writeFile(
+      `/home/tool/gui-drain-${mode}.json`,
+      JSON.stringify({ mode, before, residual, interruption }),
+    );
     if (mode === "held")
       assert.ok(
         residual.keys.length > 0,

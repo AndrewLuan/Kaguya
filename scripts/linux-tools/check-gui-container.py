@@ -69,6 +69,8 @@ def command(*parts, timeout=30, check=True, input=None):
         host_diagnostics(f"podman {parts[0]} exceeded {timeout}s")
         raise
     if check and result.returncode:
+        if result.stdout:
+            print(result.stdout[-65536:].decode(errors="replace"), flush=True)
         raise RuntimeError(result.stderr.decode(errors="replace"))
     return result
 
@@ -178,6 +180,8 @@ finally:
                                 ("/home/tool/gui-chromium.png", "gui-chromium.png"),
                                 ("/home/tool/gui-chromium-probe.json", "gui-chromium-probe.json"),
                                 ("/home/app/session/chromium.log", "gui-chromium.log"),
+                                ("/home/tool/gui-drain-held.json", "gui-drain-held.json"),
+                                ("/home/tool/gui-drain-unicode.json", "gui-drain-unicode.json"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
         if podman_unresponsive:
             break
