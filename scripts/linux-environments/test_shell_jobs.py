@@ -123,6 +123,49 @@ class ShellJobsTest(unittest.TestCase):
             with patch("shell_jobs.LOG_TOTAL", 2 * LOG_RESERVATION + 4):
                 self.prepare(self.request("three"))
 
+    def test_startup_without_persistent_group_cannot_confirm_claimed_job(self):
+        path, record, _ = self.prepare(self.request())
+        self.jobs.properties = lambda _: {"ActiveState": "inactive", "ControlGroup": ""}
+        self.jobs.container_info = lambda _: None
+        self.assertTrue(self.jobs.unit_empty(record))  # 未 claim，未创建容器。
+        (path / "claimed").touch()
+        self.assertFalse(self.jobs.unit_empty(record))
+        write_json(path / "armed.json", {"bootId": "boot", "unit": record["unit"],
+                                        "unitGroup": "/nonexistent-kaguya-test", "invocationId": "one"})
+        self.assertTrue(self.jobs.unit_empty(record))  # 没有 running.json，仍核查持久 unit cgroup。
+        self.jobs.properties = lambda _: {"ActiveState": "inactive", "InvocationID": "other"}
+        self.assertFalse(self.jobs.unit_empty(record))
+
+    def test_retirement_requires_full_cid_and_matching_private_identity(self):
+        path, record, _ = self.prepare(self.request())
+        self.jobs.unit_empty = lambda _: True
+        cid = "a" * 64
+        info = {"Id": cid, "State": {}, "Config": {"Labels": {"kaguya.environment": "env", "kaguya.role": "shell",
+                  "kaguya.job": record["jobId"], "kaguya.generation": "3"}}}
+        self.jobs.container_info = lambda _: info
+        with self.assertRaisesRegex(BrokerError, "container-identity-unconfirmed"):
+            self.jobs.retire(path, record)
+        (path / "container.cid").write_text("b" * 64)
+        with self.assertRaisesRegex(BrokerError, "container-identity-unconfirmed"):
+            self.jobs.retire(path, record)
+        (path / "container.cid").write_text(cid)
+        info["Config"]["Labels"]["kaguya.generation"] = "2"
+        with self.assertRaisesRegex(BrokerError, "container-identity-unconfirmed"):
+            self.jobs.retire(path, record)
+        info["Config"]["Labels"]["kaguya.generation"] = "3"
+        commands = []
+        self.jobs.backend.command = lambda *args: commands.append(args)
+        self.jobs.stopped = lambda _: True
+        self.jobs.system = lambda *args, **kwargs: None
+        self.jobs.properties = lambda _: {"ActiveState": "inactive"}
+        self.jobs.retire(path, record)
+        self.assertEqual(commands, [("rm", "--force", cid)])
+
+    def test_unknown_member_cannot_acknowledge_isolation_from_labels_only(self):
+        self.jobs.backend.command = lambda *args: json.dumps([{"Names": ["kaguya-job-" + "a" * 64]}])
+        with self.assertRaisesRegex(BrokerError, "unknown-shell-member-isolation-unconfirmed"):
+            self.jobs.isolate(self.env)
+
     def test_file_export_hash_range_and_fifo_rejection(self):
         (self.workspace / "file").write_bytes(b"abcdef")
         result = file_result(self.workspace, "file", 2, 2)

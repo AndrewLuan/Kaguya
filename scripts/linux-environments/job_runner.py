@@ -50,7 +50,7 @@ def read_gate(proc, deadline):
         raise BrokerError("gate-ready-invalid")
 
 
-def container_command(record):
+def container_command(record, cidfile=None):
     command = ["/usr/bin/podman", "--cgroup-manager=cgroupfs", "run", "--pull=never", "--interactive",
                "--name=" + record["container"], "--label=kaguya.environment=" + record["environmentId"],
                "--label=kaguya.role=shell", "--label=kaguya.job=" + record["jobId"],
@@ -64,6 +64,8 @@ def container_command(record):
                "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
                "--volume=" + record["volume"] + ":/workspace:rw", "--workdir=/workspace",
                "--entrypoint=/usr/local/bin/node"]
+    if cidfile is not None:
+        command += ["--cidfile=" + str(cidfile)]
     command += ["--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/home/tool", "--env=TMPDIR=/tmp", "--env=LANG=C.UTF-8"]
     command += [record["image"], "/opt/kaguya-tools/job-entry.mjs", record["cwd"], json.dumps(record["env"]), *record["argv"]]
     return command
@@ -89,6 +91,11 @@ def run(path):
     group = props["ControlGroup"]
     if not group or group_for(os.getpid()) != group:
         raise BrokerError("supervisor-cgroup-unconfirmed")
+    if not props.get("InvocationID"):
+        raise BrokerError("supervisor-invocation-unconfirmed")
+    # 在创建任何 OCI 进程之前持久化整个 unit 的归属，覆盖 gate 尚未 ready 的崩溃窗口。
+    write_json(path / "armed.json", {"bootId": record["bootId"], "unit": record["unit"],
+                                    "invocationId": props["InvocationID"], "unitGroup": group}, exclusive=True)
     # 已启动服务的 RuntimeMaxUSec 在 systemd 255 不可修改。使用机器启动时间为
     # 固定原点的 timer，不能用 OnActiveSec 把 supervisor 启动排队耗时变成续权。
     expiry_unit = record["unit"].removesuffix(".service") + "-expiry"
@@ -107,7 +114,7 @@ def run(path):
     if (jobs.properties(expiry_unit + ".timer").get("ActiveState") != "active" or
             not 0 < armed_deadline <= record["monotonicDeadline"] + 0.000002 or remaining(record) <= 0):
         raise BrokerError("deadline-not-armed")
-    command = container_command(record)
+    command = container_command(record, path / "container.cid")
     streams = {}
     proc = None
     selector = selectors.DefaultSelector()
@@ -129,6 +136,11 @@ def run(path):
                 info = json.loads(result.stdout)[0]
                 pid = info["State"].get("Pid", 0)
                 if info["State"]["Running"] and pid:
+                    cid = (path / "container.cid").read_text().strip()
+                    if info["Id"] != cid:
+                        raise BrokerError("container-identity-unconfirmed")
+                    with open(path / "container.cid", "rb") as cid_source:
+                        os.fsync(cid_source.fileno())
                     payload_group = group_for(pid)
                     conmon_group = group_for(info["State"]["ConmonPid"])
                     if not all(g.startswith(group + "/") for g in (payload_group, conmon_group)):

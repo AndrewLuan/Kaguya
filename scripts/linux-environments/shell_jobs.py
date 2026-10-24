@@ -130,7 +130,7 @@ class ShellJobs:
 
     def properties(self, unit):
         result = self.system("/usr/bin/systemctl", "--user", "show", unit,
-                             "--property=LoadState,ActiveState,SubState,ControlGroup,MainPID,Result,ActiveEnterTimestampMonotonic,RuntimeMaxUSec",
+                             "--property=LoadState,ActiveState,SubState,ControlGroup,InvocationID,MainPID,Result,ActiveEnterTimestampMonotonic,RuntimeMaxUSec",
                              check=False)
         props = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
         if result.returncode and props.get("LoadState") != "not-found":
@@ -346,13 +346,26 @@ class ShellJobs:
         props = self.properties(record["unit"])
         if props.get("ActiveState") not in ("inactive", "failed"):
             return False
-        groups = [props.get("ControlGroup")]
-        running = self.root / record["jobId"] / "running.json"
-        if running.exists() and record["bootId"] == boot_id():
-            groups.append(read_json(running)["unitGroup"])
+        path = self.root / record["jobId"]
+        armed = path / "armed.json"
+        if not armed.exists():
+            # 没有 claim 的 runner 尚未进入创建容器阶段；已 claim 却缺失归属证据时拒绝 ACK。
+            return not (path / "claimed").exists() and not self.container_info(record)
+        identity = read_json(armed)
+        if (identity.get("bootId") != record["bootId"] or identity.get("unit") != record["unit"] or
+                not identity.get("invocationId") or not identity.get("unitGroup")):
+            return False
+        if record["bootId"] != boot_id():
+            return True  # 上一次启动的进程已消失；禁止跨启动自动重放。
+        if props.get("InvocationID") and props["InvocationID"] != identity["invocationId"]:
+            return False
+        groups = [identity["unitGroup"], props.get("ControlGroup")]
+        running = path / "running.json"
+        if running.exists():
+            groups.extend(read_json(running)[k] for k in ("unitGroup", "payloadGroup", "conmonGroup"))
         for group in filter(None, groups):
             events = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.events"
-            if events.exists() and "populated 1" in events.read_text():
+            if events.exists() and "populated 0" not in events.read_text().splitlines():
                 return False
         return True
 
@@ -361,12 +374,19 @@ class ShellJobs:
             raise BrokerError("job-cgroup-still-populated")
         # conmon 被整组终止后，旧 Podman 可留下 stopped + 非零缓存 PID。
         # 先取得 kernel 空组证据，再删除该 job 的 runtime 记录；命名卷/manifest/输出均保留。
-        existing = self.backend.command("ps", "--all", "--sync", "--filter", "name=^" + record["container"] + "$", "--format={{.ID}}").strip()
-        if existing:
-            info = json.loads(self.backend.command("inspect", record["container"]))[0]
-            write_json(path / "retired.json", {"containerId": info["Id"], "observedState": info["State"],
+        info = self.container_info(record)
+        if info:
+            cid = (path / "container.cid").read_text().strip() if (path / "container.cid").exists() else None
+            running = read_json(path / "running.json") if (path / "running.json").exists() else {}
+            labels = info.get("Config", {}).get("Labels", {})
+            expected = {"kaguya.environment": record["environmentId"], "kaguya.role": "shell",
+                        "kaguya.job": record["jobId"], "kaguya.generation": str(record["generation"])}
+            if (not cid or not re.fullmatch("[a-f0-9]{64}", cid) or info["Id"] != cid or
+                    running.get("containerId", cid) != cid or any(labels.get(k) != v for k, v in expected.items())):
+                raise BrokerError("container-identity-unconfirmed")
+            write_json(path / "retired.json", {"containerId": cid, "observedState": info["State"],
                                                "unitCgroupEmpty": True, "checkedAt": now_iso()})
-            self.backend.command("rm", "--force", record["container"])
+            self.backend.command("rm", "--force", cid)
         if not self.stopped(record):
             raise BrokerError("job-isolation-unconfirmed")
         expiry = record["unit"].removesuffix(".service") + "-expiry"
@@ -376,15 +396,12 @@ class ShellJobs:
                 raise BrokerError("deadline-unit-cleanup-unconfirmed")
         self.system("/usr/bin/systemctl", "--user", "reset-failed", record["unit"], expiry + ".service", check=False)
 
-    def stopped(self, record):
-        if not self.unit_empty(record):
-            return False
+    def container_info(self, record):
         exists = self.backend.command("ps", "--all", "--filter", "name=^" + record["container"] + "$", "--format={{.ID}}").strip()
-        if exists:
-            state = json.loads(self.backend.command("inspect", record["container"]))[0]["State"]
-            if state["Running"] or state.get("Pid", 0):
-                return False
-        return True
+        return json.loads(self.backend.command("inspect", record["container"]))[0] if exists else None
+
+    def stopped(self, record):
+        return self.unit_empty(record) and self.container_info(record) is None
 
     def stop(self, path, record, reason):
         # 新旧代次都按不可变 job 成员身份停止；不通过用户输入构造 unit 或容器名。
@@ -430,14 +447,10 @@ class ShellJobs:
         members = json.loads(self.backend.command("ps", "--all", "--filter",
                              "label=kaguya.environment=" + env["environmentId"],
                              "--filter", "label=kaguya.role=shell", "--format=json"))
-        for member in members:
-            names = member.get("Names", [])
-            for name in names:
-                if name not in known:
-                    if not re.fullmatch("kaguya-job-[a-f0-9]{64}", name):
-                        raise BrokerError("unknown-shell-member")
-                    self.system("/usr/bin/systemctl", "--user", "stop", name + ".service", check=False)
-                    self.backend.stop_container(name)
+        # 已登记成员在上面的 stop 中按完整 CID 清理。剩余成员缺少私有归属记录，
+        # label/name 不能证明整个 kernel cgroup 已停止，因此整个 fence 必须拒绝 ACK。
+        if members:
+            raise BrokerError("unknown-shell-member-isolation-unconfirmed")
 
 
 if __name__ == "__main__":

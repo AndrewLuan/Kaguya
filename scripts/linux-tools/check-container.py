@@ -20,7 +20,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linux-environments"))
 from broker import PodmanBackend, BrokerError, digest  # noqa: E402
-from supervisor_checks import check_gate, check_deadlines, check_broker_crash  # noqa: E402
+from supervisor_checks import check_gate, check_deadlines, check_broker_crash, check_startup_window, cleanup_all  # noqa: E402
 
 
 def until(read, predicate, seconds=15):
@@ -104,6 +104,7 @@ f.writeFileSync('isolation.json',JSON.stringify({pid:f.readlinkSync('/proc/self/
             stopped = operation("stop", jobId=long["jobId"])["result"]
             assert stopped["state"] == "stopped" and backend.shell.stopped(record), stopped
             check_gate(backend, env, operation, root)
+            check_startup_window(backend, env)
             check_deadlines(backend, env, operation)
             check_broker_crash(backend, env["image"], root)
             ack = backend.handoff(env, 1, "human")
@@ -116,24 +117,16 @@ f.writeFileSync('isolation.json',JSON.stringify({pid:f.readlinkSync('/proc/self/
                 subprocess.run(["/usr/bin/journalctl", "--user", "-u", record["unit"], "--no-pager", "-n", "80"], env=backend.env)
             raise
         finally:
-            errors = []
+            actions = []
             for path, record in backend.shell.records(env):
-                try:
-                    backend.shell.stop(path, record, "ci-cleanup")
-                    command("rm", "--force", "--ignore", record["container"])
-                    backend.shell.system("/usr/bin/systemctl", "--user", "stop", record["unit"].removesuffix(".service") + "-expiry.timer", check=False)
-                except Exception as error:
-                    errors.append(str(error))
-            try:
-                backend.stop_container(env["container"])
-                command("rm", "--force", "--ignore", env["container"])
-                for prefix, identity in (("kaguya-workspace-", env["workspaceId"]), ("kaguya-private-", env["environmentId"])):
-                    command("volume", "rm", "--force", prefix + digest(identity)[:24])
-                backend.shell.system("/usr/bin/systemctl", "--user", "stop", backend.shell.slice(env), check=False)
-            except Exception as error:
-                errors.append(str(error))
-            if errors:
-                raise RuntimeError({"cleanupFailures": errors})
+                actions.append(lambda p=path, r=record: backend.shell.stop(p, r, "ci-cleanup"))
+                actions.append(lambda r=record: command("rm", "--force", "--ignore", r["container"]))
+            actions.extend([lambda: backend.stop_container(env["container"]),
+                            lambda: command("rm", "--force", "--ignore", env["container"])])
+            for prefix, identity in (("kaguya-workspace-", env["workspaceId"]), ("kaguya-private-", env["environmentId"])):
+                actions.append(lambda p=prefix, i=identity: command("volume", "rm", "--force", p + digest(i)[:24]))
+            actions.append(lambda: backend.shell.system("/usr/bin/systemctl", "--user", "stop", backend.shell.slice(env)))
+            cleanup_all(actions)
 
 
 if __name__ == "__main__":

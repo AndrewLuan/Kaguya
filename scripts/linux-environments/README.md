@@ -74,7 +74,7 @@ broker 为每次采集生成独立 UUID ArtifactRef，内容 hash 仅用于 blob
 
 supervisor 在放行 argv 前设置 systemd 运行上限和日历截止 timer，并核对 conmon/payload 均在 job unit 的 cgroup 下。容器内的固定入口只等待 stdin 启动消息；不接收 permit、控制 socket、systemd bus 或私有回执。broker 崩溃不影响 job unit；supervisor 异常退出或被暂停后，systemd 仍可终止整个组。单调 timer 使用机器启动为固定原点的 OnBootSec，并通过 D-Bus 读回实际截止；排队耗时不续权。创建服务时的运行上限仅作附加保护；supervisor 同时检查墙钟与 BOOTTIME。
 
-停止 ACK 要求 unit 已停、记录的 cgroup 无进程、容器 Running=false/Pid=0。正常完成还要求 payload cgroup 为空、输出管道结束。`setsid`、double-fork 和新 PID namespace 都不能离开只读 cgroup 边界。输出最多为每 job 32 MiB，两环境合计最多预留 1 GiB；超额停止任务并保留已有输出。附件仍采用单次 16 MiB、存储总额 2 GiB 的既有限制。
+停止 ACK 要求 unit 已停、创建容器前持久记录的 cgroup 无进程，并核对私有完整 CID、environment/job/generation 标签后按 CID 清除运行时记录。停止屏障最终确认容器不存在；缺失身份或未知成员保持隔离未确认。正常完成还要求 payload cgroup 为空、输出管道结束。`setsid`、double-fork 和新 PID namespace 都不能离开只读 cgroup 边界。输出最多为每 job 32 MiB，两环境合计最多预留 1 GiB；超额停止任务并保留已有输出。附件仍采用单次 16 MiB、存储总额 2 GiB 的既有限制。
 
 文件 verify 在 broker journal 中核对原 operation 存在且 scope/environment/workspace/attempt 匹配，返回 `verificationKind=current-file-state`。hash 证明核验时的文件内容；原操作引用提供身份关联，不自动证明文件由该命令造成。workspace 文件由固定宿主程序经 rootless `podman unshare` 逐级 openat/O_NOFOLLOW 读取，拒绝符号链接与非普通文件，不执行 workspace 中的代码。
 

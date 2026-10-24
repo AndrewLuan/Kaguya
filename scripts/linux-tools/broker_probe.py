@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """功能概述：真实 Linux CI 的 broker 崩溃夹具，在 dispatched 持久屏障后等待被 SIGKILL。
-主要职责：使用生产 Broker/PodmanBackend 创建环境与 shell job；collect 暂扣回执，stdout
+主要职责：使用生产 Broker/PodmanBackend 创建环境与 shell job；启动窗口模式暂停真实 gate；collect 暂扣回执，stdout
 只发无 token 的测试身份。恢复方据原 operation 核对 unknown，不重新派发。
 代码库关系：supervisor_checks.py 启动并回收本进程及所有实际容器，不能用于生产部署。
 输入输出与副作用：仅随机 CI 环境；测试 argv 写一次效果和延迟 marker，无网络或 LLM。
@@ -8,11 +8,23 @@
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import signal
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linux-environments"))
 from broker import Broker, PodmanBackend  # noqa: E402
+
+# 启动窗口夹具：保留生产 run，只在真实 gate ready 后、inspect/放行前暂停宿主 supervisor。
+if sys.argv[1] == "--startup-window":
+    import job_runner
+    gate = job_runner.read_gate
+    def paused_gate(proc, deadline):
+        gate(proc, deadline)
+        os.kill(os.getpid(), signal.SIGSTOP)
+    job_runner.read_gate = paused_gate
+    job_runner.run(Path(sys.argv[2]))
+    raise SystemExit(0)
 
 root, image, key = sys.argv[1:]
 backend = PodmanBackend()

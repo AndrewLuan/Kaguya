@@ -105,8 +105,33 @@ int OSSL_provider_init(void *h,const Dispatch *in,const Dispatch **out,void **ct
         assert base64.b64decode(result["dataBase64"]) == b"after-release"
         print(json.dumps({"gateProvider": {"withheldRunEffects": 0, "releasedProviderLoaded": True, "jobEnvironmentCorrect": True}}), flush=True)
     finally:
-        cleanup_all([lambda: backend.stop_container(record["container"]), lambda: stop_process(proc),
+        cleanup_all([lambda: backend.stop_container(record["container"]),
+                     lambda: backend.command("rm", "--force", "--ignore", record["container"]), lambda: stop_process(proc),
                      *[stream.close for stream in (proc.stdin, proc.stdout, proc.stderr) if stream]])
+
+
+def check_startup_window(backend, env):
+    req = request(env, argv=["/bin/sh", "-c", "echo bad > early-release"], cwd=".", env={})
+    path, record, _ = backend.shell.prepare(env, req, backend.shell.check(env, req))
+    command = backend.shell.unit_command(path, record)
+    command[-2:] = [str(Path(__file__).with_name("broker_probe.py")), "--startup-window", str(path)]
+    backend.shell.system(*command)
+    def paused():
+        pid = int(backend.shell.properties(record["unit"]).get("MainPID", "0"))
+        try:
+            return pid and "\nState:\tT" in Path(f"/proc/{pid}/status").read_text()
+        except FileNotFoundError:
+            return False
+    wait_until(paused, bool)
+    assert (path / "armed.json").exists() and (path / "container.cid").exists()
+    assert not (path / "running.json").exists() and not exists(backend, env, "early-release")
+    cid = (path / "container.cid").read_text().strip()
+    backend.shell.stop(path, record, "ci-startup-window")
+    assert backend.shell.stopped(record)
+    assert read_json(path / "retired.json")["containerId"] == cid
+    assert not exists(backend, env, "early-release")
+    print(json.dumps({"startupWindow": {"runningRecordAbsent": True, "effects": 0,
+                                        "fullCidRetired": cid, "unitCgroupEmpty": True}}), flush=True)
 
 
 def check_deadlines(backend, env, operation):
