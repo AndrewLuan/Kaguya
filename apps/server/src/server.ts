@@ -5,6 +5,7 @@ import { migrateLifecycleConfig } from "@kaguya/config";
  * 模块配置管理复用 configuration.exclusive，与显式应用共锁；保存不会切换运行实例。
  * 启动和显式热应用分别把 inboundAllowlist 交给 AdapterHost、outboundAllowlist 交给 Runtime 及目标授权服务。
  * 插件清单在数据库前冻结 Catalog/Kind；预检、运行和失败回滚复用相同快照，真实 fiber 负责模块生命周期。
+ * 显式 nativeMemoryTools 配置贯通初次启动与 Runtime 重建，工具目录和执行权限由宿主安装。
  * 功能概述：Server composition root，组合配置、数据库、Runtime、HTTP/Web 与 NapCat 生命周期。
  * 主要职责：startKaguyaServer 验证 Profile 和模块配置后启动宿主；close 逆序释放资源；
  * createRuntimeModelSelectionResolver 根据 Profile 批准的 tier 解析 provider/model、思考参数及硬超时；
@@ -207,6 +208,9 @@ export async function startKaguyaServer(
         : {
             configRoot: providedConfig.configRoot,
             development: providedConfig.development,
+            ...(providedConfig.nativeMemoryTools
+              ? { nativeMemoryTools: true }
+              : {}),
           };
     const newConfigRoot =
       (
@@ -458,6 +462,7 @@ export async function startKaguyaServer(
           database,
           logger: rootLogger,
           ...createMessageComposition(resolveModelSelection, {
+            ...(config.nativeMemoryTools ? { nativeMemoryTools: true } : {}),
             pluginModelTasks: pluginSnapshot.modelTasks,
             ...createMemoryCompositionOptions(
               memoryConfigFromModules(moduleConfigs),
@@ -727,6 +732,9 @@ export async function startKaguyaServer(
                 ),
                 moduleConfigs: nextPlugins.configs,
                 catalog: nextPlugins.catalog,
+                ...(nextConfig.nativeMemoryTools
+                  ? { nativeMemoryTools: true }
+                  : {}),
                 pluginModelTasks: nextPlugins.modelTasks,
                 agentIdentity: snapshot.profile.identity,
                 ai: snapshot.profile.ai,

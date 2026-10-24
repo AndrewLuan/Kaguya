@@ -1,5 +1,11 @@
+/**
+ * 功能概述：由冻结历史组装 provider 原生上下文；reasoning/图像与完整工具交互作为一组保留。
+ * 工具调用只连接同一 completed 的持久结果，SDK 临时 tool-error 不构成执行证据。
+ * 缺失配对时拒绝向新模型派发，裁剪不会留下孤立调用或结果。
+ */
 import {
   nativeResponseSchema,
+  nativeMessagesSchema,
   type NativeMessage,
   type DeepReadonly,
   type InformationAtom,
@@ -62,6 +68,37 @@ export function assembleNativeInput(input: {
         if (part.type === "tool-result")
           openCalls.delete(String(part.toolCallId));
       }
+    }
+    const toolResults = input.atoms.filter(
+      (a) =>
+        a.kind === "agent.heavy.tool.result.v1" &&
+        a.payload.modelCompletedInformationId === atom.informationId,
+    );
+    if (payload.generationKind === "tool-calls") {
+      const ordered = (payload.toolCalls ?? []).map((c: any) =>
+        toolResults.find((a) => a.payload.toolCallId === c.toolCallId),
+      );
+      if (
+        ordered.some((r: any) => !r) ||
+        ordered.length !== openCalls.size ||
+        new Set(ordered.map((r: any) => r?.payload.toolCallId)).size !==
+          ordered.length
+      )
+        throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
+      native.data.messages.push(
+        ...nativeMessagesSchema.parse([
+          {
+            role: "tool",
+            content: ordered.map((r: any, i: number) => ({
+              type: "tool-result",
+              toolCallId: r.payload.toolCallId,
+              toolName: payload.toolCalls[i].toolName,
+              output: { type: "json", value: r.payload.value },
+            })),
+          },
+        ]),
+      );
+      for (const r of ordered) openCalls.delete(String(r!.payload.toolCallId));
     }
     const compatible =
       payload.resolvedModel.providerId === input.model.providerId &&
@@ -135,13 +172,16 @@ export function assembleNativeInput(input: {
         source: source?.payload.target ?? source?.payload.source ?? null,
         conversation: background?.payload.background ?? null,
         evidenceRole: "historical-assistant-output-not-current-activity",
-        status: recall
-          ? recallResult
-            ? `recall-${recallResult.payload.status}`
-            : "recall-pending"
-          : silent
-            ? "agent.heavy.response.silent"
-            : (receipt?.kind ?? terminal?.kind ?? "pending"),
+        status:
+          payload.generationKind === "tool-calls"
+            ? "native-tool-results"
+            : recall
+              ? recallResult
+                ? `recall-${recallResult.payload.status}`
+                : "recall-pending"
+              : silent
+                ? "agent.heavy.response.silent"
+                : (receipt?.kind ?? terminal?.kind ?? "pending"),
         ...(recall
           ? { recall: recallResult?.payload.snapshot ?? null }
           : receipt

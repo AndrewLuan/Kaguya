@@ -13,6 +13,7 @@
  * 代码库关系：依赖 Database、Core、ModuleHost 和平台适配契约；具体 Agent 列表与 LLM 模型绑定位于 apps composition root。
  * 输入输出与副作用：连接、迁移、账本写入和 transport I/O 均在生命周期内执行；close 拒绝新入口并停止可靠领取。
  * 数据库初始化错误脱敏；只关闭自行创建的连接。submit 的 deliveries 是当次实际收集快照，可靠链通常异步完成。
+ * nativeTools 可选注入宿主工具目录，经批准任务协调持久原生循环；独立 route 不替换 Heavy 全局模型。
  * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
  * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
  * 模块只通过 #76 的 context.use 获得通用能力。缺少批准或无效 capability 在任何 create 前拒绝。
@@ -22,6 +23,10 @@
  * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
  * 启动注入数据库 observationCapability，Memory 热重载保留同一绑定；观察端口不改变平台投递和 Memory 发布的状态拥有者。
  */
+import {
+  nativeToolInformationKinds,
+  actionDecisionInformationKind,
+} from "@kaguya/sdk";
 import {
   MessageTargetService,
   type AuthorizedMessagePromptRenderer,
@@ -89,6 +94,11 @@ import type {
   OutboundMessageContent,
   PlatformDestination,
 } from "@kaguya/schema";
+import { createNativeMemoryTools } from "./native-memory-tools.js";
+import {
+  NativeToolLoop,
+  type NativeToolLoopOptions,
+} from "./native-tool-loop.js";
 import { ActionExecutor, type ActionExecutorOptions } from "./action.js";
 import {
   actionCapability,
@@ -124,6 +134,7 @@ import {
 export interface RuntimeModelTaskApproval {
   readonly activation: ModuleActivationProvenance;
   readonly selectionPolicy: ModelTaskRequest<unknown>["selectionPolicy"];
+  readonly taskId?: string;
 }
 export type RuntimeModelTaskOptions = Pick<
   ModelTaskClientOptions,
@@ -165,6 +176,7 @@ function isMemoryCapability(id: string): boolean {
 }
 
 type KaguyaRuntimeBaseOptions = {
+  readonly nativeTools?: NativeToolLoopOptions;
   readonly actionProviders?: readonly ActionProvider[];
   readonly actionEnvironment?: Pick<
     ActionExecutorOptions,
@@ -692,9 +704,38 @@ export class KaguyaRuntime implements InformationIngress {
           : this.options.capabilities;
       const enabledSuppliedCapabilities = suppliedCapabilities ?? [];
       await database.actions.recoverExpired();
+      if (
+        this.options.actionProviders?.some(
+          (p) => p.id === "core.native-memory",
+        ) ||
+        this.options.nativeTools?.registrations.some(
+          (t) => t.providerId === "core.native-memory",
+        )
+      )
+        throw new Error("Reserved native Memory provider");
+      const memoryTools =
+        this.options.nativeTools?.memory && memoryEnabled
+          ? createNativeMemoryTools(database)
+          : undefined;
+      const nativeOptions =
+        this.options.nativeTools && memoryTools
+          ? {
+              ...this.options,
+              nativeTools: {
+                ...this.options.nativeTools,
+                registrations: [
+                  ...this.options.nativeTools.registrations,
+                  ...memoryTools.registrations,
+                ],
+              },
+            }
+          : this.options;
       this.#actionExecutor = new ActionExecutor({
         store: database.actions,
-        providers: this.options.actionProviders ?? [],
+        providers: [
+          ...(this.options.actionProviders ?? []),
+          ...(memoryTools ? [memoryTools.provider] : []),
+        ],
         core,
         ...this.options.actionEnvironment,
         onRecoveryError: () =>
@@ -741,9 +782,10 @@ export class KaguyaRuntime implements InformationIngress {
           }),
         },
         ...composeModelTaskCapabilities(
-          this.options,
+          nativeOptions,
           { core, now: this.#now, oneShotSchedule },
           enabledSuppliedCapabilities,
+          { db: database, actions: this.#actionExecutor },
         ),
       ];
 
@@ -1443,32 +1485,60 @@ export class KaguyaRuntime implements InformationIngress {
 
 class ApprovedModelTaskClient extends ModelTaskClient {
   readonly #approvals: readonly RuntimeModelTaskApproval[];
+  readonly #loop?: NativeToolLoop;
   constructor(
     options: ModelTaskClientOptions,
     approvals: readonly RuntimeModelTaskApproval[],
+    native?: {
+      db: KaguyaDatabase;
+      actions: ActionExecutor;
+      options: NativeToolLoopOptions;
+    },
   ) {
     super(options);
-    this.#approvals = approvals.map(({ activation, selectionPolicy }) => ({
-      activation: Object.freeze({ ...activation }),
-      selectionPolicy: Object.freeze(
-        modelTaskSelectionPolicySchema.parse(selectionPolicy),
-      ),
-    }));
+    if (native)
+      this.#loop = new NativeToolLoop({
+        ...native,
+        core: options.core,
+        model: {
+          execute: (request) => super.execute(request),
+          cancel: (request) => super.cancel(request),
+        },
+      });
+    this.#approvals = approvals.map(
+      ({ activation, selectionPolicy, taskId }) => ({
+        ...(taskId ? { taskId } : {}),
+        activation: Object.freeze({ ...activation }),
+        selectionPolicy: Object.freeze(
+          modelTaskSelectionPolicySchema.parse(selectionPolicy),
+        ),
+      }),
+    );
   }
 
+  override cancel(request: import("./model-task.js").ModelTaskCancellation) {
+    return this.#loop
+      ? this.#loop.cancelRequest(request)
+      : super.cancel(request);
+  }
   override execute<TOutput>(request: ModelTaskRequest<TOutput>) {
     if (
       !this.#approvals.some(
-        ({ activation, selectionPolicy }) =>
+        ({ activation, selectionPolicy, taskId }) =>
           activation.instanceId === request.activation.instanceId &&
           activation.definitionId === request.activation.definitionId &&
-          selectionPolicy.tier === request.selectionPolicy.tier,
+          selectionPolicy.tier === request.selectionPolicy.tier &&
+          selectionPolicy.routeId === request.selectionPolicy.routeId &&
+          (!selectionPolicy.routeId || taskId === request.task.taskId) &&
+          (!taskId || taskId === request.task.taskId),
       )
     )
       return Promise.reject(
         new Error("Model task activation or policy is not approved"),
       );
-    return super.execute(request);
+    return this.#loop?.enabled(request)
+      ? this.#loop.execute(request)
+      : super.execute(request);
   }
 }
 
@@ -1476,6 +1546,7 @@ function composeModelTaskCapabilities(
   options: KaguyaRuntimeOptions,
   context: RuntimeCapabilityContext,
   supplied: readonly ModuleCapabilityImplementation[],
+  native?: { db: KaguyaDatabase; actions: ActionExecutor },
 ): readonly ModuleCapabilityImplementation[] {
   const capabilities = [...supplied];
   if (options.modelTask) {
@@ -1507,8 +1578,25 @@ function composeModelTaskCapabilities(
     capabilities.push({
       capability: modelTaskCapability,
       value: new ApprovedModelTaskClient(
-        { ...options.modelTask, ...context },
+        {
+          ...options.modelTask,
+          ...context,
+          ...(native
+            ? {
+                admitNativeDispatch: (id, step) =>
+                  native.db.nativeTools.admitModel(
+                    step.runInformationId,
+                    step.stepIndex,
+                    id,
+                    context.core.executionClaim,
+                  ),
+              }
+            : {}),
+        },
         approvals,
+        native && options.nativeTools
+          ? { ...native, options: options.nativeTools }
+          : undefined,
       ),
     });
   }
@@ -1582,6 +1670,8 @@ function createRegistry(
   for (const definition of [
     ...builtInInformationKinds,
     ...modelTaskInformationKinds,
+    ...nativeToolInformationKinds,
+    actionDecisionInformationKind,
     ...cadenceInformationKinds,
   ]) {
     registered.set(definition.kind, definition);
@@ -1620,6 +1710,8 @@ function collectDefinitions(
     [
       ...builtInInformationKinds,
       ...modelTaskInformationKinds,
+      ...nativeToolInformationKinds,
+      actionDecisionInformationKind,
       ...cadenceInformationKinds,
       ...oneShotInformationKinds,
       executionExhaustedInformationKind,

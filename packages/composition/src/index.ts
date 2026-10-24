@@ -5,6 +5,7 @@ import {
 /**
  * 按 QQ 表情实例实际开关装配草稿处理器并批准其 light 模型任务，非 QQ 和禁用路径保持原行为。
  * 模板加载器统一选择所有模块的 default/local 正文；Catalog 注入 Light、Heavy 和 Expression，授权正文渲染器注入 Runtime。
+ * nativeTaskModels 只为明确任务提供独立宿主路由；nativeMemoryTools 显式安装 Heavy 的 Memory 工具。
  * 功能概述：作为 Server 与 Demo 共用的唯一 Runtime Composition 边界，组装业务 Catalog 与宿主批准的 Model Task 能力。
  * 记忆开关控制 memory.native，关闭时普通对话继续运行。
  * Router 与 Heavy 同时注入宿主目标授权能力；自然语言跨会话自动校验，管理端路径仍需正文确认。
@@ -97,7 +98,18 @@ export type RuntimeModelSelectionResolver = (
   readonly model: ReturnType<KaguyaLlmModelResolver>;
   readonly generationOptions?: KaguyaLlmGenerationOptions;
 };
+export interface NativeTaskModelRoute {
+  readonly definitionId: string;
+  readonly taskId: string;
+  readonly routeId: string;
+  readonly tier: "light" | "heavy";
+  readonly resolve: () => ReturnType<RuntimeModelSelectionResolver>;
+}
 export interface MessageCompositionOptions {
+  /** 仅宿主配置，工具目录与授权不可从模型输出或 MCP annotations 推导。 */
+  readonly nativeMemoryTools?: boolean;
+  readonly nativeTools?: import("@kaguya/runtime").NativeToolLoopOptions;
+  readonly nativeTaskModels?: readonly NativeTaskModelRoute[];
   readonly ai?: UserConfigProfile["ai"];
   readonly pluginModelTasks?: Readonly<Record<string, "light" | "heavy">>;
   readonly memoryEnabled?: boolean;
@@ -206,31 +218,73 @@ export function createMessageComposition(
     };
     readonly generationOptions: KaguyaLlmGenerationOptions;
   }>();
+  const routes = new Map(
+    (options.nativeTaskModels ?? []).map((r) => [r.routeId, r]),
+  );
+  if (routes.size !== (options.nativeTaskModels ?? []).length)
+    throw new Error("Duplicate task model route");
+  if (options.nativeMemoryTools && !memoryEnabled)
+    throw new Error("Native Memory tools require enabled Memory");
+  const nativeTools =
+    options.nativeTools ??
+    (options.nativeMemoryTools
+      ? {
+          memory: true,
+          registrations: [],
+          tasks: [
+            {
+              taskId: "agent.heavy.respond",
+              definitionId: "agent.heavy",
+              toolIds: [
+                "memory.query",
+                "memory.read",
+                "memory.history",
+                "memory.correct",
+                "memory.record",
+              ],
+            },
+          ],
+        }
+      : undefined);
   const modelTask: RuntimeModelTaskOptions = {
     renderStructuredOutputPrompt,
-    approvals: activations
-      .filter(
-        (activation) =>
-          [
-            "agent.heavy",
-            "agent.router",
-            "agent.situation",
-            "memory.native",
-            "plugin.qq-expression",
-          ].includes(activation.definitionId) ||
-          options.pluginModelTasks?.[activation.definitionId] !== undefined,
-      )
-      .map((activation) => ({
-        activation: {
-          instanceId: activation.instanceId,
-          definitionId: activation.definitionId,
-        },
-        selectionPolicy: {
-          tier:
-            options.pluginModelTasks?.[activation.definitionId] ??
-            (activation.definitionId === "agent.heavy" ? "heavy" : "light"),
-        },
-      })),
+    approvals: [
+      ...activations
+        .filter(
+          (activation) =>
+            [
+              "agent.heavy",
+              "agent.router",
+              "agent.situation",
+              "memory.native",
+              "plugin.qq-expression",
+            ].includes(activation.definitionId) ||
+            options.pluginModelTasks?.[activation.definitionId] !== undefined,
+        )
+        .map((activation) => ({
+          activation: {
+            instanceId: activation.instanceId,
+            definitionId: activation.definitionId,
+          },
+          selectionPolicy: {
+            tier:
+              options.pluginModelTasks?.[activation.definitionId] ??
+              (activation.definitionId === "agent.heavy" ? "heavy" : "light"),
+          },
+        })),
+      ...activations.flatMap((activation) =>
+        (options.nativeTaskModels ?? [])
+          .filter((r) => r.definitionId === activation.definitionId)
+          .map((r) => ({
+            activation: {
+              instanceId: activation.instanceId,
+              definitionId: activation.definitionId,
+            },
+            taskId: r.taskId,
+            selectionPolicy: { tier: r.tier, routeId: r.routeId },
+          })),
+      ),
+    ],
     client: new KaguyaLlmClient({
       resolveModel: ({ modelId }) => {
         const active = activeModel.getStore();
@@ -243,8 +297,13 @@ export function createMessageComposition(
       resolveGenerationOptions: () =>
         activeModel.getStore()?.generationOptions ?? {},
     }),
-    resolveModel: ({ tier }) => {
-      const resolved = resolveModelSelection({ modelTier: tier });
+    resolveModel: ({ tier, routeId }) => {
+      const route = routeId ? routes.get(routeId) : undefined;
+      if (routeId && (!route || route.tier !== tier))
+        throw new Error("Unapproved task model route");
+      const resolved = route
+        ? route.resolve()
+        : resolveModelSelection({ modelTier: tier });
       const identity = {
         providerId: resolved.providerId,
         modelId: resolved.modelId,
@@ -269,6 +328,7 @@ export function createMessageComposition(
       embeddings: memoryEnabled ? nativeEmbeddings(options) : [],
     },
     modelTask,
+    ...(nativeTools ? { nativeTools } : {}),
     capabilities: ({
       oneShotSchedule,
       core,

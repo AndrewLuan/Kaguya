@@ -1,4 +1,5 @@
 /**
+ * nativeTools 保存工具循环预算、dispatch 和调用映射；迁移在行动表之后初始化。
  * memoryGraph 暴露三字段节点与有向类型边的独立 PostgreSQL 存储。
  * 功能概述：提供 Kaguya 唯一的 PostgreSQL 信息账本入口，组合驱动、schema 准备与
  * append-only `InformationRepository`。
@@ -11,6 +12,20 @@
  * 集成测试与运维边界使用，不再创建 SQLite 文件或旧消息/运行记录仓储。
  * observations 组合持久场景、冻结清单和消费者进度；prepareSchema 在基础账本后执行幂等附加迁移。
  */
+import { prepareNativeMemoryToolSchema } from "./native-memory-tools.js";
+export {
+  NativeMemoryTools,
+  nativeMemoryToolSchemas,
+} from "./native-memory-tools.js";
+import {
+  PostgresNativeToolStore,
+  prepareNativeToolSchema,
+} from "./native-tool-store.js";
+export {
+  PostgresNativeToolStore,
+  type NativeToolRunRow,
+  type NativeToolCallRow,
+} from "./native-tool-store.js";
 import { PostgresObservationStore } from "./observation-store.js";
 import { prepareObservationSchema } from "./observation-schema.js";
 import { PostgresActionStore, prepareActionSchema } from "./action-store.js";
@@ -98,6 +113,7 @@ export {
 
 export class KaguyaDatabase {
   readonly actions: PostgresActionStore;
+  readonly nativeTools: PostgresNativeToolStore;
   readonly observations: PostgresObservationStore;
   readonly information: InformationRepository;
   readonly memoryGraph: PostgresMemoryGraphStore;
@@ -106,6 +122,7 @@ export class KaguyaDatabase {
 
   constructor(readonly sql: SqlDatabase) {
     this.actions = new PostgresActionStore(sql);
+    this.nativeTools = new PostgresNativeToolStore(sql);
     this.observations = new PostgresObservationStore(sql);
     this.information = new InformationRepository(sql);
     this.memoryGraph = new PostgresMemoryGraphStore(sql);
@@ -136,6 +153,8 @@ export class KaguyaDatabase {
     await prepareDatabaseSchema(this.sql);
     await prepareObservationSchema(this.sql);
     await prepareActionSchema(this.sql);
+    await prepareNativeToolSchema(this.sql);
+    await prepareNativeMemoryToolSchema(this.sql);
   }
 
   async close(): Promise<void> {

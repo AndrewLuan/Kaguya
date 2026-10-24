@@ -24,7 +24,11 @@ import { createTestingDatabase } from "@kaguya/database/testing";
 import { closeLogger, createLogger } from "@kaguya/logger";
 import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
 import { createWebOutboundTransport } from "@kaguya/platform-adapters";
-import { KaguyaRuntime, GatewayAllowlist } from "@kaguya/runtime";
+import {
+  KaguyaRuntime,
+  GatewayAllowlist,
+  nativeToolWireName,
+} from "@kaguya/runtime";
 import type { PlatformOutboundTransport } from "@kaguya/platform-adapters";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -84,6 +88,7 @@ function testConfig(): ServerConfig {
 
 async function fixture(
   options: {
+    nativeMemoryTools?: boolean;
     registerTransport?: boolean;
     respond?: (prompt: string, index: number) => unknown | Promise<unknown>;
     transport?: PlatformOutboundTransport;
@@ -117,6 +122,7 @@ async function fixture(
   });
 
   const composerPrompts: string[] = [];
+  const providerRequests: any[] = [];
   const waitFor = createPersistenceWait(database, () => ({
     composerCalls: composerPrompts.length,
     ...options.diagnostics?.(),
@@ -128,6 +134,7 @@ async function fixture(
       model: string;
       messages: unknown[];
     };
+    providerRequests.push(request);
     const prompt = JSON.stringify(request.messages);
     let output: unknown;
     if (prompt.includes("归纳这批真人消息")) {
@@ -157,12 +164,23 @@ async function fixture(
         choices: [
           {
             index: 0,
-            message: {
-              role: "assistant",
-              content:
-                typeof output === "string" ? output : JSON.stringify(output),
-            },
-            finish_reason: "stop",
+            message: (output as any)?.nativeToolCalls
+              ? {
+                  role: "assistant",
+                  content: null,
+                  reasoning_content: "合成工具推理",
+                  tool_calls: (output as any).nativeToolCalls,
+                }
+              : {
+                  role: "assistant",
+                  content:
+                    typeof output === "string"
+                      ? output
+                      : JSON.stringify(output),
+                },
+            finish_reason: (output as any)?.nativeToolCalls
+              ? "tool_calls"
+              : "stop",
           },
         ],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -187,6 +205,9 @@ async function fixture(
           model: provider.chatModel(`web-test-${modelTier}`),
         }),
         {
+          ...(options.nativeMemoryTools
+            ? { nativeMemoryTools: true, memoryEnabled: true }
+            : {}),
           moduleConfigs: [
             ...createFirstPartyModuleConfigDefaults("test"),
             ...(options.expressions
@@ -195,21 +216,23 @@ async function fixture(
                 )
               : []),
           ].map((config) =>
-            config.definitionId === "agent.heavy" &&
-            options.pacingMs !== undefined
-              ? {
-                  ...config,
-                  settings: {
-                    pacing: {
-                      minMs: options.pacingMs,
-                      maxMs: options.pacingMs,
+            config.definitionId === "memory.native" && options.nativeMemoryTools
+              ? { ...config, enabled: true }
+              : config.definitionId === "agent.heavy" &&
+                  options.pacingMs !== undefined
+                ? {
+                    ...config,
+                    settings: {
+                      pacing: {
+                        minMs: options.pacingMs,
+                        maxMs: options.pacingMs,
+                      },
                     },
-                  },
-                }
-              : config.definitionId === "plugin.qq-expression" &&
-                  options.expressions
-                ? { ...config, enabled: true }
-                : config,
+                  }
+                : config.definitionId === "plugin.qq-expression" &&
+                    options.expressions
+                  ? { ...config, enabled: true }
+                  : config,
           ),
         },
       ),
@@ -319,6 +342,7 @@ async function fixture(
     app,
     database,
     composerPrompts,
+    providerRequests,
     waitFor,
     settle,
     runtime: () => runtime!,
@@ -335,6 +359,85 @@ async function fixture(
 }
 
 describe("Web private chat through the production information DAG", () => {
+  it(
+    "routes production Heavy native Memory query through a W3 receipt into the next prompt",
+    async () => {
+      const f = await fixture({
+        nativeMemoryTools: true,
+        respond: (_prompt, index) =>
+          index === 1
+            ? {
+                nativeToolCalls: [
+                  {
+                    id: "memory-call-original",
+                    type: "function",
+                    function: {
+                      name: nativeToolWireName("memory.query", "1"),
+                      arguments: JSON.stringify({ query: "本轮对话" }),
+                    },
+                  },
+                ],
+              }
+            : { action: "message", text: "已完成记忆查询" },
+      });
+      const conversation = randomUUID();
+      await f.exchange(
+        conversation,
+        "请查询本轮记忆",
+        "native-memory-production",
+        ["请查询本轮记忆", "已完成记忆查询"],
+      );
+      const heavy = f.providerRequests.filter(
+        (r) => r.model === "web-test-heavy",
+      );
+      expect(heavy).toHaveLength(2);
+      expect(heavy[0].tools.map((t: any) => t.function.name)).toContain(
+        nativeToolWireName("memory.query", "1"),
+      );
+      expect(heavy[1].messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: "tool",
+            tool_call_id: "memory-call-original",
+          }),
+        ]),
+      );
+      const calls = (
+        await f.database.sql.query<any>(
+          "SELECT * FROM information_native_tool_calls",
+        )
+      ).rows;
+      expect(calls).toHaveLength(1);
+      expect(calls[0].call_id).toBe("memory-call-original");
+      expect(calls[0].intent_id).toBeTruthy();
+      expect(calls[0].result_id).toBeTruthy();
+      const steps = (
+        await f.database.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='agent.heavy.tool.step.frozen.v1' ORDER BY (payload->>'stepIndex')::integer",
+        )
+      ).rows;
+      expect(steps).toHaveLength(2);
+      expect(steps[1].payload.supplements).toHaveLength(1);
+      await f.exchange(conversation, "继续", "native-memory-next-turn", [
+        "请查询本轮记忆",
+        "已完成记忆查询",
+        "继续",
+        "已完成记忆查询",
+      ]);
+      const next = f.providerRequests
+        .filter((r) => r.model === "web-test-heavy")
+        .at(-1);
+      expect(next.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: "tool",
+            tool_call_id: "memory-call-original",
+          }),
+        ]),
+      );
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
   it(
     "keeps continuation delivery records scoped to the current expression",
     async () => {

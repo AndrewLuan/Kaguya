@@ -1,4 +1,5 @@
 /**
+ * 工具单步声明和原始调用随 requested/completed 保存，dispatched 为不自动重发的持久请求凭据。
  * conversationContextInformationKind 注册宿主冻结的背景与目标解析投影，内容日志仅输出目录状态。
  * 出站策略拒绝使用不含 target ID 的失败分支；消费者通过请求引用关联 turn，日志只投影安全字段。
  * Light 的普通请求日志仅投影任务元数据，不包含 Prompt 预览；显式 content detail 保留受控诊断。
@@ -43,6 +44,8 @@ import {
   compiledPromptSchema,
   nativeMessagesSchema,
   nativeResponseSchema,
+  nativeToolDeclarationSchema,
+  nativeToolCallSchema,
   jsonValueSchema,
   informationIdSchema,
   platformDestinationSchema,
@@ -262,6 +265,7 @@ export const deliveryFailedInformationKind = defineInformationKind({
 export const modelTaskSelectionPolicySchema = z
   .object({
     tier: z.enum(["light", "heavy"]),
+    routeId: nonBlankString.exactOptional(),
   })
   .strict();
 export const modelTaskOutputModeSchema = z.enum(["text", "object"]);
@@ -292,6 +296,17 @@ export const modelTaskMetadataSchema = z
     promptTemplateDigest: nonBlankString,
     promptDigest: nonBlankString,
     messagesDigest: nonBlankString.nullable().default(null),
+    tools: z.array(nativeToolDeclarationSchema).max(64).exactOptional(),
+    nativeStep: z
+      .object({
+        runInformationId: informationIdSchema,
+        stepIndex: z.number().int().nonnegative(),
+        deadline: z.iso.datetime(),
+        maxContextBytes: z.number().int().positive(),
+        maxOutputBytes: z.number().int().positive(),
+      })
+      .strict()
+      .exactOptional(),
     provenance: modelTaskProvenanceSchema,
     activation: z
       .object({ instanceId: nonBlankString, definitionId: nonBlankString })
@@ -485,6 +500,27 @@ export const modelTaskRequestedInformationKind = defineInformationKind({
 function digest(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
+export const modelTaskDispatchedInformationKind = defineInformationKind({
+  kind: "core.model.task.dispatched.v1",
+  displayName: "模型请求已领取",
+  description:
+    "调用前固定单次请求身份；无终态的恢复请求保持不确定，不能自动重发。",
+  payloadSchema: z
+    .object({
+      requestedInformationId: informationIdSchema,
+      nonce: nonBlankString,
+    })
+    .strict(),
+  references: {
+    "core:caused-by": {
+      required: true,
+      multiple: false,
+      targetKinds: ["core.model.task.requested"],
+    },
+  },
+  log: { enabled: false },
+});
+
 export const modelTaskCompletedInformationKind = defineInformationKind({
   kind: "core.model.task.completed",
   displayName: "模型任务完成",
@@ -496,6 +532,8 @@ export const modelTaskCompletedInformationKind = defineInformationKind({
         ...modelTaskTerminalShape,
         ...modelTaskUsageShape,
         output: modelTaskOutputSchema,
+        generationKind: z.enum(["final", "tool-calls"]).default("final"),
+        toolCalls: z.array(nativeToolCallSchema).default([]),
         native: nativeResponseSchema.nullable().default(null),
       })
       .strict(),
@@ -503,6 +541,8 @@ export const modelTaskCompletedInformationKind = defineInformationKind({
       .object({
         ...modelTaskTerminalShape,
         output: modelTaskOutputSchema,
+        generationKind: z.enum(["final", "tool-calls"]).default("final"),
+        toolCalls: z.array(nativeToolCallSchema).default([]),
         native: nativeResponseSchema.nullable().default(null),
       })
       .strict(),
@@ -640,6 +680,7 @@ function sanitizePromptForLogging(text: string): string {
     );
 }
 export const modelTaskInformationKinds = Object.freeze([
+  modelTaskDispatchedInformationKind,
   modelTaskRequestedInformationKind,
   modelTaskCompletedInformationKind,
   modelTaskFailedInformationKind,

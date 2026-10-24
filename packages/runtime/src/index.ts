@@ -1,4 +1,5 @@
 /**
+ * native-tool-loop 导出宿主工具注册、任务路由和持久协调器，不在导入时执行工具。
  * 功能概述：汇总 Runtime 的最终信息原子 API，导出 kind 与
  * `KaguyaRuntime` ingress 与宿主 MessageTargetService/查询契约；model-task 导出通用 capability token、请求/结果契约与 ModelTaskClient；environment 导出 Linux broker 客户端。
  * 主要职责：稳定 re-export，不创建数据库、Core、模块或 transport；事件 dispatch、
@@ -25,3 +26,7 @@ export {
   type BrokerTransport,
   type ActionEnvironment,
 } from "./environment.js";
+
+export * from "./native-tool-loop.js";
+
+export { createNativeMemoryTools } from "./native-memory-tools.js";

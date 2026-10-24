@@ -12,6 +12,7 @@ import {
   observationManifestSchema,
 } from "@kaguya/sdk";
 import { nativeMemorySnapshotSchema } from "@kaguya/schema";
+import { actionDigest } from "./action-store.js";
 import { memoryScope } from "@kaguya/memory";
 import {
   currentInvalidity,
@@ -87,59 +88,70 @@ export async function checkActionDependencies(
     reject(input.observationId, "cutoff-mismatch");
   const sources = new Set<string>();
   const owners = new Set<string>();
-  const expected = new Map(
-    proof.memoryRevisions.map((n) => [n.id, n.revision]),
-  );
   if (input.memoryRevisions.length && (!cutoff || !memory.success))
     reject(input.observationId, "memory-proof-missing");
-  if (cutoff && memory.success && input.memoryRevisions.length) {
-    const view = await readMemoryView(tx, cutoff, {
-      ids: input.memoryRevisions.map((n) => n.id),
-    });
-    for (const ref of input.memoryRevisions) {
-      const n = view.nodes.get(ref.id);
-      if (
-        expected.get(ref.id) !== ref.revision ||
-        !n ||
-        n.metadata.revision !== ref.revision ||
-        view.invalid.has(ref.id)
-      ) {
-        reject(ref.id, "frozen-revision-invalid");
+  if (input.memoryRevisions.length) {
+    for (const { snapshot, boundary } of proof.snapshotEntries) {
+      const upper = snapshot.cutoff?.publicationPosition;
+      const refs = [
+        ...snapshot.fixed,
+        ...snapshot.recalled.map((r) => r.node),
+        ...(snapshot.personCandidates ?? []).map((p) => p.summary),
+      ];
+      if (!refs.length) continue;
+      const position = (
+        await tx.query<{ position: string }>(
+          "SELECT position::text FROM information_lifecycle WHERE information_id=$1",
+          [boundary],
+        )
+      ).rows[0]?.position;
+      if (!upper || !position || BigInt(upper) > BigInt(position)) {
+        reject(boundary, "snapshot-after-boundary");
         continue;
       }
-      const frozen = proof.nodes.find((n) => n.id === ref.id);
-      if (
-        !frozen ||
-        frozen.metadata.revision !== ref.revision ||
-        n.metadata.scope !== frozen.metadata.scope ||
-        n.metadata.ownerId !== frozen.metadata.ownerId
-      )
-        reject(ref.id, "frozen-node-mismatch");
+      const view = await readMemoryView(tx, upper, {
+        ids: refs.map((n) => n.id),
+      });
+      for (const frozen of refs) {
+        const n = view.nodes.get(frozen.id);
+        if (
+          !n ||
+          n.metadata.revision !== frozen.metadata.revision ||
+          view.invalid.has(frozen.id) ||
+          !n.content.startsWith(frozen.content) ||
+          (n.content !== frozen.content &&
+            !snapshot.recalled.some((r) => r.node.id === n.id && r.truncated) &&
+            !snapshot.personCandidates?.some(
+              (p) => p.summary.id === n.id && p.truncated,
+            )) ||
+          actionDigest(n.metadata) !== actionDigest(frozen.metadata)
+        )
+          reject(frozen.id, "frozen-revision-invalid");
+      }
+      for (const n of view.nodes.values()) {
+        if (!(
+          n.metadata.scope === scope ||
+          (n.metadata.scope === "shared" &&
+            snapshot.owners.includes(n.metadata.ownerId) &&
+            ["person", "self", "expression"].includes(n.metadata.kind))
+        ))
+          reject(n.id, "memory-scope-denied");
+        owners.add(n.metadata.ownerId);
+        n.metadata.sourceIds.forEach((id) => sources.add(id));
+        for (const p of [
+          ...(n.metadata.proofOwners ?? []),
+          ...(n.metadata.experience?.proofOwners ?? []),
+        ])
+          if (p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)))
+            owners.add(p.ownerId);
+      }
+      const persisted = await persistedSourceProofOwners(
+        tx,
+        [...sources],
+        upper,
+      );
+      for (const owner of persisted.keys()) owners.add(owner);
     }
-    // 只展开真实证明边；predecessors 是审计，不将拆分前的所有来源强加给每个输出。
-    for (const n of view.nodes.values()) {
-      if (!(
-        n.metadata.scope === scope ||
-        (n.metadata.scope === "shared" &&
-          proof.snapshots.some((s) => s.owners.includes(n.metadata.ownerId)) &&
-          ["person", "self", "expression"].includes(n.metadata.kind))
-      ))
-        reject(n.id, "memory-scope-denied");
-      owners.add(n.metadata.ownerId);
-      n.metadata.sourceIds.forEach((s) => sources.add(s));
-      for (const proof of [
-        ...(n.metadata.proofOwners ?? []),
-        ...(n.metadata.experience?.proofOwners ?? []),
-      ])
-        if (proof.sourceIds.some((s) => n.metadata.sourceIds.includes(s)))
-          owners.add(proof.ownerId);
-    }
-    const persisted = await persistedSourceProofOwners(
-      tx,
-      [...sources],
-      cutoff,
-    );
-    for (const owner of persisted.keys()) owners.add(owner);
     const invalid = await currentInvalidity(
       tx,
       input.memoryRevisions.map((n) => n.id),
@@ -167,6 +179,31 @@ export async function checkActionDependencies(
         [id, proof.boundaries.get(id)],
       )
     ).rows[0];
+    if (proof.receipts.has(id)) {
+      const receipt = (
+        await tx.query<{ input: any }>(
+          `SELECT h.input FROM information_action_receipts r JOIN information_action_heads h ON h.intent_id=r.intent_id WHERE r.receipt_id=$1`,
+          [id],
+        )
+      ).rows[0];
+      if (
+        !row ||
+        !receipt ||
+        receipt.input.scope !== scope ||
+        row.payload.intent?.scope !== scope
+      )
+        reject(id, "action-receipt-source-invalid");
+      sources.add(id);
+      for (const dependency of receipt?.input.dependencies
+        .sourceInformationIds ?? [])
+        sources.add(dependency);
+      const sourceOwners = await sourceProofOwners(
+        tx,
+        receipt?.input.dependencies.sourceInformationIds ?? [],
+      );
+      for (const owner of sourceOwners.keys()) owners.add(owner);
+      continue;
+    }
     let source = row?.payload.source;
     if (row?.kind === "core.delivery.delivered" && row.payload.ok === true) {
       const delivery = (

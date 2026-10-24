@@ -1,6 +1,7 @@
 /**
  * 功能概述：提供无持久化副作用的结构化 LLM 调用边界，只负责模型解析、调用、输出校验、
  * usage 累加、耗时计算和 provider 错误分类。JSON mode 最多两次，Schema mode 单次。
+ * 工具模式只生成一步，冻结原始参数并返回调用；没有 execute、自动修复或正文重试。
  * 主要职责：`KaguyaLlmClient.generate` 按显式 outputMode 选择纯文本或结构化输出，
  * 接收调用方提供的泛型 outputSchema 并返回
  * `KaguyaLlmGeneration<T>`；`KaguyaLlmError` 把取消、可重试和不可重试失败统一成稳定分类。
@@ -16,6 +17,8 @@
  */
 import {
   nativeResponseSchema,
+  type NativeToolDeclaration,
+  type NativeToolCall,
   type NativeMessage,
   type NativeResponse,
   type CompiledPrompt,
@@ -25,6 +28,9 @@ import {
   APICallError,
   asSchema,
   generateText,
+  jsonSchema,
+  wrapLanguageModel,
+  isStepCount,
   JSONParseError,
   NoObjectGeneratedError,
   Output,
@@ -40,6 +46,8 @@ export type KaguyaLlmRequest<TOutput = unknown> = {
   readonly outputMode: "text" | "object";
   readonly outputSchema: FlexibleSchema<TOutput>;
   readonly signal?: AbortSignal;
+  readonly tools?: readonly NativeToolDeclaration[];
+  readonly timeoutMs?: number;
 } & (
   | { readonly prompt: CompiledPrompt; readonly messages?: never }
   | { readonly messages: NativeMessage[]; readonly prompt?: never }
@@ -61,14 +69,20 @@ export interface KaguyaLlmGenerationOptions {
   readonly recommendedDurationMs?: number;
 }
 
-export interface KaguyaLlmGeneration<T> {
-  readonly output: T;
+export type KaguyaLlmGeneration<T> = (
+  | { readonly kind?: "final"; readonly output: T }
+  | {
+      readonly kind: "tool-calls";
+      readonly output: null;
+      readonly calls: NativeToolCall[];
+    }
+) & {
   readonly native?: NativeResponse;
   readonly usage?: Record<string, number>;
   readonly durationMs: number;
   readonly recommendedDurationMs?: number;
   readonly exceededRecommendedDuration?: boolean;
-}
+};
 
 export type KaguyaLlmErrorKind = LlmErrorKind;
 export type KaguyaLlmFailureStage =
@@ -198,7 +212,16 @@ export class KaguyaLlmClient {
     let usage: Record<string, number> | undefined;
     try {
       const generationOptions = this.#resolveGenerationOptions(request);
-      const timeoutMs = generationOptions.timeoutMs ?? 300_000;
+      for (const limit of [generationOptions.timeoutMs, request.timeoutMs])
+        if (
+          limit !== undefined &&
+          (!Number.isSafeInteger(limit) || limit < 1 || limit > 300000)
+        )
+          throw new Error("Invalid model timeout");
+      const timeoutMs = Math.min(
+        generationOptions.timeoutMs ?? 300_000,
+        request.timeoutMs ?? 300_000,
+      );
       if (
         !Number.isSafeInteger(timeoutMs) ||
         timeoutMs < 1 ||
@@ -229,9 +252,35 @@ export class KaguyaLlmClient {
         throw new Error("JSON output requires a local schema validator");
       const typedOutput =
         schema === undefined ? undefined : Output.object({ schema });
+      // 在 SDK 解析前保存参数，非法 JSON 不得被其续接消息中的 {} 覆盖。
+      let rawCalls: {
+        toolCallId: string;
+        toolName: string;
+        input: string;
+        providerExecuted?: boolean;
+      }[] = [];
+      const resolved = this.#resolveModel(request);
+      if (request.tools && typeof resolved === "string")
+        throw new Error("Native tools require a resolved model");
+      const model =
+        request.tools && typeof resolved !== "string"
+          ? wrapLanguageModel({
+              model: resolved,
+              middleware: {
+                specificationVersion: "v4",
+                wrapGenerate: async ({ doGenerate }) => {
+                  const result = await doGenerate();
+                  rawCalls = result.content.filter(
+                    (p) => p.type === "tool-call",
+                  );
+                  return result;
+                },
+              },
+            })
+          : resolved;
       const common = {
         timeout: timeoutMs,
-        model: this.#resolveModel(request),
+        model,
         ...(request.messages
           ? { messages: request.messages as ModelMessage[] }
           : { prompt: request.prompt.text }),
@@ -241,7 +290,120 @@ export class KaguyaLlmClient {
           ? {}
           : { reasoning: generationOptions.reasoning }),
       } as const;
-      // 所有尝试共享同一模型、Prompt 和 deadline；仅结构化生成失败允许一次恢复。
+      if (request.tools) {
+        const tools = Object.fromEntries(
+          request.tools.map((t) => [
+            t.wireName,
+            {
+              description: t.description,
+              inputSchema: jsonSchema(t.inputSchema),
+            },
+          ]),
+        );
+        attemptCount = 1;
+        const result = await generateText({
+          ...common,
+          tools,
+          toolChoice: "auto",
+          stopWhen: isStepCount(1),
+          output: Output.text(),
+        });
+        usage = addUsage(usage, result.usage);
+        attemptCount = 1;
+        signal.throwIfAborted();
+        const calls: NativeToolCall[] = rawCalls.map((raw) => {
+          let input: NativeToolCall["input"] = null;
+          let valid = false;
+          const declaration = request.tools!.find(
+            (t) => t.wireName === raw.toolName,
+          );
+          try {
+            input = JSON.parse(raw.input);
+            valid = true;
+          } catch {
+            /* 原文保存在 rawInput。 */
+          }
+          return {
+            toolCallId: raw.toolCallId,
+            toolName: raw.toolName,
+            rawInput: raw.input,
+            input,
+            validation: raw.providerExecuted
+              ? "provider-executed"
+              : !declaration
+                ? "unknown-tool"
+                : !valid
+                  ? "invalid-input"
+                  : "valid",
+          };
+        });
+        // 仅保存 assistant 原生输出；SDK 自造 tool-error 由 Runtime 的持久拒绝事实替代。
+        const native = nativeResponseSchema.parse(
+          JSON.parse(
+            JSON.stringify({
+              version: 1,
+              messages: result.response.messages
+                .filter((m) => m.role === "assistant")
+                .map((m) => ({
+                  ...m,
+                  content: Array.isArray(m.content)
+                    ? m.content.map((part) => {
+                        if (part.type !== "tool-call") return part;
+                        const raw = rawCalls.find(
+                          (c) =>
+                            c.toolCallId === part.toolCallId &&
+                            c.toolName === part.toolName,
+                        );
+                        if (!raw)
+                          throw new Error("Native call identity mismatch");
+                        // openai-compatible 的正式 providerOptions 扩展在其 JSON.stringify(input) 之后应用。
+                        // 保留参数原文（含非法 JSON 与空白），不靠替换 HTTP 文本或修改全局 JSON 实现。
+                        return {
+                          ...part,
+                          rawInput: raw.input,
+                          providerOptions: {
+                            ...part.providerOptions,
+                            openaiCompatible: {
+                              ...part.providerOptions?.openaiCompatible,
+                              id: raw.toolCallId,
+                              type: "function",
+                              function: {
+                                name: raw.toolName,
+                                arguments: raw.input,
+                              },
+                            },
+                          },
+                        };
+                      })
+                    : m.content,
+                })),
+              reasoning: result.reasoning,
+              ...(result.providerMetadata
+                ? { providerMetadata: result.providerMetadata }
+                : {}),
+            }),
+          ),
+        );
+        const metrics = {
+          native,
+          ...(usage ? { usage } : {}),
+          durationMs: Math.max(0, this.#now().getTime() - startedAt.getTime()),
+        };
+        if (calls.length)
+          return { ...metrics, kind: "tool-calls", output: null, calls };
+        if (result.finishReason !== "stop")
+          throw new Error("Native generation did not complete");
+        // 工具模式最多一次请求；最终 JSON 校验失败不发起恢复请求。
+        const output =
+          request.outputMode === "text"
+            ? result.text.trim()
+            : await typedOutput!.parseCompleteOutput(
+                { text: result.text },
+                result,
+              );
+        return { ...metrics, kind: "final", output: output as TOutput };
+      }
+      // 所有尝试共享同一模型、Prompt 和 deadline；仅旧结构化路径允许一次恢复。
       let output: unknown;
       let native: NativeResponse | undefined;
       for (;;) {
