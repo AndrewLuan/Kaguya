@@ -697,6 +697,28 @@
                             ],
                             "additionalProperties": false
                           },
+                          "proofOwners": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "ownerId": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "sourceIds": {
+                                  "minItems": 1,
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  }
+                                }
+                              },
+                              "required": ["ownerId", "sourceIds"],
+                              "additionalProperties": false
+                            }
+                          },
                           "experience": {
                             "type": "object",
                             "properties": {
@@ -938,6 +960,28 @@
                         ],
                         "additionalProperties": false
                       },
+                      "proofOwners": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "ownerId": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "sourceIds": {
+                              "minItems": 1,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            }
+                          },
+                          "required": ["ownerId", "sourceIds"],
+                          "additionalProperties": false
+                        }
+                      },
                       "experience": {
                         "type": "object",
                         "properties": {
@@ -1166,6 +1210,28 @@
                               "supersedes"
                             ],
                             "additionalProperties": false
+                          },
+                          "proofOwners": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "ownerId": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "sourceIds": {
+                                  "minItems": 1,
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  }
+                                }
+                              },
+                              "required": ["ownerId", "sourceIds"],
+                              "additionalProperties": false
+                            }
                           },
                           "experience": {
                             "type": "object",
@@ -2371,6 +2437,28 @@
                                 ],
                                 "additionalProperties": false
                               },
+                              "proofOwners": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "ownerId": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    },
+                                    "sourceIds": {
+                                      "minItems": 1,
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      }
+                                    }
+                                  },
+                                  "required": ["ownerId", "sourceIds"],
+                                  "additionalProperties": false
+                                }
+                              },
                               "experience": {
                                 "type": "object",
                                 "properties": {
@@ -2612,6 +2700,28 @@
                             ],
                             "additionalProperties": false
                           },
+                          "proofOwners": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "ownerId": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "sourceIds": {
+                                  "minItems": 1,
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  }
+                                }
+                              },
+                              "required": ["ownerId", "sourceIds"],
+                              "additionalProperties": false
+                            }
+                          },
                           "experience": {
                             "type": "object",
                             "properties": {
@@ -2844,6 +2954,28 @@
                                   "supersedes"
                                 ],
                                 "additionalProperties": false
+                              },
+                              "proofOwners": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "ownerId": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    },
+                                    "sourceIds": {
+                                      "minItems": 1,
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      }
+                                    }
+                                  },
+                                  "required": ["ownerId", "sourceIds"],
+                                  "additionalProperties": false
+                                }
                               },
                               "experience": {
                                 "type": "object",

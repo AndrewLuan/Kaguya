@@ -13,6 +13,7 @@ import {
   memoryProofMetadata,
   type MemoryView,
 } from "./native-memory-history.js";
+import { sourceProofOwners } from "./native-memory-proof.js";
 import { randomUUID, createHash } from "node:crypto";
 import {
   memoryPublicationSchema,
@@ -387,6 +388,8 @@ export class PostgresNativeMemoryStore
   async ingest(source: MemorySource) {
     source = memorySourceSchema.parse(source);
     return this.db.transaction(async (tx) => {
+      // 正规来源也参与历史补证；先取全局提交锁，再取会话锁，禁止迟提交填入旧 cutoff。
+      await tx.query("SELECT pg_advisory_xact_lock(7149321)");
       const evidence = (
         await tx.query<{ payload: Record<string, any>; kind: string }>(
           `SELECT a.payload,a.kind FROM information_atoms a JOIN information_lifecycle l USING(information_id), memory_native_epoch e WHERE a.information_id=$1 AND l.position>e.source_after`,
@@ -1010,6 +1013,7 @@ export class PostgresNativeMemoryStore
           string,
           { ownerId: string; sourceIds: string[] }[]
         >();
+        const derivedVerifiedSources = new Map<string, Set<string>>();
         for (const effect of p.invalidations ?? []) {
           if (
             effect.kind === "source-withdrawal" &&
@@ -1116,6 +1120,18 @@ export class PostgresNativeMemoryStore
                   ownerId,
                   sourceIds: [...ids].sort(),
                 }));
+              derivedVerifiedSources.set(
+                output!.id,
+                new Set(
+                  proof.flatMap((row) =>
+                    row.sources.filter(
+                      (id) =>
+                        !row.unproved.includes(id) &&
+                        output!.metadata.sourceIds.includes(id),
+                    ),
+                  ),
+                ),
+              );
               derivedProofOwners.set(
                 output!.id,
                 output!.metadata.experience!.proofOwners,
@@ -1190,68 +1206,6 @@ export class PostgresNativeMemoryStore
             previous.data.metadata.locked
           )
             throw new NativeMemoryError("memory_node_locked");
-          const priorExperience = previous?.success
-            ? previous.data.metadata.experience
-            : undefined;
-          const experience = node.metadata.experience ?? priorExperience;
-          if (experience) {
-            // 证明归属由存储层持有；客户端省略、清空或伪造均不能改写。
-            // 暂时移除的来源保留原映射，读取只对当前 sourceIds 交集生效，重新加入时恢复约束。
-            const owners = new Map<string, Set<string>>();
-            for (const proof of derivedProofOwners.get(node.id) ??
-              priorExperience?.proofOwners ??
-              []) {
-              if (!owners.has(proof.ownerId))
-                owners.set(proof.ownerId, new Set());
-              for (const id of proof.sourceIds)
-                owners.get(proof.ownerId)!.add(id);
-            }
-            const addedSources = node.metadata.sourceIds.filter(
-              (id) =>
-                !previous?.success ||
-                !previous.data.metadata.sourceIds.includes(id),
-            );
-            if (addedSources.length) {
-              const canonical = await tx.query<{ payload: unknown }>(
-                "SELECT payload FROM information_atoms WHERE information_id=ANY($1::text[]) AND kind='memory.native.source.v1'",
-                [addedSources.map(canonicalMemorySourceId)],
-              );
-              for (const row of canonical.rows) {
-                const source = memorySourceSchema.parse(
-                  (row.payload as { memorySource: unknown }).memorySource,
-                );
-                if (!owners.has(source.ownerId))
-                  owners.set(source.ownerId, new Set());
-                owners.get(source.ownerId)!.add(source.id);
-              }
-              if (
-                priorExperience &&
-                addedSources.some(
-                  (id) => ![...owners.values()].some((ids) => ids.has(id)),
-                )
-              )
-                throw new NativeMemoryError(
-                  "memory_experience_source_proof_missing",
-                  400,
-                );
-            }
-            const { proofOwners: _clientProof, ...state } = experience;
-            node.metadata.experience = {
-              ...state,
-              ...(owners.size ||
-              priorExperience?.proofOwners ||
-              derivedProofOwners.has(node.id)
-                ? {
-                    proofOwners: [...owners]
-                      .sort(([a], [b]) => a.localeCompare(b))
-                      .map(([ownerId, ids]) => ({
-                        ownerId,
-                        sourceIds: [...ids].sort(),
-                      })),
-                  }
-                : {}),
-            };
-          }
           if (
             node.metadata.scope === "shared" &&
             !["person", "self", "expression"].includes(node.metadata.kind)
@@ -1284,6 +1238,70 @@ export class PostgresNativeMemoryStore
                   400,
                 );
             }
+          }
+          const prior = previous?.success ? previous.data.metadata : undefined;
+          const experience = node.metadata.experience ?? prior?.experience;
+          // 每次发布校验全部当前来源，旧节点缺少证明也不能跳过；客户端映射不构成证明。
+          const currentProof = await sourceProofOwners(
+            tx,
+            node.metadata.sourceIds,
+          );
+          const inherited = [
+            ...(prior?.proofOwners ?? []),
+            ...(prior?.experience?.proofOwners ?? []),
+            ...(derivedProofOwners.get(node.id) ?? []),
+          ];
+          const owners = new Map<string, Set<string>>();
+          for (const proof of inherited) {
+            if (!owners.has(proof.ownerId))
+              owners.set(proof.ownerId, new Set());
+            for (const id of proof.sourceIds)
+              owners.get(proof.ownerId)!.add(id);
+          }
+          for (const [owner, ids] of currentProof) {
+            if (!owners.has(owner)) owners.set(owner, new Set());
+            for (const id of ids) owners.get(owner)!.add(id);
+          }
+          if (
+            node.metadata.sourceIds.some(
+              (id) =>
+                ![...currentProof.values()].some((ids) => ids.has(id)) &&
+                !derivedVerifiedSources.get(node.id)?.has(id) &&
+                ![
+                  ...(prior?.proofOwners ?? []),
+                  ...(prior?.experience?.proofOwners ?? []),
+                ].some((p) => p.sourceIds.includes(id)),
+            )
+          )
+            throw new NativeMemoryError("memory_source_proof_missing", 400);
+          // 暂时移除的来源保留映射；读取仅对当前 sourceIds 交集生效，重新加入时恢复约束。
+          const proofOwners = [...owners]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([ownerId, ids]) => ({ ownerId, sourceIds: [...ids].sort() }));
+          delete node.metadata.proofOwners;
+          if (proofOwners.length) node.metadata.proofOwners = proofOwners;
+          if (experience) {
+            const { proofOwners: _clientProof, ...state } = experience;
+            node.metadata.experience = {
+              ...state,
+              ...(proofOwners.length ? { proofOwners } : {}),
+            };
+          }
+          if (p.actor === "automatic") {
+            const effects = await readMemoryInvalidations(
+              tx,
+              undefined,
+              proofOwners
+                .filter((p) =>
+                  p.sourceIds.some((id) =>
+                    node.metadata.sourceIds.includes(id),
+                  ),
+                )
+                .map((p) => p.ownerId),
+              node.metadata.sourceIds,
+            );
+            if (effects.identities.size || effects.withdrawn.size)
+              throw new NativeMemoryError("memory_source_invalidated");
           }
         }
         const endpointIds = [

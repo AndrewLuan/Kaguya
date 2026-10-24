@@ -11,6 +11,7 @@ import {
   type NativeMemoryNode,
   type MemoryReadContext,
 } from "@kaguya/memory";
+import { persistedSourceProofOwners } from "./native-memory-proof.js";
 import type { SqlTransaction } from "./driver.js";
 
 export type HistoricalEdge = {
@@ -26,6 +27,13 @@ export interface MemoryView {
   blocked: Set<string>;
   withdrawn: Set<string>;
   identities: Set<string>;
+}
+/** 新通用映射与旧 experience 映射共同参与读取，不修改历史节点。 */
+function nodeProofOwners(n: NativeMemoryNode) {
+  return [
+    ...(n.metadata.proofOwners ?? []),
+    ...(n.metadata.experience?.proofOwners ?? []),
+  ];
 }
 export async function memoryUpper(db: SqlTransaction): Promise<string> {
   return (
@@ -70,25 +78,51 @@ export async function memoryProofMetadata(
   seeds: readonly string[],
 ) {
   if (!seeds.length) return [];
-  return (
+  const rows = (
     await db.query<{
       root: string;
       status: string;
       owner: string;
       sources: string[];
+      unproved: string[];
     }>(
       `WITH RECURSIVE proof(root,id) AS (
     SELECT seed,seed FROM unnest($1::uuid[]) seed
     UNION SELECT p.root,e.target_id FROM proof p JOIN memory_edges e ON e.source_id=p.id
       WHERE e.relation IN ('summarizes','derived-from')
     ), metadata AS (SELECT p.root,n.metadata FROM proof p JOIN memory_nodes n ON n.id=p.id WHERE n.metadata->>'system'='native-v1')
-    SELECT root::text,metadata->>'status' status,metadata->>'ownerId' owner,metadata->'sourceIds' sources FROM metadata
-    UNION ALL SELECT root::text,'active',owner->>'ownerId',to_jsonb(ARRAY(SELECT value FROM jsonb_array_elements_text(owner->'sourceIds') WHERE metadata->'sourceIds' ? value)) FROM metadata
-      CROSS JOIN LATERAL jsonb_array_elements(metadata->'experience'->'proofOwners') owner
+    SELECT root::text,metadata->>'status' status,metadata->>'ownerId' owner,metadata->'sourceIds' sources,
+      ARRAY(SELECT id FROM jsonb_array_elements_text(metadata->'sourceIds') id WHERE NOT EXISTS(
+        SELECT 1 FROM jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb) || COALESCE(metadata->'experience'->'proofOwners','[]'::jsonb)) owner WHERE owner->'sourceIds' ? id)) unproved FROM metadata
+    UNION ALL SELECT root::text,'active',owner->>'ownerId',to_jsonb(ARRAY(SELECT value FROM jsonb_array_elements_text(owner->'sourceIds') WHERE metadata->'sourceIds' ? value)),ARRAY[]::text[] FROM metadata
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb) || COALESCE(metadata->'experience'->'proofOwners','[]'::jsonb)) owner
       WHERE owner->'sourceIds' ?| ARRAY(SELECT jsonb_array_elements_text(metadata->'sourceIds'))`,
       [seeds],
     )
   ).rows;
+  const persisted = await persistedSourceProofOwners(
+    db,
+    [...new Set(rows.flatMap((r) => r.sources))],
+    await memoryUpper(db),
+  );
+  const extra: typeof rows = [];
+  for (const row of rows) {
+    for (const [owner, ids] of persisted) {
+      const sources = row.sources.filter((id) => ids.has(id));
+      if (sources.length)
+        extra.push({
+          root: row.root,
+          status: "active",
+          owner,
+          sources,
+          unproved: [],
+        });
+    }
+    row.unproved = row.unproved.filter(
+      (id) => ![...persisted.values()].some((ids) => ids.has(id)),
+    );
+  }
+  return [...rows, ...extra];
 }
 export async function currentInvalidity(
   db: SqlTransaction,
@@ -106,6 +140,7 @@ export async function currentInvalidity(
     rows
       .filter(
         (r) =>
+          r.unproved.length > 0 ||
           (!blockedOnly && r.status !== "active") ||
           effects.identities.has(r.owner) ||
           r.sources.some((id) => effects.withdrawn.has(id)),
@@ -184,12 +219,32 @@ export async function readMemoryView(
     await load(missing);
     if (nodes.size === count) break;
   }
+  const proofs = new Map([...nodes].map(([id, n]) => [id, nodeProofOwners(n)]));
+  const missing = (n: NativeMemoryNode) =>
+    n.metadata.sourceIds.filter(
+      (id) => !proofs.get(n.id)!.some((p) => p.sourceIds.includes(id)),
+    );
+  const persisted = await persistedSourceProofOwners(
+    db,
+    [...new Set([...nodes.values()].flatMap((n) => n.metadata.sourceIds))],
+    upper,
+  );
+  const unproved = new Set<string>();
+  for (const n of nodes.values()) {
+    const ids = n.metadata.sourceIds;
+    for (const [ownerId, sources] of persisted) {
+      const sourceIds = ids.filter((id) => sources.has(id));
+      if (sourceIds.length) proofs.get(n.id)!.push({ ownerId, sourceIds });
+    }
+    if (missing(n).length) unproved.add(n.id);
+  }
   const { withdrawn, identities } = await readMemoryInvalidations(
     db,
     upper,
     [...nodes.values()].flatMap((n) => [
       n.metadata.ownerId,
-      ...(n.metadata.experience?.proofOwners ?? [])
+      ...proofs
+        .get(n.id)!
         .filter((p) =>
           p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)),
         )
@@ -201,13 +256,16 @@ export async function readMemoryView(
     [...nodes.values()]
       .filter(
         (n) =>
+          unproved.has(n.id) ||
           n.metadata.sourceIds.some((id) => withdrawn.has(id)) ||
           identities.has(n.metadata.ownerId) ||
-          n.metadata.experience?.proofOwners?.some(
-            (p) =>
-              identities.has(p.ownerId) &&
-              p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)),
-          ) ||
+          proofs
+            .get(n.id)!
+            .some(
+              (p) =>
+                identities.has(p.ownerId) &&
+                p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)),
+            ) ||
           n.metadata.status !== "active",
       )
       .map((n) => n.id),
@@ -216,13 +274,16 @@ export async function readMemoryView(
     [...nodes.values()]
       .filter(
         (n) =>
+          unproved.has(n.id) ||
           n.metadata.sourceIds.some((id) => withdrawn.has(id)) ||
           identities.has(n.metadata.ownerId) ||
-          n.metadata.experience?.proofOwners?.some(
-            (p) =>
-              identities.has(p.ownerId) &&
-              p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)),
-          ),
+          proofs
+            .get(n.id)!
+            .some(
+              (p) =>
+                identities.has(p.ownerId) &&
+                p.sourceIds.some((id) => n.metadata.sourceIds.includes(id)),
+            ),
       )
       .map((n) => n.id),
   );

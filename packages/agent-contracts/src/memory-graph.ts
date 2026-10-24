@@ -143,6 +143,14 @@ export const nativeMemoryMetadataSchema = memoryNodeMetadataSchema.extend({
   sourceIds: z.array(nonBlank).default([]),
   aliases: z.array(nonBlank).default([]),
   evidence: personEvidenceSchema.exactOptional(),
+  // 所有 native 类型共用的服务端来源归属；可选字段保留历史 publication 的解析与哈希。
+  proofOwners: z
+    .array(
+      z
+        .object({ ownerId: nonBlank, sourceIds: z.array(nonBlank).min(1) })
+        .strict(),
+    )
+    .exactOptional(),
   experience: z
     .object({
       state: z.enum(["open", "sealed"]),

@@ -4,9 +4,11 @@
  * 证明较晚冻结不会因较早分配 position 而吸入未见知识。所有阻塞在 finally 释放后再关闭连接。
  * 代码库关系：直接调用生产 NativeMemoryStore/Access，仅向量候选使用离线替身；不调用外部模型。
  */
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createNativeMemoryAccess,
+  memoryPublicationSchema,
   type NativeMemoryNode,
 } from "@kaguya/memory";
 import { freezeInformationAtom, informationAtomSchema } from "@kaguya/schema";
@@ -120,6 +122,447 @@ const put = (
   });
 
 describe.each(backends)("native revision boundary ($name)", ({ create }) => {
+  it.each([
+    ["raw", "initial"],
+    ["canonical", "initial"],
+    ["raw", "revision"],
+    ["canonical", "revision"],
+    ["raw", "legacy-read"],
+    ["canonical", "legacy-read"],
+    ["source-table", "legacy-read"],
+    ["late-canonical", "legacy-read"],
+  ])(
+    "owns source proof across all kinds: %s / %s",
+    async (normalization, mode) => {
+      const db = await setup(create);
+      const kinds = [
+        "memory.identity.platform.account.entity",
+        "memory.identity.platform.account.binding",
+      ];
+      await db.information.synchronizeKinds(kinds);
+      for (const [informationId, kind, payload, references] of [
+        [
+          "account",
+          kinds[0],
+          { platform: "qq", adapterId: "qq", accountId: "a" },
+          [],
+        ],
+        [
+          "binding",
+          kinds[1],
+          { personInformationId: "A" },
+          [{ relation: "core:binds", informationId: "account" }],
+        ],
+      ] as const)
+        await db.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId,
+              kind,
+              payload,
+              references,
+              occurredAt: "2020-01-01T00:00:00Z",
+              source: "test:memory",
+            }),
+          ),
+          references.map((r) => ({
+            relation: r.relation,
+            required: true,
+            multiple: false,
+          })),
+        );
+      await source(db, "S");
+      if (normalization === "canonical")
+        await db.memoryGraph.native.ingest({
+          id: "S",
+          scope,
+          ownerId: "person:A",
+          text: "原文",
+          occurredAt: "2020-01-01T00:00:00Z",
+          collectedAt: "2026-01-01T00:00:00Z",
+          sourceType: "inbound",
+          participants: [],
+          replyTo: null,
+        });
+      const nodes = [
+        node(31, 0, ["S"]),
+        node(32, 1, ["S"]),
+        node(33, 1, ["S"]),
+        node(34, 0, ["S"]),
+        node(35, 1),
+      ];
+      for (const n of nodes) {
+        n.metadata.ownerId = `conversation:${scope}`;
+        n.metadata.kind = "conversation";
+        // 两种客户端字段都不能定义服务端归属。
+        n.metadata.proofOwners = [
+          { ownerId: "person:forged", sourceIds: ["S"] },
+        ];
+      }
+      nodes[2]!.metadata.kind = "experience";
+      nodes[2]!.metadata.experience = {
+        state: "open",
+        policyVersion: "manual.v1",
+        predecessors: [],
+        proofOwners: [],
+      };
+      nodes[3]!.metadata.kind = "person";
+      nodes[3]!.metadata.ownerId = "person:summary-owner";
+      const edge = {
+        sourceId: nodes[4]!.id,
+        targetId: nodes[1]!.id,
+        relation: "derived-from",
+      };
+      let published: NativeMemoryNode[];
+      if (mode === "initial") {
+        published = await put(db, "proof-initial", nodes, { edges: [edge] });
+        expect(
+          published
+            .slice(0, 4)
+            .every((n) =>
+              n.metadata.proofOwners?.some(
+                (p) => p.ownerId === "person:A" && p.sourceIds.includes("S"),
+              ),
+            ),
+        ).toBe(true);
+        expect(
+          published.some((n) =>
+            n.metadata.proofOwners?.some((p) => p.ownerId === "person:forged"),
+          ),
+        ).toBe(false);
+      } else {
+        // 直接登记升级前的 fixture，不修改 immutable Atom，也不关闭 append-only 保护。
+        for (const n of nodes) {
+          delete n.metadata.proofOwners;
+          if (n.metadata.experience) delete n.metadata.experience.proofOwners;
+        }
+        const proposal = memoryPublicationSchema.parse({
+          operationId: "proof-initial",
+          actor: "manual",
+          nodes: nodes.map((node) => ({ node, expectedRevision: 0 })),
+          edges: [edge],
+        });
+        const canonical = (value: unknown): unknown =>
+          Array.isArray(value)
+            ? value.map(canonical)
+            : value !== null && typeof value === "object"
+              ? Object.fromEntries(
+                  Object.entries(value)
+                    .sort(([a], [b]) => a.localeCompare(b))
+                    .map(([k, v]) => [k, canonical(v)]),
+                )
+              : value;
+        const hash = createHash("sha256")
+          .update(JSON.stringify(canonical(proposal)))
+          .digest("hex");
+        published = proposal.nodes.map((n) => n.node);
+        await db.information.synchronizeKinds(["memory.native.revision.v1"]);
+        await db.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId: "legacy-proof-publication",
+              kind: "memory.native.revision.v1",
+              source: "memory:manual",
+              occurredAt: "2026-01-01T00:00:00Z",
+              references: [],
+              payload: {
+                operationId: proposal.operationId,
+                nodes: published,
+                edges: proposal.edges,
+                removeEdges: proposal.removeEdges,
+              },
+            }),
+          ),
+          [],
+        );
+        for (const n of published)
+          await db.sql.query(
+            "INSERT INTO memory_nodes(id,metadata,content) VALUES($1,$2::jsonb,$3)",
+            [n.id, JSON.stringify(n.metadata), n.content],
+          );
+        await db.sql.query(
+          "INSERT INTO memory_edges(source_id,target_id,relation,metadata) VALUES($1,$2,$3,'{}'::jsonb)",
+          [edge.sourceId, edge.targetId, edge.relation],
+        );
+        await db.sql.query(
+          "INSERT INTO memory_native_publications(operation_id,input_hash,information_id,nodes) VALUES($1,$2,$3,$4::jsonb)",
+          [
+            proposal.operationId,
+            hash,
+            "legacy-proof-publication",
+            JSON.stringify(published),
+          ],
+        );
+      }
+      if (["source-table", "late-canonical"].includes(normalization!)) {
+        const storedSource = {
+          id: "S",
+          scope,
+          ownerId: "person:A",
+          text: "原文",
+          occurredAt: "2020-01-01T00:00:00Z",
+          collectedAt: "2026-01-01T00:00:00Z",
+          sourceType: "inbound" as const,
+          participants: [],
+          replyTo: null,
+        };
+        await db.sql.query(
+          "INSERT INTO memory_native_sources(id,scope,source) VALUES($1,$2,$3::jsonb)",
+          ["S", scope, JSON.stringify(storedSource)],
+        );
+        if (normalization === "late-canonical")
+          await db.memoryGraph.native.ingest(storedSource);
+      }
+      const original = (
+        await db.sql.query(
+          "SELECT p.*,a.payload FROM memory_native_publications p JOIN information_atoms a USING(information_id) WHERE operation_id='proof-initial'",
+        )
+      ).rows;
+      if (mode === "revision")
+        await put(
+          db,
+          "proof-revision",
+          nodes.map((n) => ({
+            ...n,
+            metadata: { ...n.metadata, revision: 2 },
+          })),
+        );
+      const context = {
+        ...input,
+        owners: [`conversation:${scope}`, "person:summary-owner"],
+        explicitIds: nodes.map((n) => n.id),
+      };
+      const access = createNativeMemoryAccess({
+        enabled: true,
+        store: db.memoryGraph.native,
+      });
+      const before = await access.freeze(context),
+        beforeBytes = JSON.stringify(before);
+      const unverifiable =
+        mode === "legacy-read" && normalization !== "canonical";
+      expect(
+        (
+          await db.memoryGraph.native.current(
+            context,
+            nodes.map((n) => n.id),
+          )
+        ).length,
+      ).toBe(unverifiable ? 0 : 5);
+      await put(db, "proof-split", [], {
+        invalidations: [
+          {
+            kind: "identity-split",
+            targetId: "person:A",
+            reason: "来源身份拆分",
+          },
+        ],
+      });
+      const after = await db.memoryGraph.native.cutoff(context);
+      const assertMasked = async (cutoff?: typeof after) => {
+        const ctx = { ...context, ...(cutoff ? { cutoff } : {}) };
+        expect(await db.memoryGraph.native.readFixed(ctx)).toEqual([]);
+        expect(await db.memoryGraph.native.forFormation(ctx)).toEqual([]);
+        expect(
+          await db.memoryGraph.native.current(
+            ctx,
+            nodes.map((n) => n.id),
+          ),
+        ).toEqual([]);
+        expect(await db.memoryGraph.native.candidates(ctx)).toEqual([]);
+        expect(await db.memoryGraph.native.personCandidates(ctx)).toEqual([]);
+        expect(
+          await db.memoryGraph.native.expand(
+            ctx,
+            nodes.map((n) => n.id),
+          ),
+        ).toEqual([]);
+        const frozen = await createNativeMemoryAccess({
+          enabled: true,
+          store: db.memoryGraph.native,
+          retrievers: [
+            {
+              identity: "stale-source-owner",
+              role: "semantic",
+              search: async () => published,
+            },
+          ],
+        }).freeze(ctx);
+        expect(frozen.fixed).toEqual([]);
+        expect(frozen.recalled).toEqual([]);
+      };
+      await assertMasked();
+      await expect(
+        db.memoryGraph.native.publish({
+          operationId: "automatic-after-split",
+          actor: "automatic",
+          nodes: [
+            {
+              expectedRevision: 0,
+              node: {
+                ...node(36, 1, ["S"]),
+                metadata: {
+                  ...node(36, 1, ["S"]).metadata,
+                  ownerId: `conversation:${scope}`,
+                },
+              },
+            },
+          ],
+        }),
+      ).rejects.toThrow("memory_source_invalidated");
+      // 后续发布迫使显式 cutoff 使用历史读取，不能只测 current 快路径。
+      await put(db, "proof-later", [node(99)]);
+      await assertMasked(after);
+      expect(
+        (
+          await db.memoryGraph.native.current(
+            { ...context, cutoff: before.cutoff! },
+            nodes.map((n) => n.id),
+          )
+        ).length,
+      ).toBe(unverifiable ? 0 : 5);
+      expect(JSON.stringify(before)).toBe(beforeBytes);
+      expect(
+        (
+          await db.sql.query(
+            "SELECT p.*,a.payload FROM memory_native_publications p JOIN information_atoms a USING(information_id) WHERE operation_id='proof-initial'",
+          )
+        ).rows,
+      ).toEqual(original);
+      expect(await put(db, "proof-initial", nodes, { edges: [edge] })).toEqual(
+        original[0]!.nodes,
+      );
+    },
+    30000,
+  );
+  it("rejects unsupported evidence despite client-supplied source ownership", async () => {
+    const db = await setup(create);
+    await db.information.synchronizeKinds(["test.untrusted"]);
+    await db.information.append(
+      freezeInformationAtom(
+        informationAtomSchema.parse({
+          informationId: "untrusted",
+          kind: "test.untrusted",
+          source: "test:memory",
+          occurredAt: "2020-01-01T00:00:00Z",
+          payload: {},
+          references: [],
+        }),
+      ),
+      [],
+    );
+    const n = node(1, 1, ["untrusted"]);
+    n.metadata.proofOwners = [
+      { ownerId: "person:forged", sourceIds: ["untrusted"] },
+    ];
+    await expect(put(db, "unsupported", [n])).rejects.toThrow(
+      "memory_source_proof_missing",
+    );
+    expect(await db.memoryGraph.native.history(n.id)).toEqual([]);
+    for (const source of [
+      { id: "untrusted", ownerId: " " },
+      { id: "other-source", ownerId: "person:A" },
+    ]) {
+      await db.sql.query(
+        "INSERT INTO memory_native_sources(id,scope,source) VALUES('untrusted',$1,$2::jsonb) ON CONFLICT(id) DO UPDATE SET source=EXCLUDED.source",
+        [scope, JSON.stringify(source)],
+      );
+      await expect(put(db, "unsupported", [n])).rejects.toThrow(
+        "memory_source_proof_missing",
+      );
+    }
+  });
+
+  it.each([true, false])(
+    "splits legacy source kinds only with stored server proof: %s",
+    async (verified) => {
+      const db = await setup(create);
+      await db.information.synchronizeKinds(["test.legacy.evidence"]);
+      for (const informationId of ["old-S1", "old-S2"])
+        await db.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId,
+              kind: "test.legacy.evidence",
+              source: "test:memory",
+              occurredAt: "2020-01-01T00:00:00Z",
+              payload: {},
+              references: [],
+            }),
+          ),
+          [],
+        );
+      const root = node(1, 1, ["old-S1", "old-S2"]);
+      root.metadata.kind = "experience";
+      root.metadata.experience = {
+        state: "open",
+        policyVersion: "legacy",
+        predecessors: [],
+        ...(verified
+          ? {
+              proofOwners: [
+                { ownerId: "person:A", sourceIds: ["old-S1"] },
+                { ownerId: "person:B", sourceIds: ["old-S2"] },
+              ],
+            }
+          : {}),
+      };
+      // 旧数据库中的服务端映射，不能用新publish的客户端字段伪造。
+      await db.sql.query(
+        "INSERT INTO memory_nodes(id,metadata,content) VALUES($1,$2::jsonb,$3)",
+        [root.id, JSON.stringify(root.metadata), root.content],
+      );
+      const outputs = [node(2, 1, ["old-S1"]), node(3, 1, ["old-S2"])];
+      for (const n of outputs) {
+        n.metadata.kind = "experience";
+        n.metadata.experience = {
+          state: "open",
+          policyVersion: "manual.v1",
+          predecessors: [root.id],
+        };
+      }
+      const result = put(
+        db,
+        "legacy-split",
+        [
+          {
+            ...root,
+            metadata: { ...root.metadata, revision: 2, status: "archived" },
+          },
+          ...outputs,
+        ],
+        {
+          experienceOperation: {
+            kind: "split",
+            inputIds: [root.id],
+            outputIds: outputs.map((n) => n.id),
+          },
+        },
+      );
+      if (!verified) {
+        await expect(result).rejects.toThrow("memory_source_proof_missing");
+        expect(await db.memoryGraph.native.history(outputs[0]!.id)).toEqual([]);
+        return;
+      }
+      await result;
+      await put(db, "legacy-A-split", [], {
+        invalidations: [
+          {
+            kind: "identity-split",
+            targetId: "person:A",
+            reason: "旧来源拆分",
+          },
+        ],
+      });
+      expect(
+        (
+          await db.memoryGraph.native.current(
+            input,
+            outputs.map((n) => n.id),
+          )
+        ).map((n) => n.id),
+      ).toEqual([outputs[1]!.id]);
+    },
+  );
   it("keeps historical text and edges while current revisions change", async () => {
     const db = await setup(create),
       a = node(1, 0),
@@ -624,6 +1067,153 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
 });
 
 it.skipIf(!url)(
+  "orders canonical-source commits before Memory publications (real PostgreSQL)",
+  async () => {
+    const db = await setup(() => createPostgresTestingDatabase(url!));
+    await source(db, "S");
+    const n = node(1, 0, ["S"]);
+    n.metadata.ownerId = `conversation:${scope}`;
+    n.metadata.kind = "conversation";
+    await db.information.synchronizeKinds(["memory.native.revision.v1"]);
+    await db.information.append(
+      freezeInformationAtom(
+        informationAtomSchema.parse({
+          informationId: "legacy-prefix",
+          kind: "memory.native.revision.v1",
+          source: "memory:manual",
+          occurredAt: "2026-01-01T00:00:00Z",
+          references: [],
+          payload: {
+            operationId: "legacy-prefix",
+            nodes: [n],
+            edges: [],
+            removeEdges: [],
+          },
+        }),
+      ),
+      [],
+    );
+    await db.sql.query(
+      "INSERT INTO memory_nodes(id,metadata,content) VALUES($1,$2::jsonb,$3)",
+      [n.id, JSON.stringify(n.metadata), n.content],
+    );
+    await db.sql.query(
+      "INSERT INTO memory_native_publications(operation_id,input_hash,information_id,nodes) VALUES('legacy-prefix','legacy-fixture','legacy-prefix',$1::jsonb)",
+      [JSON.stringify([n])],
+    );
+    let release!: () => void,
+      entered = false,
+      waiterPid: number | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writer = new KaguyaDatabase({
+      query: db.sql.query.bind(db.sql),
+      exec: db.sql.exec.bind(db.sql),
+      close: async () => {},
+      transaction: (run) =>
+        db.sql.transaction(async (tx) => {
+          const result = await run(tx);
+          entered = true;
+          await gate;
+          return result;
+        }),
+    });
+    const other = new KaguyaDatabase({
+      query: db.sql.query.bind(db.sql),
+      exec: db.sql.exec.bind(db.sql),
+      close: async () => {},
+      transaction: (run) =>
+        db.sql.transaction(async (tx) => {
+          waiterPid = (
+            await tx.query<{ pid: number }>("SELECT pg_backend_pid() pid")
+          ).rows[0]!.pid;
+          return run(tx);
+        }),
+    });
+    const pending = writer.memoryGraph.native.ingest({
+      id: "S",
+      scope,
+      ownerId: "person:A",
+      text: "原文",
+      occurredAt: "2020-01-01T00:00:00Z",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sourceType: "inbound",
+      participants: [],
+      replyTo: null,
+    });
+    const tasks: Promise<unknown>[] = [pending];
+    let backgroundError: unknown, mainError: unknown;
+    void pending.catch((error) => {
+      backgroundError = error;
+    });
+    try {
+      await vi.waitFor(
+        () => {
+          if (backgroundError) throw backgroundError;
+          expect(entered).toBe(true);
+        },
+        { timeout: 8000, interval: 20 },
+      );
+      const competing = put(other, "after-canonical", [node(2)]);
+      tasks.push(competing);
+      void competing.catch((error) => {
+        backgroundError = error;
+      });
+      await vi.waitFor(
+        async () => {
+          if (backgroundError) throw backgroundError;
+          expect(waiterPid).toBeDefined();
+          expect(
+            (
+              await db.sql.query(
+                "SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted",
+                [waiterPid],
+              )
+            ).rowCount,
+          ).toBe(1);
+        },
+        { timeout: 8000, interval: 20 },
+      );
+      const context = { ...input, owners: [n.metadata.ownerId] };
+      const before = await createNativeMemoryAccess({
+        enabled: true,
+        store: db.memoryGraph.native,
+      }).freeze(context);
+      expect(before.fixed).toEqual([]);
+      release();
+      await Promise.all(tasks);
+      expect(
+        (await db.memoryGraph.native.current(context, [n.id])).map((n) => n.id),
+      ).toEqual([n.id]);
+      expect(
+        await db.memoryGraph.native.current(
+          { ...context, cutoff: before.cutoff! },
+          [n.id],
+        ),
+      ).toEqual([]);
+    } catch (error) {
+      mainError = error;
+    } finally {
+      release();
+      const finished = await Promise.allSettled(tasks);
+      const errors = [
+        ...new Set([
+          ...(mainError ? [mainError] : []),
+          ...finished.flatMap((r) =>
+            r.status === "rejected" ? [r.reason] : [],
+          ),
+        ]),
+      ];
+      if (errors.length === 1) throw errors[0];
+      if (errors.length)
+        throw new AggregateError(errors, "Canonical commit barrier failed");
+    }
+  },
+  30000,
+);
+
+it.skipIf(!url)(
   "freezes a committed Memory prefix while an earlier position is uncommitted (real PostgreSQL)",
   async () => {
     const db = await setup(() => createPostgresTestingDatabase(url!));
@@ -877,10 +1467,6 @@ describe.each(backends)("native inherited evidence ($name)", ({ create }) => {
           },
         },
       );
-    await expect(edit(2, ["S3"])).rejects.toThrow(
-      "memory_experience_source_proof_missing",
-    );
-    expect(await db.memoryGraph.native.history(x.id)).toHaveLength(1);
     await db.memoryGraph.native.ingest({
       id: "S3",
       scope,
@@ -894,6 +1480,7 @@ describe.each(backends)("native inherited evidence ($name)", ({ create }) => {
     });
     const removed = await edit(2, ["S3"]);
     expect(removed[0]!.metadata.experience!.proofOwners).toEqual([
+      { ownerId: `conversation:${scope}`, sourceIds: ["S1"] },
       { ownerId: "person:a", sourceIds: ["S1"] },
       { ownerId: "person:dependency", sourceIds: ["S1"] },
       { ownerId: "person:new-source", sourceIds: ["S3"] },
