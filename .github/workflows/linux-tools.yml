@@ -25,6 +25,7 @@ jobs:
           node --test scripts/linux-tools/check-shell.mjs
           node --test scripts/linux-tools/check-browser-input.mjs
           node --test scripts/linux-tools/check-browser-freshness.mjs
+          node --test scripts/linux-tools/check-gui.mjs
           python3 -B scripts/linux-tools/check_files.py
           python3 -B scripts/linux-tools/check_gui_x11.py
       - name: Prepare pinned OCI builder

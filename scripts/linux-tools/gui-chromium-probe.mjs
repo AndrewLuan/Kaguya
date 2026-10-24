@@ -80,7 +80,7 @@ try {
     () => {},
   );
   assert.notEqual(evidence.type.isError, true);
-  evidence.after = await state("W8 browser ASCII");
+  evidence.after = await state("Value: W8 browser ASCII");
   // 单独打开 sandbox 页，确认 Chromium 自身报告，再关闭该页保留原页未保存输入。
   const browserInput = async (name, args) => {
     const result = await driver.call(
@@ -106,7 +106,7 @@ try {
   ])
     assert.ok(text(evidence.sandbox).includes(label), label);
   await browserInput("hotkey", { keys: ["ctrl", "w"] });
-  evidence.restored = await state("W8 browser ASCII");
+  evidence.restored = await state("Value: W8 browser ASCII");
   const image = evidence.after.content?.find((item) => item.type === "image");
   assert.equal(image?.mimeType, "image/png");
   const bytes = Buffer.from(image.data, "base64");

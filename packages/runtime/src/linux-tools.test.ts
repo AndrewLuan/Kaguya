@@ -10,8 +10,83 @@ import {
   linuxBrowserActSchema,
   linuxBrowserVerifySchema,
 } from "./linux-browser.js";
+import { linuxGuiActSchema } from "./linux-gui.js";
 
 describe("Linux native shell registry", () => {
+  it("registers GUI only for its configured scope and keeps insertion distinct from replacement", async () => {
+    const host = new LinuxToolsHost(
+      {
+        version: 1,
+        revision: "gui-one",
+        bindings: [
+          {
+            scope: "shell-only",
+            environmentId: "shell",
+            workflowId: "shell-flow",
+          },
+          {
+            scope: "gui-scope",
+            environmentId: "desktop",
+            workflowId: "gui-flow",
+            gui: true,
+          },
+        ],
+      },
+      new LinuxEnvironmentClient(async () => {
+        throw new Error("unexpected-rpc");
+      }),
+    );
+    try {
+      const registrations = host.snapshot().nativeTools.registrations;
+      expect(registrations.map((tool) => tool.id)).toEqual([
+        "shell.exec",
+        "gui.observe",
+        "gui.act",
+        "gui.verify",
+      ]);
+      await expect(
+        registrations
+          .find((tool) => tool.id === "gui.act")!
+          .bind({
+            scope: "shell-only",
+            arguments: {},
+            runInformationId: "run",
+            stepInformationId: "step",
+          }),
+      ).rejects.toThrow("gui-scope-denied");
+      const observation = {
+        id: "a".repeat(64),
+        environmentId: "desktop",
+        workflowId: "gui-flow",
+        generation: 0,
+      };
+      expect(
+        linuxGuiActSchema.safeParse({
+          action: "insert",
+          observation,
+          selector: { kind: "element", elementId: "e0" },
+          text: "暂存",
+        }).success,
+      ).toBe(false);
+      expect(
+        linuxGuiActSchema.safeParse({
+          action: "replace",
+          observation,
+          elementId: "e0",
+          value: "暂存",
+        }).success,
+      ).toBe(true);
+      expect(
+        linuxGuiActSchema.safeParse({
+          action: "launch_app",
+          observation,
+          argv: ["ignored"],
+        }).success,
+      ).toBe(false);
+    } finally {
+      await host.close();
+    }
+  });
   it("registers browser tools only for explicit browser scopes and rejects arbitrary scripts", async () => {
     const host = new LinuxToolsHost(
       {

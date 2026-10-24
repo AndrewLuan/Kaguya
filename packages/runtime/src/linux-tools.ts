@@ -1,5 +1,5 @@
 /**
- * 功能概述：把显式宿主配置的 Linux shell/Chromium 工具接入 W4 原生目录和 W3/W6 执行边界。
+ * 功能概述：把显式宿主配置的 Linux shell/Chromium/GUI 工具接入 W4 原生目录和 W3/W6 执行边界。
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
  * snapshot 提供 shell.exec 的有界 schema、scope/target 授权与 broker provider，不另建工具循环。
  * close 释放所持 lease，W6 负责物理隔离；失败保留 owner 以便再次清理，禁止盲目 recover。
@@ -16,6 +16,11 @@ import {
   linuxBrowserActSchema,
   linuxBrowserVerifySchema,
 } from "./linux-browser.js";
+import {
+  linuxGuiObserveSchema,
+  linuxGuiActSchema,
+  linuxGuiVerifySchema,
+} from "./linux-gui.js";
 
 const text = z.string().min(1).max(4096);
 const jobId = z.string().regex(/^[a-f0-9]{64}$/);
@@ -66,6 +71,7 @@ export const linuxToolsConfigurationSchema = z
             environmentId: text,
             workflowId: text,
             browser: z.boolean().optional(),
+            gui: z.boolean().optional(),
           })
           .strict(),
       )
@@ -197,10 +203,33 @@ export class LinuxToolsHost {
         description:
           "在新操作中引用原 operationId/attemptId，读取真实页面状态或核对并导出下载当前文件；下载操作关联为启发式、因果未确认，不重放原输入。",
       },
+      {
+        id: "gui.observe",
+        inputSchema: linuxGuiObserveSchema,
+        readonly: true,
+        description:
+          "观察隔离 Linux 桌面或指定窗口，返回原尺寸 PNG、AX、窗口原点和一次性观察引用。像素坐标属于返回的窗口图或桌面图；每次输入前重新观察。",
+      },
+      {
+        id: "gui.act",
+        inputSchema: linuxGuiActSchema,
+        readonly: false,
+        description:
+          "依据当前观察执行一次 GUI 输入。insert 只插入 ASCII；replace 明确替换整个字段并支持 Unicode。未知结果不得重复输入；过期观察、旧 generation 或已撤销许可均拒绝。",
+      },
+      {
+        id: "gui.verify",
+        inputSchema: linuxGuiVerifySchema,
+        readonly: true,
+        description:
+          "引用原 operationId/attemptId，重新观察并核对当前 GUI 文本，不重放原输入，不改写原操作的未知结果。",
+      },
     ].filter(
       (tool) =>
         tool.id === "shell.exec" ||
-        this.configuration.bindings.some((b) => b.browser === true),
+        this.configuration.bindings.some((b) =>
+          tool.id.startsWith("gui.") ? b.gui === true : b.browser === true,
+        ),
     );
     const tools: NativeToolLoopOptions = {
       registrations: this.configuration.bindings.length
@@ -219,10 +248,18 @@ export class LinuxToolsHost {
               if (
                 tool.id !== "shell.exec" &&
                 !this.configuration.bindings.some(
-                  (b) => b.scope === scope && b.browser === true,
+                  (b) =>
+                    b.scope === scope &&
+                    (tool.id.startsWith("gui.")
+                      ? b.gui === true
+                      : b.browser === true),
                 )
               )
-                throw new Error("linux-browser-scope-denied");
+                throw new Error(
+                  tool.id.startsWith("gui.")
+                    ? "linux-gui-scope-denied"
+                    : "linux-browser-scope-denied",
+                );
               return {
                 target: { scope, revision: this.configuration.revision },
                 environment: await this.bind(scope),
@@ -234,7 +271,10 @@ export class LinuxToolsHost {
               this.configuration.bindings.some(
                 (b) =>
                   b.scope === intent.scope &&
-                  (tool.id === "shell.exec" || b.browser === true) &&
+                  (tool.id === "shell.exec" ||
+                    (tool.id.startsWith("gui.")
+                      ? b.gui === true
+                      : b.browser === true)) &&
                   b.environmentId === intent.environment?.environmentId &&
                   b.workflowId === intent.environment.workflowId,
               ) &&

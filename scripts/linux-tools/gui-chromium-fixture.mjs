@@ -27,9 +27,9 @@ async function save() {
 const html = `<!doctype html><meta charset="utf-8"><title>Kaguya Chromium acceptance</title>
 <style>body{font:24px sans-serif;padding:48px}input,button{font:inherit;margin:12px;padding:12px}</style>
 <h1>Kaguya Chromium acceptance</h1><label>Browser unsaved text<input aria-label="Browser unsaved text"></label>
-<button>Browser increment once</button><p id="count">Count: 0</p><script>
+<button>Browser increment once</button><p id="count">Count: 0</p><p id="value">Value: </p><script>
 let count=0, chain=Promise.resolve(); const input=document.querySelector('input');
-function save(){const body=JSON.stringify({text:input.value,count});chain=chain.then(()=>fetch('/event',{method:'POST',body}));}
+function save(){document.querySelector('#value').textContent='Value: '+input.value;const body=JSON.stringify({text:input.value,count});chain=chain.then(()=>fetch('/event',{method:'POST',body}));}
 input.addEventListener('input',save);document.querySelector('button').addEventListener('click',()=>{count++;document.querySelector('#count').textContent='Count: '+count;save();});
 </script>`;
 const server = createServer(async (request, response) => {
