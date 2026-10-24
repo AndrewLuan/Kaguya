@@ -6,7 +6,7 @@
  * 功能概述：通过真实 Runtime/PGlite 与 DeepSeek-compatible HTTP mock 验证先观察、后规划的发言链。
  * fixture 装配正式 Catalog、light Light 和 heavy Heavy；settle 等待 durable 订阅闭合，
  * restart 保留数据库并重建宿主，advance 推进持久 heartbeat 时钟。仅 mock provider HTTP，
- * waitForPersistence 将本 fixture 的启动、打断、重建、重放及 settle 等待统一到已有的 8 秒
+ * createPersistenceWait 将本 fixture 的启动、打断、重建、重放及 settle 等待统一到已有的 8 秒
  * 持久化预算，条件满足即继续；不改变注入时钟、业务静默窗、等待次数或精确行为断言。
  * 多次取消、重建与重启场景另设 30 秒总预算；QQ 四至五轮 45 秒、八轮加重启 60 秒。
  * macOS 四轮实测约 26 秒，Windows 八轮约 29 秒，顺序 I/O 不能套用单轮的 15 秒总上限；
@@ -19,6 +19,10 @@
  * 所有消息和密钥均为合成测试数据；清理按 Runtime、数据库顺序关闭，不访问外部服务。
  * 观察延期测试保留数据库重建 Runtime，在无新入站时触发到期复查，并核对原 manifest 及最终成功状态。
  */
+import {
+  closeTestResources,
+  createPersistenceWait,
+} from "./test-support/persistence.js";
 import { readSituation } from "./inspection-situation.js";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createMessageComposition } from "@kaguya/composition";
@@ -36,17 +40,17 @@ import {
 import type { PlatformInboundMessage } from "@kaguya/platform-adapters";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const PERSISTENCE_WAIT = { timeout: 8000, interval: 20 } as const;
 const MULTI_STAGE_TIMEOUT = 30_000;
+// 受控打断含 5 次持久化等待（5×8 秒）和两次重启，60 秒覆盖初始化/收尾。
+const INTERRUPTION_TIMEOUT = 60_000;
+// 双重重建：1 次启动等待 + 2×3 次循环等待 + wake/settle 共 9×8 秒，另留两次重启余量。
+const REBUILD_LIMIT_TIMEOUT = 90_000;
 const QQ_MULTI_TURN_TIMEOUT = 45_000;
 const QQ_RESTART_TIMEOUT = 60_000;
-function waitForPersistence(assertion: () => void | Promise<void>) {
-  return vi.waitFor(assertion, PERSISTENCE_WAIT);
-}
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
-  for (const close of cleanups.splice(0).reverse()) await close();
+  await closeTestResources(cleanups);
 });
 const speak = {
   action: "message",
@@ -65,6 +69,11 @@ async function fixture(
     emoji: string | null;
   } = { assetInformationId: null, emoji: null };
   const database = await createTestingDatabase();
+  cleanups.push(() => database.close());
+  let activeRuntime: KaguyaRuntime | undefined;
+  cleanups.push(async () => {
+    await activeRuntime?.close();
+  });
   let now = Date.parse("2026-09-12T12:00:00.000Z");
   const requests: Record<string, any>[] = [];
   const backgroundRequests: Record<string, any>[] = [];
@@ -199,22 +208,23 @@ async function fixture(
       platform: "qq",
       transport: { sendMessage: delivered },
     });
+    activeRuntime = runtime;
     await runtime.start();
     return runtime;
   };
   let runtime = await start();
-  cleanups.push(async () => {
-    await runtime.close();
-    await database.close();
-  });
+  const waitFor = createPersistenceWait(database, () => ({
+    modelCalls: requests.length,
+    backgroundCalls: backgroundRequests.length,
+  }));
   const atoms = () =>
     database.information.find({
       occurredAfter: "2020-01-01T00:00:00.000Z",
       order: "asc",
       limit: 1000,
     });
-  const settle = async () => {
-    await waitForPersistence(async () =>
+  const settle = async (phase = "durable queue settled") => {
+    await waitFor(phase, async () =>
       expect((await database.information.reliable.health()).pending).toBe(0),
     );
   };
@@ -236,7 +246,10 @@ async function fixture(
   });
   return {
     waitForDeliveries: (count: number) =>
-      waitForPersistence(() => expect(delivered).toHaveBeenCalledTimes(count)),
+      waitFor(`deliveries reach ${count}`, () =>
+        expect(delivered).toHaveBeenCalledTimes(count),
+      ),
+    waitFor,
     database,
     requests,
     backgroundRequests,
@@ -335,7 +348,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
     const freeze = vi.spyOn(f.database.rawEvents, "freeze");
     freeze.mockRejectedValueOnce(new Error("synthetic raw projection outage"));
     await f.submit(f.message());
-    await waitForPersistence(async () =>
+    await f.waitFor("speech persistence", async () =>
       expect(freeze).toHaveBeenCalledTimes(1),
     );
     expect(f.requests).toHaveLength(0);
@@ -559,37 +572,41 @@ describe("Router Light via DeepSeek-compatible provider", () => {
     },
   );
 
-  it("repairs an obsolete composition field before dispatch and replays the decision once", async () => {
-    const f = await fixture([
-      {
-        ...speak,
-        composition: {
-          focusInputIndexes: [0],
-          topic: "topic",
-          replyAct: "reply",
+  it(
+    "repairs an obsolete composition field before dispatch and replays the decision once",
+    async () => {
+      const f = await fixture([
+        {
+          ...speak,
+          composition: {
+            focusInputIndexes: [0],
+            topic: "topic",
+            replyAct: "reply",
+          },
         },
-      },
-      speak,
-    ]);
-    await f.submit(f.message());
-    await f.settle();
-    const before = await f.atoms();
-    expect(f.requests).toHaveLength(3); // invalid Light, repaired Light, Heavy
-    const task = before.find(
-      (a) =>
-        a.kind === "core.model.task.requested" &&
-        a.payload.taskId === "agent.light.decide",
-    )!;
-    expect(task.payload).not.toHaveProperty("version");
-    expect(
-      before.filter((a) => a.kind === "agent.light.decision.completed"),
-    ).toHaveLength(1);
-    expect(f.delivered).toHaveBeenCalledTimes(1);
-    await f.restart();
-    await f.settle();
-    expect(f.requests).toHaveLength(3);
-    expect(f.delivered).toHaveBeenCalledTimes(1);
-  });
+        speak,
+      ]);
+      await f.submit(f.message());
+      await f.settle("repaired decision committed");
+      const before = await f.atoms();
+      expect(f.requests).toHaveLength(3); // invalid Light, repaired Light, Heavy
+      const task = before.find(
+        (a) =>
+          a.kind === "core.model.task.requested" &&
+          a.payload.taskId === "agent.light.decide",
+      )!;
+      expect(task.payload).not.toHaveProperty("version");
+      expect(
+        before.filter((a) => a.kind === "agent.light.decision.completed"),
+      ).toHaveLength(1);
+      expect(f.delivered).toHaveBeenCalledTimes(1);
+      await f.restart();
+      await f.settle();
+      expect(f.requests).toHaveLength(3);
+      expect(f.delivered).toHaveBeenCalledTimes(1);
+    },
+    MULTI_STAGE_TIMEOUT,
+  );
 
   it("fails closed without structural repair for an HTTP failure", async () => {
     const f = await fixture(["HTTP_FAILURE", speak]);
@@ -700,13 +717,13 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       const blockedRequestCount = duringRepair ? 2 : 1;
       try {
         await f.submit(f.message());
-        await waitForPersistence(() =>
+        await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(blockedRequestCount),
         );
         f.setTime(1000);
         for (let i = 0; i < 8; i++)
           await f.submit(f.message(`m${i + 2}`, { text: `更新的消息 ${i}` }));
-        await waitForPersistence(async () =>
+        await f.waitFor("speech persistence", async () =>
           expect(kinds(await f.atoms())).toContain(
             "agent.heartbeat.observation.wake",
           ),
@@ -718,7 +735,9 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         ).toHaveLength(1);
         expect(f.requests).toHaveLength(blockedRequestCount);
         release(speak);
-        await f.settle();
+        await f.settle(
+          "cancelled Light result drained before quiet-window restart",
+        );
         f.setTime(1001);
         await f.restart();
         await f.settle();
@@ -767,7 +786,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         release(speak);
       }
     },
-    MULTI_STAGE_TIMEOUT,
+    INTERRUPTION_TIMEOUT,
   );
 
   it(
@@ -780,10 +799,12 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       const f = await fixture([() => blocked, silent]);
       try {
         await f.submit(f.message());
-        await waitForPersistence(() => expect(f.requests).toHaveLength(1));
+        await f.waitFor("speech persistence", () =>
+          expect(f.requests).toHaveLength(1),
+        );
         f.setTime(1000);
         await f.submit(f.message("m2"));
-        await waitForPersistence(async () =>
+        await f.waitFor("speech persistence", async () =>
           expect(kinds(await f.atoms())).toContain(
             "agent.router.turn.interrupted",
           ),
@@ -824,11 +845,13 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       const f = await fixture([blocked, blocked, blocked, silent]);
       try {
         await f.submit(f.message());
-        await waitForPersistence(() => expect(releases).toHaveLength(1));
+        await f.waitFor("speech persistence", () =>
+          expect(releases).toHaveLength(1),
+        );
         for (let round = 1; round <= 2; round++) {
           f.setTime(1000);
           await f.submit(f.message(`m${round + 1}`));
-          await waitForPersistence(async () =>
+          await f.waitFor("speech persistence", async () =>
             expect(
               (await f.atoms()).filter(
                 (a) => a.kind === "agent.router.turn.interrupted",
@@ -839,13 +862,13 @@ describe("Router Light via DeepSeek-compatible provider", () => {
           await f.settle();
           f.setTime(1001);
           await f.restart();
-          await waitForPersistence(() =>
+          await f.waitFor("speech persistence", () =>
             expect(releases).toHaveLength(round + 1),
           );
         }
         f.setTime(1000);
         await f.submit(f.message("m4"));
-        await waitForPersistence(async () =>
+        await f.waitFor("speech persistence", async () =>
           expect(kinds(await f.atoms())).toContain(
             "agent.heartbeat.observation.wake",
           ),
@@ -861,7 +884,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         for (const release of releases) release(silent);
       }
     },
-    MULTI_STAGE_TIMEOUT,
+    REBUILD_LIMIT_TIMEOUT,
   );
 
   it(
@@ -874,10 +897,12 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       const f = await fixture([() => blocked, speak]);
       try {
         await f.submit(f.message());
-        await waitForPersistence(() => expect(f.requests).toHaveLength(1));
+        await f.waitFor("speech persistence", () =>
+          expect(f.requests).toHaveLength(1),
+        );
         f.setTime(1000);
         await f.submit(f.message("during-wait"));
-        await waitForPersistence(async () =>
+        await f.waitFor("speech persistence", async () =>
           expect(kinds(await f.atoms())).toContain(
             "agent.heartbeat.observation.wake",
           ),
@@ -919,7 +944,9 @@ describe("Router Light via DeepSeek-compatible provider", () => {
     const f = await fixture([() => blocked]);
     try {
       await f.submit(f.message());
-      await waitForPersistence(() => expect(f.requests).toHaveLength(1));
+      await f.waitFor("speech persistence", () =>
+        expect(f.requests).toHaveLength(1),
+      );
       const requested = (await f.atoms()).find(
         (a) => a.kind === "core.model.task.requested",
       )!;
@@ -1017,7 +1044,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       expect(f.requests).toHaveLength(0);
       f.setTime(300001);
       await f.restart();
-      await waitForPersistence(async () =>
+      await f.waitFor("speech persistence", async () =>
         expect(
           (await f.atoms()).some(
             (a) => a.kind === "agent.observation.completed.v1",
@@ -1075,7 +1102,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       for (let round = 0; round < 3; round++) {
         f.setTime(6000);
         await f.restart();
-        await waitForPersistence(() =>
+        await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(round === 2 ? 5 : round + 2),
         );
         await f.settle();
@@ -1110,7 +1137,9 @@ describe("Router Light via DeepSeek-compatible provider", () => {
     const f = await fixture([() => blocked]);
     try {
       await f.submit(f.message());
-      await waitForPersistence(() => expect(f.requests).toHaveLength(1));
+      await f.waitFor("speech persistence", () =>
+        expect(f.requests).toHaveLength(1),
+      );
       f.setTime(60000);
       release(wait);
       await f.settle();
@@ -1147,7 +1176,9 @@ describe("Router Light via DeepSeek-compatible provider", () => {
         });
       try {
         await f.submit(f.message());
-        await waitForPersistence(() => expect(interrupted).toBe(true));
+        await f.waitFor("speech persistence", () =>
+          expect(interrupted).toBe(true),
+        );
         await f.submit(
           f.message("late-history", {
             occurredAt: "2026-09-12T11:59:00.000Z",
@@ -1195,7 +1226,7 @@ describe("Router Light via DeepSeek-compatible provider", () => {
       for (let round = 1; round <= 3; round++) {
         f.setTime(6000);
         await f.restart();
-        await waitForPersistence(() =>
+        await f.waitFor("speech persistence", () =>
           expect(f.requests).toHaveLength(round === 3 ? 5 : round + 1),
         );
         await f.settle();
