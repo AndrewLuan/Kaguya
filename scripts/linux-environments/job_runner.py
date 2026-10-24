@@ -6,6 +6,7 @@
 输入输出与副作用：命令没有 permit、控制 FD 或宿主路径；lease renew 不改变原截止。
 """
 import fcntl
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,25 @@ def payload_empty(group):
     return not path.exists() or "populated 0" in path.read_text()
 
 
+def container_command(record):
+    command = ["/usr/bin/podman", "--cgroup-manager=cgroupfs", "run", "--pull=never", "--interactive",
+               "--name=" + record["container"], "--label=kaguya.environment=" + record["environmentId"],
+               "--label=kaguya.role=shell", "--label=kaguya.job=" + record["jobId"],
+               "--label=kaguya.generation=" + str(record["generation"]), "--cgroups=split",
+               "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
+               "--security-opt=no-new-privileges", "--read-only", "--ipc=private", "--pid=private",
+               "--cgroupns=private", "--cpus=1", "--memory=2g", "--memory-swap=2g", "--pids-limit=256",
+               "--shm-size=512m", "--init", "--log-driver=none", "--restart=no",
+               "--network=" + ("none" if record["network"] == "none" else "pasta:--no-map-gw"),
+               "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
+               "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
+               "--volume=" + record["volume"] + ":/workspace:rw", "--workdir=/workspace",
+               "--entrypoint=/usr/local/bin/node"]
+    command += ["--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/home/tool", "--env=TMPDIR=/tmp", "--env=LANG=C.UTF-8"]
+    command += [record["image"], "/opt/kaguya-tools/job-entry.mjs", record["cwd"], json.dumps(record["env"]), *record["argv"]]
+    return command
+
+
 def run(path):
     record = read_json(path / "manifest.json")
     if record["bootId"] != boot_id() or remaining(record) <= 0:
@@ -59,7 +79,8 @@ def run(path):
     expiry_unit = record["unit"].removesuffix(".service") + "-expiry"
     jobs.system("/usr/bin/systemd-run", "--user", "--quiet", "--unit=" + expiry_unit,
                 f"--on-boot={record['monotonicDeadline']:.6f}s",
-                "--on-calendar=@" + str(record["expires"]), "--timer-property=AccuracySec=1us",
+                "--on-calendar=" + datetime.fromtimestamp(record["expires"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f UTC"),
+                "--timer-property=AccuracySec=1us",
                 "--timer-property=RandomizedDelaySec=0", "/usr/bin/systemctl", "--user", "stop", record["unit"])
     timer_path = jobs.system("/usr/bin/busctl", "--user", "call", "org.freedesktop.systemd1",
                             "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
@@ -71,21 +92,7 @@ def run(path):
     if (jobs.properties(expiry_unit + ".timer").get("ActiveState") != "active" or
             not 0 < armed_deadline <= record["monotonicDeadline"] + 0.000002 or remaining(record) <= 0):
         raise BrokerError("deadline-not-armed")
-    command = ["/usr/bin/podman", "--cgroup-manager=cgroupfs", "run", "--pull=never", "--interactive",
-               "--name=" + record["container"], "--label=kaguya.environment=" + record["environmentId"],
-               "--label=kaguya.role=shell", "--label=kaguya.job=" + record["jobId"],
-               "--label=kaguya.generation=" + str(record["generation"]), "--cgroups=split",
-               "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
-               "--security-opt=no-new-privileges", "--read-only", "--ipc=private", "--pid=private",
-               "--cgroupns=private", "--cpus=1", "--memory=2g", "--memory-swap=2g", "--pids-limit=256",
-               "--shm-size=512m", "--init", "--log-driver=none", "--restart=no",
-               "--network=" + ("none" if record["network"] == "none" else "pasta:--no-map-gw"),
-               "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
-               "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
-               "--volume=" + record["volume"] + ":/workspace:rw", "--workdir=/workspace",
-               "--entrypoint=/usr/local/bin/node"]
-    command += ["--env=" + key + "=" + value for key, value in record["env"].items()]
-    command += [record["image"], "/opt/kaguya-tools/job-entry.mjs", record["cwd"], *record["argv"]]
+    command = container_command(record)
     streams = {}
     proc = None
     selector = selectors.DefaultSelector()
@@ -96,6 +103,18 @@ def run(path):
         proc = subprocess.Popen(command, env=backend.env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         end = time.monotonic() + min(15, remaining(record))
+        ready = bytearray()
+        with selectors.DefaultSelector() as handshake:
+            handshake.register(proc.stdout, selectors.EVENT_READ)
+            while not ready.endswith(b"\n"):
+                if not handshake.select(max(0, end - time.monotonic())):
+                    raise BrokerError("gate-ready-timeout")
+                data = os.read(proc.stdout.fileno(), 1)
+                if not data or len(ready) >= 128:
+                    raise BrokerError("gate-ready-invalid")
+                ready.extend(data)
+        if ready != b"kaguya-job-ready\n":
+            raise BrokerError("gate-ready-invalid")
         while time.monotonic() < end:
             if proc.poll() is not None:
                 os.write(streams["stderr"], proc.stderr.read(LOG_RESERVATION))
