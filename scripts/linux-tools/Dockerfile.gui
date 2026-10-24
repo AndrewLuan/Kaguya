@@ -22,6 +22,7 @@ RUN (getent passwd 1001 || useradd --uid 1001 --create-home --home-dir /home/app
     && chown 1001:1001 /home/app /run/kaguya-app /private/app \
     && chmod 0711 /run/kaguya-app \
     && cp /opt/kaguya-tools/gui-accessibility.conf /usr/share/defaults/at-spi2/accessibility.conf \
+    && cp /opt/kaguya-tools/gui-marker.service /usr/share/dbus-1/services/org.kaguya.GuiAcceptance.service \
     && chmod 0555 /opt/kaguya-tools/gui-app-session.py /opt/kaguya-tools/helper /opt/cua/helpers
 USER 1000:1000
 ENV HOME=/home/tool DISPLAY=:99 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kaguya-app/session/bus \

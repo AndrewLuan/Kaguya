@@ -97,6 +97,14 @@ def until_json(parts, predicate, seconds=15):
         time.sleep(.02)
 
 
+def application_identity(pid):
+    status = command("exec", name, "/bin/cat", f"/proc/{pid}/status").stdout.decode()
+    assert re.search(r"^Uid:\s+1001\s+1001\s+1001\s+1001$", status, re.M), status
+    assert not re.search(r"^State:\s+Z", status, re.M), status
+    process = command("exec", name, "/bin/cat", f"/proc/{pid}/stat").stdout.decode()
+    return {"pid": pid, "uid": 1001, "startTime": process.rsplit(")", 1)[1].split()[19]}
+
+
 info = json.loads(command("info", "--format=json").stdout)
 assert info["host"]["security"]["rootless"] is True
 security = info["host"]["security"]
@@ -137,6 +145,7 @@ try:
     until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/session/gui-ledger.json"])
     ledger = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
     assert ledger["uid"] == 1001
+    gtk_identity = application_identity(ledger["pid"])
     probe_process = subprocess.Popen(["/usr/bin/podman", "exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     driver = json.loads(until(["exec", name, "/bin/cat", "/home/tool/gui-probe-driver.json"]))
     health = json.loads(command("exec", "-i", name, "/opt/kaguya-tools/helper", input=b'{"helperProtocolVersion":1,"kind":"health"}').stdout)
@@ -158,13 +167,26 @@ try:
     assert preserved == after, preserved
     command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-fixture.mjs")
     browser = json.loads(until(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-fixture.json"]))
-    browser_status = command("exec", name, "/bin/cat", f'/proc/{browser["pid"]}/status').stdout.decode()
-    assert re.search(r"^Uid:\s+1001\s+1001\s+1001\s+1001$", browser_status, re.M)
+    browser_identity = application_identity(browser["pid"])
     browser_result = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-probe.mjs", str(browser["pid"]), timeout=120)
     print(browser_result.stdout.decode(), flush=True)
     browser_after = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-ledger.json"], lambda value: value["text"] == "W8 browser ASCII" and value["count"] == 1)
     assert browser_after == {"uid": 1001, "pid": browser["pid"], "text": "W8 browser ASCII", "count": 1}, browser_after
     print(json.dumps({"independentBrowserLedger": browser_after, "sandboxPolicy": "chromium-v1", "seccompSha256": hashlib.sha256(selected_profile.read_bytes()).hexdigest()}), flush=True)
+    command("exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.StartServiceByName", "string:org.kaguya.GuiAcceptance", "uint32:0")
+    command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-launch-probe.mjs", timeout=120)
+    launches = []
+    for kind in ("activation", "shortcut", "menu"):
+        marker = json.loads(until(["exec", "--user=1001:1001", name, "/bin/cat", f"/home/app/session/launch-{kind}.json"]))
+        assert marker["kind"] == kind and marker["uid"] == 1001 and marker["pid"] > 1, marker
+        launches.append(marker)
+    print(json.dumps({"applicationLaunches": launches}), flush=True)
+    for filename, expected in [("gui-ledger.json", after), ("chromium-ledger.json", browser_after)]:
+        preserved = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/" + filename).stdout)
+        assert preserved == expected, preserved
+    assert application_identity(ledger["pid"]) == gtk_identity
+    assert application_identity(browser["pid"]) == browser_identity
+    print(json.dumps({"applicationsPreserved": [gtk_identity, browser_identity]}), flush=True)
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
     Path("gui-packages.txt").write_bytes(command("exec", name, "/bin/cat", "/usr/share/kaguya-gui-packages.txt").stdout)
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
@@ -182,6 +204,8 @@ finally:
                                 ("/home/app/session/chromium.log", "gui-chromium.log"),
                                 ("/home/tool/gui-drain-held.json", "gui-drain-held.json"),
                                 ("/home/tool/gui-drain-unicode.json", "gui-drain-unicode.json"),
+                                ("/home/tool/gui-menu.png", "gui-menu.png"),
+                                ("/home/tool/gui-menu-observation.json", "gui-menu-observation.json"),
                                 ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
         if podman_unresponsive:
             break

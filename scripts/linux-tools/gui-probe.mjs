@@ -33,7 +33,9 @@ const text = (result) =>
 const element = (result, name) => {
   const rows = text(result);
   const snapshot = /snapshot_id=([^\s]+)/.exec(rows)?.[1];
-  const row = rows.split("\n").find((line) => line.includes('"' + name + '"'));
+  const row = rows
+    .split("\n")
+    .find((line) => /\[\d+\]/.test(line) && line.includes('"' + name + '"'));
   const index = /\[(\d+)\]/.exec(row ?? "")?.[1];
   assert.ok(snapshot && index, "fixture-element-token-missing");
   return `${snapshot}:${index}`;

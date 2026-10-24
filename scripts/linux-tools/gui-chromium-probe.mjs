@@ -17,7 +17,10 @@ const text = (r) =>
     ?.filter((c) => c.type === "text")
     .map((c) => c.text)
     .join("\n") ?? "";
-async function state(contains) {
+async function state(
+  contains,
+  matches = (result) => text(result).includes(contains),
+) {
   const deadline = Date.now() + 15000;
   while (true) {
     const result = await driver.call("get_window_state", {
@@ -25,7 +28,7 @@ async function state(contains) {
       max_image_dimension: 0,
     });
     assert.notEqual(result.isError, true);
-    if (text(result).includes(contains)) return result;
+    if (matches(result)) return result;
     if (Date.now() >= deadline)
       throw new Error(`chromium-AX-timeout:${text(result).slice(0, 2000)}`);
     await delay(20);
@@ -34,7 +37,9 @@ async function state(contains) {
 function element(result, name) {
   const rows = text(result);
   const snapshot = /snapshot_id=([^\s]+)/.exec(rows)?.[1];
-  const row = rows.split("\n").find((line) => line.includes(`"${name}"`));
+  const row = rows
+    .split("\n")
+    .find((line) => /\[\d+\]/.test(line) && line.includes(`"${name}"`));
   const index = /\[(\d+)\]/.exec(row ?? "")?.[1];
   assert.ok(snapshot && index, "chromium-element-missing");
   return `${snapshot}:${index}`;
@@ -54,7 +59,7 @@ try {
     () => {},
   );
   assert.notEqual(evidence.click.isError, true);
-  const entry = await state("Count: 1");
+  const entry = (evidence.entry = await state("Count: 1"));
   evidence.type = await driver.call(
     "type_text",
     {
@@ -68,6 +73,32 @@ try {
   );
   assert.notEqual(evidence.type.isError, true);
   evidence.after = await state("W8 browser ASCII");
+  // 单独打开 sandbox 页，确认 Chromium 自身报告，再关闭该页保留原页未保存输入。
+  const browserInput = async (name, args) => {
+    const result = await driver.call(
+      name,
+      { pid, window_id: windowId, delivery_mode: "foreground", ...args },
+      () => {},
+    );
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+  };
+  await browserInput("hotkey", { keys: ["ctrl", "t"] });
+  await state("New Tab", (result) =>
+    (result.structuredContent?.window_title ?? "").includes("New Tab"),
+  );
+  await browserInput("type_text", { text: "chrome://sandbox" });
+  await browserInput("press_key", { key: "enter" });
+  evidence.sandbox = await state("You are adequately sandboxed.");
+  for (const label of [
+    "Namespace",
+    "PID namespaces",
+    "Network namespaces",
+    "Seccomp-BPF sandbox",
+    "TSYNC",
+  ])
+    assert.ok(text(evidence.sandbox).includes(label), label);
+  await browserInput("hotkey", { keys: ["ctrl", "w"] });
+  evidence.restored = await state("W8 browser ASCII");
   const image = evidence.after.content?.find((item) => item.type === "image");
   assert.equal(image?.mimeType, "image/png");
   const bytes = Buffer.from(image.data, "base64");
@@ -81,6 +112,7 @@ try {
       windowId,
       text: text(evidence.after),
       screenshot: "gui-chromium.png",
+      sandboxText: text(evidence.sandbox),
     }),
   );
 } finally {
