@@ -13,7 +13,14 @@ const READ = new Set([
   "get_window_state",
   "get_desktop_state",
 ]);
-const INPUT = new Set(["click", "type_text", "press_key", "hotkey", "scroll"]);
+const INPUT = new Set([
+  "click",
+  "type_text",
+  "set_value",
+  "press_key",
+  "hotkey",
+  "scroll",
+]);
 export class CuaStdio {
   #child;
   #pending = new Map();

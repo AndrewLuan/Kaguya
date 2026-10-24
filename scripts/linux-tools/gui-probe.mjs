@@ -120,12 +120,29 @@ try {
       pid,
       window_id: windowId,
       element_token: element(entryState, "Unsaved text"),
-      text: "W8 暂存",
+      text: "W8 ASCII",
       delivery_mode: "foreground",
     },
     () => assert.equal(process.getuid(), 1000),
   ));
   assert.notEqual(typed.isError, true);
+  const asciiState = await observed(
+    () => driver.call("get_window_state", { pid, window_id: windowId }),
+    (result) => text(result).includes("W8 ASCII"),
+    "gtk-ascii-inserted",
+  );
+  // 固定 Cua 0.38 InsertText 的长度处理会截断 UTF-8；Unicode 使用明确的整字段赋值。
+  evidence.filled = await driver.call(
+    "set_value",
+    {
+      pid,
+      window_id: windowId,
+      element_token: element(asciiState, "Unsaved text"),
+      value: "W8 暂存",
+    },
+    () => assert.equal(process.getuid(), 1000),
+  );
+  assert.notEqual(evidence.filled.isError, true);
   evidence.after = await observed(
     () =>
       driver.call("get_window_state", {
