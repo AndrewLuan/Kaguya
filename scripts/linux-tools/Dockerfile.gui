@@ -1,0 +1,26 @@
+# 功能概述：固定 Cua 二进制及基础镜像的双 UID GUI；控制与应用身份在 OCI 启动时确定。
+# probe 记录完整 dpkg 清单；GUI 不挂宿主显示/uinput，不提高运行时 capability。
+FROM node:24.18.0-bookworm-slim@sha256:d45d78e7929b46875bbd4e29bea672d5bc48186c6c3588306521c815e78352d6 AS node
+FROM mcr.microsoft.com/playwright@sha256:d65108d1a8095d8b0c4a5e32bf1807a40a5ce90ff0c78473e1116b1c243235e8
+COPY --from=node /usr/local/ /usr/local/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb openbox dbus-x11 at-spi2-core python3-gi gir1.2-gtk-3.0 xterm x11-utils libxdo3 \
+    && dpkg-query -W > /usr/share/kaguya-gui-packages.txt && rm -rf /var/lib/apt/lists/*
+ADD --checksum=sha256:31ab9709dd91ce73677e49b9f3e75c6f0d3e4d9625c286c9e58262bfbea698dd \
+    https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.38.0/cua-driver-rs-0.38.0-linux-x86_64-binary.tar.gz /tmp/cua.tar.gz
+RUN mkdir /opt/cua && tar -xzf /tmp/cua.tar.gz -C /opt/cua cua-driver && rm /tmp/cua.tar.gz \
+    && chmod 0555 /opt/cua/cua-driver && /opt/cua/cua-driver --version
+COPY --chown=0:0 scripts/linux-tools/ /opt/kaguya-tools/
+RUN (getent passwd 1001 || useradd --uid 1001 --create-home --home-dir /home/app --shell /bin/bash kaguya-app) \
+    && mkdir -p /home/tool /home/app /run/kaguya-app /private/app /workspace \
+    && chown 1000:1000 /home/tool /private /workspace \
+    && chmod 0700 /home/tool \
+    && chown 1001:1001 /home/app /run/kaguya-app /private/app \
+    && chmod 0711 /run/kaguya-app \
+    && cp /opt/kaguya-tools/gui-accessibility.conf /usr/share/defaults/at-spi2/accessibility.conf \
+    && chmod 0555 /opt/kaguya-tools/gui-app-session.py /opt/kaguya-tools/helper
+USER 1000:1000
+ENV HOME=/home/tool DISPLAY=:99 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/kaguya-app/session-bus \
+    CUA_DRIVER_RS_TELEMETRY_ENABLED=false DO_NOT_TRACK=1 CUA_TELEMETRY=0
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/node", "/opt/kaguya-tools/gui-init.mjs"]
