@@ -31,11 +31,11 @@ jobs:
       - name: Build fixed Linux amd64 OCI image
         run: >-
           docker buildx build --platform linux/amd64
-            --provenance=false --sbom=false
-            --file scripts/linux-tools/Dockerfile
-            --tag localhost/kaguya-shell:ci
-            --output type=oci,dest=shell-tools.oci
-            --metadata-file shell-image-metadata.json .
+          --provenance=false --sbom=false
+          --file scripts/linux-tools/Dockerfile
+          --tag localhost/kaguya-shell:ci
+          --output type=oci,dest=shell-tools.oci
+          --metadata-file shell-image-metadata.json .
       - name: Record archive and image identities
         run: |
           sha256sum shell-tools.oci > shell-tools.oci.sha256
