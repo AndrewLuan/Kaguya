@@ -2,6 +2,7 @@
  * 功能概述：用 PGlite 和可选真实 PostgreSQL 事务验证观察快照、独立水位、来源隔离、失败恢复及并发唯一性。
  * fixture 每例独立数据库，写入与确认均 await 持久边界；并发 SQL 屏障使用 8 秒/20 毫秒有界轮询且 finally 释放事务。
  * 代码库关系：经公开 observations 与 information API 验证生产仓储；PostgreSQL 分支实际关闭并重连连接池，PGlite 只重建仓储对象。
+ * 旧 #255 迁移用固定历史 DDL 与完成/开放种子验证首次升级，随后重连并继续消费。
  * 输入输出与副作用：合成群聊来源与确认原子，不调用模型/平台，afterEach 关闭测试数据库。
  */
 import { randomUUID } from "node:crypto";
@@ -594,6 +595,166 @@ for (const postgres of [false, true]) {
           expect(
             (await db.observations.freezeNext(query))?.sourceInformationIds,
           ).toEqual([c]);
+        });
+        it("migrates populated PR255 tables without replacing old facts or consumer progress", async () => {
+          const a = await append(),
+            b = await append(),
+            c = await append();
+          const positions = await db.sql.query<{
+            information_id: string;
+            position: string;
+          }>(
+            `SELECT information_id,position::text FROM information_lifecycle WHERE information_id=ANY($1::text[])`,
+            [[a, b, c]],
+          );
+          const position = (id: string) =>
+            positions.rows.find((r) => r.information_id === id)!.position;
+          const completedId = randomUUID(),
+            openId = randomUUID();
+          const proof = await result({
+            observationId: completedId,
+            sourceInformationIds: [a],
+            contextInformationIds: [],
+          });
+          const facts = await db.information.find({
+            informationIds: [a, b, c, proof],
+            registrationOrder: true,
+            order: "asc",
+            limit: 10,
+          });
+          // 仅重建本例隔离库的附加观察表；DDL 固定来自 #255 ac292582，不调用新迁移来伪造旧状态。
+          await db.sql.exec(
+            `DROP TABLE information_observation_attempts,information_observations,information_observation_progress,information_scenes;`,
+          );
+          await db.sql.exec(`
+      CREATE TABLE IF NOT EXISTS information_scenes (
+        scene_id text PRIMARY KEY, address jsonb NOT NULL,
+        legacy_scope_key text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+      );
+      CREATE TABLE IF NOT EXISTS information_observation_progress (
+        stream_id text PRIMARY KEY, scene_id text NOT NULL REFERENCES information_scenes(scene_id),
+        consumer_id text NOT NULL, policy_version text NOT NULL, contract jsonb NOT NULL,
+        through_position bigint NOT NULL DEFAULT 0, latest_observation_id text
+      );
+      CREATE TABLE IF NOT EXISTS information_observations (
+        observation_id text PRIMARY KEY,
+        stream_id text NOT NULL REFERENCES information_observation_progress(stream_id),
+        after_position bigint NOT NULL, through_position bigint NOT NULL,
+        source_ids jsonb NOT NULL, context_ids jsonb NOT NULL, has_more boolean NOT NULL,
+        recorded_at timestamptz NOT NULL DEFAULT date_trunc('milliseconds',clock_timestamp()),
+        status text NOT NULL DEFAULT 'frozen' CHECK(status IN ('frozen','completed','failed')),
+        result_information_id text REFERENCES information_atoms(information_id), error_code text,
+        CHECK(through_position > after_position),
+        UNIQUE(stream_id, after_position)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS information_observations_open_idx
+        ON information_observations(stream_id) WHERE status <> 'completed';
+      CREATE INDEX IF NOT EXISTS information_observations_scene_idx
+        ON information_observations(stream_id, through_position DESC);
+    `);
+          const sceneId = sceneIdentity(address);
+          const streamId = JSON.stringify([
+            sceneId,
+            input.consumerId,
+            input.policyVersion,
+            null,
+          ]);
+          await db.sql.query(
+            `INSERT INTO information_scenes(scene_id,address,legacy_scope_key) VALUES($1,$2::jsonb,$3)`,
+            [sceneId, JSON.stringify(address), "qq:test:group:g"],
+          );
+          await db.sql.query(
+            `INSERT INTO information_observation_progress(stream_id,scene_id,consumer_id,policy_version,contract,through_position,latest_observation_id) VALUES($1,$2,$3,$4,$5::jsonb,$6::bigint,$7)`,
+            [
+              streamId,
+              sceneId,
+              input.consumerId,
+              input.policyVersion,
+              JSON.stringify(input),
+              position(a),
+              completedId,
+            ],
+          );
+          await db.sql.query(
+            `INSERT INTO information_observations(observation_id,stream_id,after_position,through_position,source_ids,context_ids,has_more,status,result_information_id,recorded_at) VALUES
+            ($1,$2,0,$3::bigint,$4::jsonb,'[]',true,'completed',$5,'2026-10-01T00:00:00Z'),
+            ($6,$2,$3::bigint,$7::bigint,$8::jsonb,'[]',true,'frozen',NULL,'2026-10-01T00:00:01Z')`,
+            [
+              completedId,
+              streamId,
+              position(a),
+              JSON.stringify([a]),
+              proof,
+              openId,
+              position(b),
+              JSON.stringify([b]),
+            ],
+          );
+          const oldRows = (
+            await db.sql.query(
+              `SELECT observation_id,stream_id,after_position::text,through_position::text,source_ids,context_ids,has_more,status,result_information_id,recorded_at::text,error_code FROM information_observations ORDER BY after_position`,
+            )
+          ).rows;
+          await db.prepareSchema();
+          expect(
+            (
+              await db.sql.query(
+                `SELECT observation_id,stream_id,after_position::text,through_position::text,source_ids,context_ids,has_more,status,result_information_id,recorded_at::text,error_code FROM information_observations ORDER BY after_position`,
+              )
+            ).rows,
+          ).toEqual(oldRows);
+          expect(await db.observations.progress(input)).toMatchObject({
+            throughPosition: position(a),
+            throughInformationId: a,
+            allocatedThroughPosition: position(b),
+            discoveredThroughPosition: position(b),
+            latestObservationId: completedId,
+            policyVersion: input.policyVersion,
+            revision: 0,
+          });
+          expect(await db.observations.read(completedId)).toMatchObject({
+            status: "completed",
+            manifest: null,
+            operationKey: null,
+            resultInformationId: proof,
+            contract: input,
+            sourceInformationIds: [a],
+          });
+          expect(await db.observations.read(openId)).toMatchObject({
+            status: "frozen",
+            manifest: null,
+            operationKey: null,
+            sourceInformationIds: [b],
+            contract: input,
+          });
+          expect(
+            await db.information.find({
+              informationIds: [a, b, c, proof],
+              registrationOrder: true,
+              order: "asc",
+              limit: 10,
+            }),
+          ).toEqual(facts);
+          await reconnect();
+          const open = (await db.observations.freezeNext(input))!;
+          expect(open.observationId).toBe(openId);
+          await db.observations.finish(openId, await result(open));
+          expect(
+            (await db.observations.progress(input))?.throughInformationId,
+          ).toBe(b);
+          const next = (await db.observations.freezeNext({
+            ...input,
+            operationKey: "after-upgrade",
+          }))!;
+          expect(next.sourceInformationIds).toEqual([c]);
+          await db.observations.finish(next.observationId, await result(next));
+          await db.prepareSchema();
+          expect(
+            (await db.observations.progress(input))?.throughInformationId,
+          ).toBe(c);
+          expect(
+            (await db.observations.read(completedId))?.resultInformationId,
+          ).toBe(proof);
         });
         it("repeated schema preparation preserves frozen snapshots and failure does not alter successful progress", async () => {
           await append();

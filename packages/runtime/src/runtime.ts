@@ -20,7 +20,7 @@
  * Runtime 过滤旧检索策略，不创建稀疏、向量或认知工作者。
  * inspectModules 仅在 started 状态返回模块声明、版本、Kind、Prompt 和能力绑定的只读投影。
  * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
- * 启动与 Memory 热重载都注入数据库 observationCapability；观察端口不改变平台投递和 Memory 发布的状态拥有者。
+ * 启动注入数据库 observationCapability，Memory 热重载保留同一绑定；观察端口不改变平台投递和 Memory 发布的状态拥有者。
  */
 import {
   MessageTargetService,
@@ -436,7 +436,6 @@ export class KaguyaRuntime implements InformationIngress {
       ...this.#hostCapabilities.filter(
         ({ capability }) => !isMemoryCapability(capability.id),
       ),
-      { capability: observationCapability, value: database.observations },
       { capability: rawContextCapability, value: database.rawEvents },
       {
         capability: nativeMemoryCapability,

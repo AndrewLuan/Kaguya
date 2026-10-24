@@ -4,9 +4,11 @@
  * 主要职责：fixture 安装 Router 与受控模型能力；appendOpportunity/decide 构造通知与观察事实；
  * waitFor/settle 按 8 秒持久化预算等待事实或 durable 队列收敛，否定断言不依赖固定休眠。
  * 代码库关系：配合 planner.test.ts 的纯编译测试及 Server 的真实模型任务协议测试；不访问外部模型。
+ * 资源取得后立即登记清理；启动拒绝或 stop 失败时仍顺序释放全部资源并汇总错误。
  * 输入输出与副作用：每项测试使用独立数据库并在结束时关闭 Host/Core/数据库，保留精确输入水位与动作断言。
  * 模型替身入口断言观察成功及持久 claim/run 已存在、行动意图尚未创建；观察能力使用真实数据库实现。
  */
+import { closeTestResources } from "../test-support/cleanup.js";
 import { observationCapability } from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
@@ -80,18 +82,9 @@ const modelCancelled = terminal("core.model.task.cancelled", false);
 const modelTaskCapability = defineModuleCapability<
   import("../heavy/index.js").ModelTaskCapability
 >("kaguya:model-task", 1);
-const resources: Array<{
-  host: ModuleHost;
-  core: InformationCore;
-  database: Awaited<ReturnType<typeof createTestingDatabase>>;
-}> = [];
-
+const clean: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
-  for (const item of resources.splice(0).reverse()) {
-    await item.host.stop();
-    await item.core.close();
-    await item.database.close();
-  }
+  await closeTestResources(clean);
 });
 
 async function fixture(
@@ -105,6 +98,7 @@ async function fixture(
   } = {},
 ) {
   const database = await createTestingDatabase();
+  clean.push(() => database.close());
   await database.prepareSchema();
   const execute = vi.fn(async (request: any) => {
     await options.beforeExecute?.(database);
@@ -165,6 +159,7 @@ async function fixture(
     now,
     nextInformationId: () => `router-${++sequence}`,
   });
+  clean.push(() => core.close());
   const host = new ModuleHost({
     core,
     catalog,
@@ -182,6 +177,7 @@ async function fixture(
       },
     ],
   });
+  clean.push(() => host.stop());
   await core.start();
   await host.start(
     [module, situation].map((definition) => ({
@@ -196,7 +192,6 @@ async function fixture(
       },
     })),
   );
-  resources.push({ host, core, database });
   return { core, database, execute };
 }
 

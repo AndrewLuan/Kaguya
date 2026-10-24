@@ -1,6 +1,7 @@
 /**
  * 功能概述：在 Lifecycle 启动与持久延期到期时，从账本恢复观察积压，不依赖在线入站广播。
  * recoverySourcesSelector 分页扫描启动上界内的来源，按完整 scene 地址选择各流的第一完整页；
+ * 开放调度与候选独立完整分页，已有 owner 不因超页被误判为不存在。
  * recoverObservations 登记独立发现进度并复用现有 Candidate/openScope/wake 协议，不确认读取成功。
  * 代码库关系：由 agent.lifecycle 持久订阅调用；使用 SDK observation、账本 Selector 和已有 Kind。
  * 输入输出与副作用：只读原始证据，追加幂等候选及进度；缺少原始运行上下文时保留积压，不伪造权限。
@@ -99,17 +100,24 @@ export const recoverySourcesSelector = defineInformationSelector({
             selected.set(a.informationId, a);
       }
     }
-    // Existing timers keep their own deadlines; startup must not erase a defer.
-    for (const a of await ledger.find({
-      kinds: [
-        oneShotRequestedInformationKind.kind,
-        turnCandidateInformationKind.kind,
-      ],
-      openOnly: true,
-      registrationOrder: true,
-      limit: 1000,
-    }))
-      selected.set(a.informationId, a);
+    // 开放任务必须完整扫描；截断不能成为“没有 owner”的证据。
+    let ownerAfter: string | undefined;
+    for (;;) {
+      const owners = await ledger.find({
+        kinds: [
+          oneShotRequestedInformationKind.kind,
+          turnCandidateInformationKind.kind,
+        ],
+        openOnly: true,
+        registrationOrder: true,
+        order: "asc",
+        limit: 1000,
+        ...(ownerAfter ? { afterInformationId: ownerAfter } : {}),
+      });
+      for (const owner of owners) selected.set(owner.informationId, owner);
+      if (owners.length < 1000) break;
+      ownerAfter = owners.at(-1)!.informationId;
+    }
     return [...selected.keys()];
   },
 });
