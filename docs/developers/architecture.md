@@ -34,6 +34,8 @@ flowchart LR
 
 开发模式把 Vite middleware 与 HMR 挂在 Fastify 内；生产模式由同一实例提供 `apps/web/dist`。Web 消息也先规范化为平台 `web`、adapter `web.ui.main` 的入站消息，再异步交给 Runtime。NapCat 是可选 ingress 与 transport，连接失败不会停止 HTTP 服务或改变 `/healthz`。
 
+Linux 工具环境由独立 `kaguya-tools` UID 下的 rootless Podman broker 管理。Runtime 通过 `LinuxEnvironmentClient` 将公开环境身份与临时凭据接入 ActionProvider；broker journal 保存执行物理事实，业务事实仍进入 Information 账本。安装与镜像验收边界见 [Linux 隔离工具环境](./continuous/action-lifecycle#linux-隔离工具环境)。
+
 ## Runtime Composition 边界
 
 `packages/composition` 是 Server 与 Demo 共用的正式组装入口。`createMessageCatalog` 提供内置声明；`loadModulePlugins` 从配置根导入显式安装的外部包，合并模块清单并生成冻结的 Kind Registry。数据库预检与 Runtime 接收同一个 Registry 实例，处理器尚未创建时就完成所有 Kind 的冲突和持久契约检查。

@@ -2,7 +2,7 @@
  * 功能概述：以真实 PGlite/PostgreSQL 证明行动 admission、取消、恢复与冻结证据的竞争边界。
  * 主要职责：fixture 经生产 observation 校验冻结来源；受控 provider 统计实际 effect；
  * barrier 明确进入/释放/完成阶段，所有失败路径先释放 provider 再关闭隔离数据库。
- * 代码库关系：调用生产 ActionExecutor/PostgresActionStore，不调用模型、QQ 或真实桌面。
+ * 代码库关系：调用生产 ActionExecutor/PostgresActionStore 与 LinuxEnvironmentClient 适配，不调用模型、QQ 或真实桌面。
  * 输入输出与副作用：每例独立数据库；PG 恢复关闭并重连 pool，未接外部服务不冒充端到端验收。
  */
 import { randomUUID } from "node:crypto";
@@ -34,6 +34,7 @@ import {
   type ActionOutcome,
 } from "@kaguya/sdk";
 import { ActionExecutor } from "./action.js";
+import { LinuxEnvironmentClient } from "./environment.js";
 
 const url = process.env.KAGUYA_TEST_DATABASE_URL;
 if (process.env.KAGUYA_REQUIRE_POSTGRES_TESTS === "1" && !url)
@@ -384,6 +385,70 @@ async function fixture(
 }
 
 describe.each(backends)("action lifecycle (PostgreSQL=%s)", (postgres) => {
+  it("persists broker action results without persisting the private lease token", async () => {
+    const f = await fixture(postgres);
+    const environment = {
+      environmentId: "env",
+      generation: 1,
+      workspaceId: "workspace",
+      resourceIds: ["desktop"],
+      workflowId: "workflow",
+      leaseId: "lease",
+      fencing: "1",
+      expiresAt: f.intent.deadline,
+    };
+    const token = "synthetic-private-environment-credential";
+    let effects = 0;
+    const client = new LinuxEnvironmentClient(async (method, params) => {
+      if (method === "lease.acquire") return { environment, token };
+      if (method === "lease.validate") return { valid: true };
+      expect(method).toBe("operation.execute");
+      expect(params.token).toBe(token);
+      expect(params.attemptId).toBeTypeOf("string");
+      effects++;
+      return { ...success, evidence: "returned" };
+    });
+    f.intent.environment = await client.acquire({
+      environmentId: "env",
+      scope: f.scope,
+      workflowId: "workflow",
+    });
+    f.intent.toolName = "shell.exec";
+    await f.authorize();
+    const executor = new ActionExecutor({
+      store: f.db.actions,
+      providers: [client.provider("test")],
+      ...client.actionHooks,
+    });
+    cleanups.push(() => executor.close());
+    const registered = await executor.register(f.intent);
+    const result = await executor.execute(registered.intentId, f.scope);
+    expect(result.state).toBe("succeeded");
+    await executor.execute(registered.intentId, f.scope);
+    expect(effects).toBe(1);
+    const receipt = await executor.readReceipt(
+      result.receiptId!,
+      f.scope,
+      f.intent.authorizationId,
+    );
+    expect(receipt.outcome.environmentValidation).toBe("current");
+    expect(JSON.stringify(receipt)).not.toContain(token);
+    expect(
+      JSON.stringify(await executor.read(registered.intentId, f.scope)),
+    ).not.toContain(token);
+    const facts = await f.db.sql.query<{ kind: string; payload: unknown }>(
+      "SELECT kind, payload FROM information_atoms WHERE kind LIKE 'core.action.%'",
+    );
+    expect(facts.rows.map((row) => row.kind)).toEqual(
+      expect.arrayContaining([
+        "core.action.intent.v1",
+        "core.action.started.v1",
+        "core.action.result.v1",
+      ]),
+    );
+    expect(JSON.stringify(facts.rows)).not.toContain(token);
+  });
+
   it.each([true, false])(
     "serializes real Memory-lock competition (admission first=%s)",
     async (admissionFirst) => {

@@ -79,10 +79,22 @@ Intent 固定 `operationId`、run、decision、observation、Memory revision、�
 
 **取消与恢复** — 取消先记录请求，provider 确认后追加结果。`partial` 和已核实的结果不会被迟到 `unknown` 覆盖；所有回执仍保留。启动和运行中的有界周期扫描将已开始但租约过期的动作恢复为 `unknown`；重启时仍有效的 lease 保留到期后再处理，无需新输入。再次 `execute` 不重发。调用方使用当前控制授权调用 `reconcile`，查询原 operation/attempt；核对采用独立预算，不继承已经过期的执行期限。
 
-**环境与凭据** — Intent 仅保存环境、generation、workspace、资源范围、workflow、lease ID 和 fencing 序号。宿主在调用前解析内部凭据，凭据不写入 intent 或回执。环境准备、执行与结果核对共享一次调用的绝对预算。Provider 必须在实际入口验证租约及取消 tombstone；具体环境 broker 另行接入。接管后的历史回执保留原 attempt 的效果与产物，并以 `environmentValidation` 记录当前、已隔离或未确认状态。这项记录不授权继续操作；数据库 claim 失效仍拒绝旧执行器提交。
+**环境与凭据** — Intent 仅保存环境、generation、workspace、资源范围、workflow、lease ID 和 fencing 序号。宿主在调用前解析内部凭据，凭据不写入 intent 或回执。环境准备、执行与结果核对共享一次调用的绝对预算。Provider 必须在实际入口验证租约及取消 tombstone；Linux 环境可通过下述 broker 适配；其他环境按 provider 能力另行接入。接管后的历史回执保留原 attempt 的效果与产物，并以 `environmentValidation` 记录当前、已隔离或未确认状态。这项记录不授权继续操作；数据库 claim 失效仍拒绝旧执行器提交。
 
 **回执读取** — 回执是独立、不可变的 Information。`readReceipt` 校验当前控制授权、scope、intent 摘要、started/attempt 来源链、结果摘要和产物归属，返回原始登记位置。后续 Memory 消费方应通过此接口重读，不能把模型转述当成执行证据。回执到 Memory 的来源桥接由独立模块完成。
 
 **消息兼容** — Runtime 在现有消息发送前使用同一 admission，并在运输入口复核目标授权。已保存 action 结果但旧 delivery 投影丢失时，从持久结果恢复，不再次发送。NapCat 超时、连接中断和未证实的失败回执记录为 `unknown`。没有完整 observation 的历史消息保留显式 `legacy:` 依据标识，不补造冻结证明。
 
-Schema 以新增 action 授权、run、head、receipt 和 outbox 表的方式增量初始化，不删除旧表或改写历史 turn payload。当前测试使用受控 provider 验证真实执行次数，并覆盖 PGlite 与 PostgreSQL；环境 broker、真实桌面、TTS 和设备各自完成适配器验收。
+Schema 以新增 action 授权、run、head、receipt 和 outbox 表的方式增量初始化，不删除旧表或改写历史 turn payload。当前测试使用受控 provider 验证真实执行次数，并覆盖 PGlite 与 PostgreSQL；Linux broker 协议另有持久 journal 与实际 SO_PEERCRED 测试；真实容器镜像、桌面、TTS 和设备分别完成实际环境验收。
+
+## Linux 隔离工具环境
+
+宿主可通过 `LinuxEnvironmentClient` 连接专用账户的 Unix broker。将 `client.provider()` 注入 `RuntimeOptions.actionProviders`，将 `client.actionHooks` 注入 `RuntimeOptions.actionEnvironment`；环境管理 API 由宿主调用，不自动开放为模型工具。`acquire` 返回公开环境引用，私有 token 仅保留在客户端内存与 socket 请求中。安装入口与完整 helper 合同见仓库 `scripts/linux-environments/README.md`。
+
+broker 在真正派发处复核 scope、workspace/resources、workflow、generation、fencing、lease 与 token。固定 operation/attempt/digest 与参数；取消先到会持久化 tombstone，未知结果不重派。单次 permit 截止取操作 deadline 与派发时 lease 到期时间的较早者，renew 不延长旧 permit。镜像内部服务负责在每次实际输入前核验 permit，broker 在收集超时后隔离整个环境。
+
+人工接管 `handoff` 关闭旧自动化输入，收到内部确认后推进 generation，保留桌面和未保存内容；`resume` 再次推进代次并要求新 lease 与新观察。故障恢复 `recover` 停止旧容器、确认无运行 PID 后重建，保留 workspace。历史回执和产物始终保留原 attempt/generation。`reconcile` 只读 broker journal，外部文件、job 或站点状态需要新 lease 下独立 verify，再将证据接回 W3。
+
+安装目标为 Ubuntu 26.04 x86_64、systemd、cgroup v2 与专用 rootless Podman。容器使用固定镜像 digest、只读 rootfs、命名工作卷与独立进程/网络空间；默认无网络，显式 public-web 由专用 UID 规则限制出口。容器存储为预分配 24 GiB ext4，broker 状态为独立 4 GiB，产物受单次 16 MiB 与累计 2 GiB 约束。每次采集拥有独立产物身份，内容 hash 可去重；附件超限保留已返回 outcome 与 workspace 回执，并标记 truncated。
+
+当前实现包含安装脚本、broker、宿主适配与受控后端测试。管理员 bootstrap 由用户在 Linux 本机执行；W7/W8 的完整镜像、Chromium sandbox、GUI 输入隔离及实际网络边界仍须独立验收。
