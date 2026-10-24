@@ -67,6 +67,22 @@ class ResetTests(unittest.TestCase):
                 gui.reset(x, Mock(), "display", before, {0x1004e2d})
         x.XChangeKeyboardMapping.assert_not_called()
 
+    def test_fixed_xvfb_unicode_normalization_matches_complete_row(self):
+        before = {"keys": [], "buttons": [], "per": 7, "mapping": [[0] * 7 for _ in range(248)]}
+        current = copy.deepcopy(before)
+        current["mapping"][240] = [0x1004e2d] * 4 + [0] * 3
+        x = Mock()
+        with patch.object(gui, "snapshot", side_effect=[current, before]):
+            result = gui.reset(x, Mock(), "display", before, {0x1004e2d})
+        self.assertEqual(result["restoredKeycodes"], [248])
+        for row in ([0x1004e2d, 0, 0x1004e2d, 0, 0, 0, 0], [0x1004e2d] * 5 + [0] * 2):
+            current["mapping"][240] = row
+            x.reset_mock()
+            with patch.object(gui, "snapshot", side_effect=[current, current]):
+                with self.assertRaisesRegex(RuntimeError, "reset-unconfirmed"):
+                    gui.reset(x, Mock(), "display", before, {0x1004e2d})
+            x.XChangeKeyboardMapping.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -155,18 +155,16 @@ for (const mode of ["held", "unicode"]) {
     primary = error;
   } finally {
     const errors = primary ? [primary] : [];
-    try {
-      if (monitor && monitor.exitCode === null && monitor.signalCode === null)
-        monitor.kill("SIGKILL");
-      await monitorClosed;
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await driver.stop();
-    } catch (error) {
-      errors.push(error);
-    }
+    const cleanup = await Promise.allSettled([
+      (async () => {
+        if (monitor && monitor.exitCode === null && monitor.signalCode === null)
+          monitor.kill("SIGKILL");
+        await monitorClosed;
+      })(),
+      driver.stop(),
+    ]);
+    for (const result of cleanup)
+      if (result.status === "rejected") errors.push(result.reason);
     if (errors.length)
       throw new AggregateError(errors, "gui-drain-probe-failed");
   }

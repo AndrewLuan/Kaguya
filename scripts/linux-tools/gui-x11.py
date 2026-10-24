@@ -76,9 +76,14 @@ def reset(x, xt, d, before, expected_keysyms):
         now = current["mapping"][index]
         if any(original) or not any(now):
             continue
-        # 固定 Cua reserve_spare_keycode 仅借全空槽，并把一个 keysym 写入每列。
-        symbols = set(now)
-        if len(symbols) != 1 or not symbols.issubset(expected_keysyms):
+        # Cua 仅借全空槽。固定 Xvfb 21.1.12 的 core mapping 会把 Unicode 行
+        # 规范化为前四列同符号、后三列零（真实 79db69c keycode248 证据）。
+        # 按完整行匹配两种已知形状；不能丢弃零后仅比较非零 symbols。
+        exact = any(now == [symbol] * len(now) for symbol in expected_keysyms)
+        normalized = before["per"] == 7 and any(
+            0x01000000 <= symbol <= 0x0110ffff and now == [symbol] * 4 + [0] * 3
+            for symbol in expected_keysyms)
+        if not exact and not normalized:
             unexpected.append({"keycode": index + 8, "mapping": now})
             continue
         array = (C.c_ulong * before["per"])(*original)
