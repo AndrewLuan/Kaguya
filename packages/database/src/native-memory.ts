@@ -451,6 +451,16 @@ export class PostgresNativeMemoryStore
         )
       ).rows[0];
       if (existing) source = memorySourceSchema.parse(existing.source);
+      if (!source.ownerId.trim())
+        throw new NativeMemoryError("memory_invalid_source", 400);
+      // 冻结原始账号的全部身份依赖，含已拆分身份；people() 的当前解析结果不能替代它。
+      const proof = await sourceProofOwners(tx, [source.id]);
+      const sourceOwners = [...proof]
+        .filter(([, ids]) => ids.has(source.id))
+        .map(([owner]) => owner);
+      if (sourceOwners.length && !sourceOwners.includes(source.ownerId))
+        sourceOwners.push(source.ownerId);
+      sourceOwners.sort();
       const kind = "memory.native.source.v1",
         canonicalId = canonicalMemorySourceId(source.id);
       await tx.query(
@@ -482,6 +492,9 @@ export class PostgresNativeMemoryStore
                 text: source.text,
                 originalInformationId: source.id,
                 memorySource: source,
+                ...(sourceOwners.length
+                  ? { sourceProofVersion: 1, sourceOwners }
+                  : {}),
               },
               references: [
                 { relation: "core:uses-context", informationId: source.id },
@@ -1267,10 +1280,9 @@ export class PostgresNativeMemoryStore
               (id) =>
                 ![...currentProof.values()].some((ids) => ids.has(id)) &&
                 !derivedVerifiedSources.get(node.id)?.has(id) &&
-                ![
-                  ...(prior?.proofOwners ?? []),
-                  ...(prior?.experience?.proofOwners ?? []),
-                ].some((p) => p.sourceIds.includes(id)),
+                !(prior?.proofOwners ?? []).some((p) =>
+                  p.sourceIds.includes(id),
+                ),
             )
           )
             throw new NativeMemoryError("memory_source_proof_missing", 400);
@@ -1278,8 +1290,20 @@ export class PostgresNativeMemoryStore
           const proofOwners = [...owners]
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([ownerId, ids]) => ({ ownerId, sourceIds: [...ids].sort() }));
+          // 旧 nested 的 dormant 依赖仍保留，但移除来源不能把未验证映射升级成完整证明。
+          const verifiedSources = new Set([
+            ...(prior?.proofOwners ?? []).flatMap((p) => p.sourceIds),
+            ...[...currentProof.values()].flatMap((ids) => [...ids]),
+            ...(derivedVerifiedSources.get(node.id) ?? []),
+          ]);
+          const completeOwners = proofOwners.flatMap((p) => {
+            const sourceIds = p.sourceIds.filter((id) =>
+              verifiedSources.has(id),
+            );
+            return sourceIds.length ? [{ ownerId: p.ownerId, sourceIds }] : [];
+          });
           delete node.metadata.proofOwners;
-          if (proofOwners.length) node.metadata.proofOwners = proofOwners;
+          if (completeOwners.length) node.metadata.proofOwners = completeOwners;
           if (experience) {
             const { proofOwners: _clientProof, ...state } = experience;
             node.metadata.experience = {

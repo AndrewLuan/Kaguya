@@ -131,6 +131,11 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
     ["canonical", "legacy-read"],
     ["source-table", "legacy-read"],
     ["late-canonical", "legacy-read"],
+    ["recover-after-split", "legacy-read"],
+    ["rebind-after-split", "legacy-read"],
+    ["markerless-conversation", "legacy-read"],
+    ["markerless-B", "legacy-read"],
+    ["nested-only", "legacy-read"],
   ])(
     "owns source proof across all kinds: %s / %s",
     async (normalization, mode) => {
@@ -184,6 +189,38 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
           participants: [],
           replyTo: null,
         });
+      if (normalization!.startsWith("markerless")) {
+        const ownerId =
+          normalization === "markerless-B"
+            ? "person:B"
+            : `conversation:${scope}`;
+        await db.information.synchronizeKinds(["memory.native.source.v1"]);
+        await db.information.append(
+          freezeInformationAtom(
+            informationAtomSchema.parse({
+              informationId: "memory-native-source:S",
+              kind: "memory.native.source.v1",
+              source: "memory:normalization",
+              occurredAt: "2020-01-01T00:00:00Z",
+              references: [],
+              payload: {
+                memorySource: {
+                  id: "S",
+                  scope,
+                  ownerId,
+                  text: "原文",
+                  occurredAt: "2020-01-01T00:00:00Z",
+                  collectedAt: "2026-01-01T00:00:00Z",
+                  sourceType: "inbound",
+                  participants: [],
+                  replyTo: null,
+                },
+              },
+            }),
+          ),
+          [],
+        );
+      }
       const nodes = [
         node(31, 0, ["S"]),
         node(32, 1, ["S"]),
@@ -236,6 +273,10 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
           delete n.metadata.proofOwners;
           if (n.metadata.experience) delete n.metadata.experience.proofOwners;
         }
+        if (normalization === "nested-only")
+          nodes[2]!.metadata.experience!.proofOwners = [
+            { ownerId: nodes[2]!.metadata.ownerId, sourceIds: ["S"] },
+          ];
         const proposal = memoryPublicationSchema.parse({
           operationId: "proof-initial",
           actor: "manual",
@@ -357,6 +398,49 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
           },
         ],
       });
+      if (
+        ["recover-after-split", "rebind-after-split"].includes(normalization!)
+      ) {
+        if (normalization === "rebind-after-split")
+          await db.information.append(
+            freezeInformationAtom(
+              informationAtomSchema.parse({
+                informationId: "binding-B",
+                kind: kinds[1],
+                payload: { personInformationId: "B" },
+                references: [
+                  { relation: "core:binds", informationId: "account" },
+                ],
+                occurredAt: "2026-01-01T00:00:00Z",
+                source: "test:memory",
+              }),
+            ),
+            [{ relation: "core:binds", required: true, multiple: false }],
+          );
+        await db.memoryGraph.native.recover();
+        const canonical = (
+          await db.sql.query<{
+            payload: {
+              sourceOwners: string[];
+              memorySource: { ownerId: string };
+            };
+          }>(
+            "SELECT payload FROM information_atoms WHERE information_id='memory-native-source:S'",
+          )
+        ).rows[0]!.payload;
+        expect(canonical.memorySource.ownerId).toBe(
+          normalization === "rebind-after-split"
+            ? "person:B"
+            : `conversation:${scope}`,
+        );
+        expect(canonical.sourceOwners).toContain("person:A");
+        await put(db, "proof-normalized", [
+          {
+            ...node(98),
+            metadata: { ...node(98).metadata, scope: "unrelated-private" },
+          },
+        ]);
+      }
       const after = await db.memoryGraph.native.cutoff(context);
       const assertMasked = async (cutoff?: typeof after) => {
         const ctx = { ...context, ...(cutoff ? { cutoff } : {}) };
@@ -470,6 +554,27 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
         "memory_source_proof_missing",
       );
     }
+    await db.information.synchronizeKinds(["memory.native.source.v1"]);
+    await db.information.append(
+      freezeInformationAtom(
+        informationAtomSchema.parse({
+          informationId: "memory-native-source:untrusted",
+          kind: "memory.native.source.v1",
+          source: "test:memory",
+          occurredAt: "2020-01-01T00:00:00Z",
+          references: [],
+          payload: {
+            memorySource: { id: "untrusted", ownerId: "person:A" },
+            sourceProofVersion: 1,
+            sourceOwners: ["person:A", 17],
+          },
+        }),
+      ),
+      [],
+    );
+    await expect(put(db, "unsupported", [n])).rejects.toThrow(
+      "memory_source_proof_missing",
+    );
   });
 
   it.each([true, false])(
@@ -506,7 +611,16 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
             }
           : {}),
       };
-      // 旧数据库中的服务端映射，不能用新publish的客户端字段伪造。
+      if (verified)
+        root.metadata.proofOwners = root.metadata.experience.proofOwners!;
+      else
+        root.metadata.experience.proofOwners = [
+          {
+            ownerId: root.metadata.ownerId,
+            sourceIds: root.metadata.sourceIds,
+          },
+        ];
+      // 旧证据类型可复用已存完整服务端映射；旧 nested 派生 owner 不足以证明完整性。
       await db.sql.query(
         "INSERT INTO memory_nodes(id,metadata,content) VALUES($1,$2::jsonb,$3)",
         [root.id, JSON.stringify(root.metadata), root.content],
@@ -541,6 +655,22 @@ describe.each(backends)("native revision boundary ($name)", ({ create }) => {
       if (!verified) {
         await expect(result).rejects.toThrow("memory_source_proof_missing");
         expect(await db.memoryGraph.native.history(outputs[0]!.id)).toEqual([]);
+        const removed = await put(db, "remove-unproved", [
+          {
+            ...root,
+            metadata: { ...root.metadata, revision: 2, sourceIds: [] },
+          },
+        ]);
+        expect(removed[0]!.metadata.proofOwners).toBeUndefined();
+        expect(removed[0]!.metadata.experience!.proofOwners).toEqual(
+          root.metadata.experience!.proofOwners,
+        );
+        await expect(
+          put(db, "readd-unproved", [
+            { ...root, metadata: { ...root.metadata, revision: 3 } },
+          ]),
+        ).rejects.toThrow("memory_source_proof_missing");
+        expect(await db.memoryGraph.native.history(root.id)).toHaveLength(1);
         return;
       }
       await result;
@@ -1480,7 +1610,7 @@ describe.each(backends)("native inherited evidence ($name)", ({ create }) => {
     });
     const removed = await edit(2, ["S3"]);
     expect(removed[0]!.metadata.experience!.proofOwners).toEqual([
-      { ownerId: `conversation:${scope}`, sourceIds: ["S1"] },
+      { ownerId: `conversation:${scope}`, sourceIds: ["S1", "S3"] },
       { ownerId: "person:a", sourceIds: ["S1"] },
       { ownerId: "person:dependency", sourceIds: ["S1"] },
       { ownerId: "person:new-source", sourceIds: ["S3"] },

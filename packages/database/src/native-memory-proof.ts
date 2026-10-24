@@ -2,19 +2,20 @@
  * 功能概述：为 native 发布和旧节点读取解析指定来源的身份依赖，不扫描无关来源。
  * 主要职责：sourceProofOwners 在发布事务内读取持久来源与原始消息绑定；persistedSourceProofOwners
  * 只投影来源 ID/owner，读取时受 publication 上界约束，返回 owner→source 映射。
- * 代码库关系：由 native-memory.publish 在发布事务内调用；native-memory-history 读取已保存的映射，
- * 不按当前绑定回填历史。未正规化的入站消息支持首次接触摘要，其他来源必须先正规化。
+ * 代码库关系：native-memory 的 publish/ingest 在提交锁内调用；native-memory-history 读取已保存的完整证明，
+ * 不按当前绑定回填历史。原始入站消息支持首次摘要，投递来源核对实际成功回执及 request。
  * 输入输出与副作用：只读指定 sourceIds；保留已拆分身份的绑定，防止重新发布绕过失效；
  * 无法验证的来源不返回证明，由发布边界拒绝。无绑定入站消息属于其实际会话。
  */
 import { canonicalMemorySourceId } from "@kaguya/memory";
 import type { SqlTransaction } from "./driver.js";
 
-/** 旧节点只使用持久化归属补证；历史读取只接受上界内已提交的正规来源。 */
+/** 完整证明与旧 owner 依赖分开读取；旧 canonical 的单一 owner 不能填平证明缺口。 */
 export async function persistedSourceProofOwners(
   db: SqlTransaction,
   sourceIds: string[],
   upper?: string,
+  requireComplete = true,
 ) {
   const owners = new Map<string, Set<string>>();
   if (!sourceIds.length) return owners;
@@ -23,15 +24,24 @@ export async function persistedSourceProofOwners(
     owner: string;
     storage_id: string;
     canonical: boolean;
+    owners: unknown;
+    version: unknown;
   }>(
-    `SELECT a.payload->'memorySource'->>'id' id,a.payload->'memorySource'->>'ownerId' owner,a.information_id storage_id,true canonical FROM information_atoms a
-      JOIN information_lifecycle l USING(information_id)
+    `SELECT a.payload->'memorySource'->>'id' id,a.payload->'memorySource'->>'ownerId' owner,
+      a.information_id storage_id,true canonical,a.payload->'sourceOwners' owners,a.payload->'sourceProofVersion' version
+      FROM information_atoms a JOIN information_lifecycle l USING(information_id)
       WHERE a.information_id=ANY($1::text[]) AND a.kind='memory.native.source.v1'
         AND jsonb_typeof(a.payload->'memorySource'->'id')='string' AND jsonb_typeof(a.payload->'memorySource'->'ownerId')='string'
         AND ($3::bigint IS NULL OR l.position<=$3::bigint)
-    UNION ALL SELECT source->>'id',source->>'ownerId',id,false FROM memory_native_sources WHERE id=ANY($2::text[]) AND $3::bigint IS NULL
-      AND jsonb_typeof(source->'id')='string' AND jsonb_typeof(source->'ownerId')='string'`,
-    [sourceIds.map(canonicalMemorySourceId), sourceIds, upper ?? null],
+    UNION ALL SELECT source->>'id',source->>'ownerId',id,false,NULL::jsonb,NULL::jsonb FROM memory_native_sources
+      WHERE id=ANY($2::text[]) AND $3::bigint IS NULL AND NOT $4::boolean
+        AND jsonb_typeof(source->'id')='string' AND jsonb_typeof(source->'ownerId')='string'`,
+    [
+      sourceIds.map(canonicalMemorySourceId),
+      sourceIds,
+      upper ?? null,
+      requireComplete,
+    ],
   );
   for (const row of rows.rows) {
     if (
@@ -42,9 +52,20 @@ export async function persistedSourceProofOwners(
       !row.owner.trim()
     )
       continue;
-    const { owner: ownerId, id } = row;
-    if (!owners.has(ownerId)) owners.set(ownerId, new Set());
-    owners.get(ownerId)!.add(id);
+    const complete =
+      row.version === 1 &&
+      Array.isArray(row.owners) &&
+      row.owners.length > 0 &&
+      row.owners.every((o) => typeof o === "string" && o.trim().length > 0) &&
+      row.owners.includes(row.owner);
+    if (requireComplete && !complete) continue;
+    const identities: string[] = complete
+      ? (row.owners as string[])
+      : [row.owner];
+    for (const owner of identities) {
+      if (!owners.has(owner)) owners.set(owner, new Set());
+      owners.get(owner)!.add(row.id);
+    }
   }
   return owners;
 }
@@ -101,5 +122,26 @@ export async function sourceProofOwners(
       );
     }
   }
+  // 成功投递可直接验证 request/status-of；其他旧证据种类必须已有完整证明。
+  const delivered = await db.query<{ information_id: string }>(
+    `SELECT a.information_id FROM information_atoms a
+      JOIN information_references r ON r.information_id=a.information_id AND r.relation='core:status-of'
+      JOIN information_atoms req ON req.information_id=r.target_information_id AND req.kind='core.delivery.requested'
+      WHERE a.information_id=ANY($1::text[]) AND a.kind='core.delivery.delivered' AND a.payload->'ok'='true'::jsonb
+        AND req.payload->'platform'=a.payload->'platform' AND req.payload->'adapterId'=a.payload->'adapterId'
+        AND req.payload->'destination'=a.payload->'target' AND jsonb_typeof(req.payload->'message'->'text')='string'
+        AND length(trim(req.payload->'message'->>'text'))>0`,
+    [sourceIds],
+  );
+  for (const row of delivered.rows) add("self:kaguya", row.information_id);
+  const verified = new Set([...owners.values()].flatMap((ids) => [...ids]));
+  const legacy = await persistedSourceProofOwners(
+    db,
+    sourceIds,
+    undefined,
+    false,
+  );
+  for (const [owner, ids] of legacy)
+    for (const id of ids) if (verified.has(id)) add(owner, id);
   return owners;
 }

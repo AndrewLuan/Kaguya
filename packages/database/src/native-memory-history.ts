@@ -93,8 +93,10 @@ export async function memoryProofMetadata(
     ), metadata AS (SELECT p.root,n.metadata FROM proof p JOIN memory_nodes n ON n.id=p.id WHERE n.metadata->>'system'='native-v1')
     SELECT root::text,metadata->>'status' status,metadata->>'ownerId' owner,metadata->'sourceIds' sources,
       ARRAY(SELECT id FROM jsonb_array_elements_text(metadata->'sourceIds') id WHERE NOT EXISTS(
-        SELECT 1 FROM jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb) || COALESCE(metadata->'experience'->'proofOwners','[]'::jsonb)) owner WHERE owner->'sourceIds' ? id)) unproved FROM metadata
-    UNION ALL SELECT root::text,'active',owner->>'ownerId',to_jsonb(ARRAY(SELECT value FROM jsonb_array_elements_text(owner->'sourceIds') WHERE metadata->'sourceIds' ? value)),ARRAY[]::text[] FROM metadata
+        SELECT 1 FROM jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb)) owner WHERE owner->'sourceIds' ? id)) unproved FROM metadata
+    UNION ALL SELECT root::text,'active',owner->>'ownerId',to_jsonb(ARRAY(SELECT value FROM jsonb_array_elements_text(owner->'sourceIds') WHERE metadata->'sourceIds' ? value)),
+      ARRAY(SELECT id FROM jsonb_array_elements_text(owner->'sourceIds') id WHERE metadata->'sourceIds' ? id AND NOT EXISTS(
+        SELECT 1 FROM jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb)) verified WHERE verified->'sourceIds' ? id)) FROM metadata
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(metadata->'proofOwners','[]'::jsonb) || COALESCE(metadata->'experience'->'proofOwners','[]'::jsonb)) owner
       WHERE owner->'sourceIds' ?| ARRAY(SELECT jsonb_array_elements_text(metadata->'sourceIds'))`,
       [seeds],
@@ -220,9 +222,12 @@ export async function readMemoryView(
     if (nodes.size === count) break;
   }
   const proofs = new Map([...nodes].map(([id, n]) => [id, nodeProofOwners(n)]));
+  const verified = new Map(
+    [...nodes].map(([id, n]) => [id, [...(n.metadata.proofOwners ?? [])]]),
+  );
   const missing = (n: NativeMemoryNode) =>
     n.metadata.sourceIds.filter(
-      (id) => !proofs.get(n.id)!.some((p) => p.sourceIds.includes(id)),
+      (id) => !verified.get(n.id)!.some((p) => p.sourceIds.includes(id)),
     );
   const persisted = await persistedSourceProofOwners(
     db,
@@ -234,7 +239,10 @@ export async function readMemoryView(
     const ids = n.metadata.sourceIds;
     for (const [ownerId, sources] of persisted) {
       const sourceIds = ids.filter((id) => sources.has(id));
-      if (sourceIds.length) proofs.get(n.id)!.push({ ownerId, sourceIds });
+      if (sourceIds.length) {
+        proofs.get(n.id)!.push({ ownerId, sourceIds });
+        verified.get(n.id)!.push({ ownerId, sourceIds });
+      }
     }
     if (missing(n).length) unproved.add(n.id);
   }
