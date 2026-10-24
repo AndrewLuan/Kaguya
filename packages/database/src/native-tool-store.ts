@@ -185,14 +185,18 @@ export class PostgresNativeToolStore {
       )
     ).rows[0];
   }
-  async step(runId: string, index: number, db: SqlTransaction = this.db) {
+  async step(
+    runInformationId: string,
+    index: number,
+    db: SqlTransaction = this.db,
+  ) {
     const row = (
       await db.query<{
         information_id: string;
         payload: z.infer<typeof nativeToolStepSchema>;
       }>(
         "SELECT a.information_id,a.payload FROM information_native_tool_steps s JOIN information_atoms a ON a.information_id=s.frozen_id WHERE run_id=$1 AND step_index=$2",
-        [runId, index],
+        [runInformationId, index],
       )
     ).rows[0];
     return row
@@ -309,13 +313,13 @@ export class PostgresNativeToolStore {
     });
   }
   async admitModel(
-    runId: string,
+    runInformationId: string,
     index: number,
     requestId: string,
     guard?: InformationClaim,
   ) {
     return this.tx(async (tx) => {
-      const row = await this.row(tx, runId);
+      const row = await this.row(tx, runInformationId);
       await this.active(tx, row, guard);
       const step = (
         await tx.query<{
@@ -323,7 +327,7 @@ export class PostgresNativeToolStore {
           request_id: string | null;
         }>(
           "SELECT dispatched_id,request_id FROM information_native_tool_steps WHERE run_id=$1 AND step_index=$2 FOR UPDATE",
-          [runId, index],
+          [runInformationId, index],
         )
       ).rows[0];
       if (!step) throw new Error("native-step-missing");
@@ -336,7 +340,7 @@ export class PostgresNativeToolStore {
       ).rows[0];
       if (
         !request ||
-        request.payload.nativeStep?.runInformationId !== runId ||
+        request.payload.nativeStep?.runInformationId !== runInformationId ||
         request.payload.nativeStep?.stepIndex !== index ||
         actionDigest(request.payload.tools) !==
           actionDigest(row.spec.declarations)
@@ -354,34 +358,38 @@ export class PostgresNativeToolStore {
       );
       await tx.query(
         "UPDATE information_native_tool_steps SET dispatched_id=$3,request_id=$4 WHERE run_id=$1 AND step_index=$2",
-        [runId, index, atom.informationId, requestId],
+        [runInformationId, index, atom.informationId, requestId],
       );
       await tx.query(
         "UPDATE information_native_tool_runs SET steps_count=steps_count+1 WHERE run_id=$1",
-        [runId],
+        [runInformationId],
       );
       await this.active(tx, row, guard);
       return true;
     });
   }
-  async calls(runId: string, index: number, db: SqlTransaction = this.db) {
+  async calls(
+    runInformationId: string,
+    index: number,
+    db: SqlTransaction = this.db,
+  ) {
     return (
       await db.query<NativeToolCallRow & Record<string, unknown>>(
         "SELECT * FROM information_native_tool_calls WHERE run_id=$1 AND step_index=$2 ORDER BY call_index",
-        [runId, index],
+        [runInformationId, index],
       )
     ).rows;
   }
   async registerCalls(
-    runId: string,
+    runInformationId: string,
     index: number,
     completedId: string,
     calls: NativeToolCall[],
     guard?: InformationClaim,
   ) {
     return this.tx(async (tx) => {
-      const row = await this.row(tx, runId);
-      const old = await this.calls(runId, index, tx);
+      const row = await this.row(tx, runInformationId);
+      const old = await this.calls(runInformationId, index, tx);
       if (old.length) {
         if (
           old[0]!.completed_id !== completedId ||
@@ -400,7 +408,7 @@ export class PostgresNativeToolStore {
       const request = (
         await tx.query<{ request_id: string }>(
           "SELECT request_id FROM information_native_tool_steps WHERE run_id=$1 AND step_index=$2 AND dispatched_id IS NOT NULL",
-          [runId, index],
+          [runInformationId, index],
         )
       ).rows[0];
       const caused = (
@@ -412,7 +420,7 @@ export class PostgresNativeToolStore {
       if (
         !caused ||
         !completed ||
-        completed.payload.nativeStep?.runInformationId !== runId ||
+        completed.payload.nativeStep?.runInformationId !== runInformationId ||
         completed.payload.nativeStep?.stepIndex !== index ||
         completed.payload.generationKind !== "tool-calls" ||
         actionDigest(completed.payload.toolCalls) !== actionDigest(calls)
@@ -429,13 +437,20 @@ export class PostgresNativeToolStore {
       for (const [i, c] of calls.entries())
         await tx.query(
           "INSERT INTO information_native_tool_calls(run_id,step_index,call_index,call_id,completed_id,call) VALUES($1,$2,$3,$4,$5,$6::jsonb)",
-          [runId, index, i, c.toolCallId, completedId, JSON.stringify(c)],
+          [
+            runInformationId,
+            index,
+            i,
+            c.toolCallId,
+            completedId,
+            JSON.stringify(c),
+          ],
         );
       await tx.query(
         "UPDATE information_native_tool_runs SET calls_count=calls_count+$2 WHERE run_id=$1",
-        [runId, calls.length],
+        [runInformationId, calls.length],
       );
-      return this.calls(runId, index, tx);
+      return this.calls(runInformationId, index, tx);
     });
   }
   async bind(
@@ -559,41 +574,41 @@ export class PostgresNativeToolStore {
     });
   }
   async stop(
-    runId: string,
+    runInformationId: string,
     reason: string,
     modelResult: unknown = null,
     causeId?: string,
   ) {
     return this.tx(async (tx) => {
-      const row = await this.row(tx, runId);
+      const row = await this.row(tx, runInformationId);
       if (row.stopped_id) return row.stopped_id;
       const atom = await this.fact(
         tx,
         "agent.heavy.tool.terminal.v1",
-        { runInformationId: runId, reason, modelResult },
+        { runInformationId: runInformationId, reason, modelResult },
         row.context_id,
-        [runId, ...(causeId ? [causeId] : [])],
+        [runInformationId, ...(causeId ? [causeId] : [])],
       );
       await tx.query(
         "UPDATE information_native_tool_runs SET stopped_id=$2 WHERE run_id=$1",
-        [runId, atom.informationId],
+        [runInformationId, atom.informationId],
       );
       return atom.informationId;
     });
   }
-  async requests(runId: string) {
+  async requests(runInformationId: string) {
     return (
       await this.db.query<{ request_id: string }>(
         "SELECT request_id FROM information_native_tool_steps WHERE run_id=$1 AND request_id IS NOT NULL ORDER BY step_index",
-        [runId],
+        [runInformationId],
       )
     ).rows.map((r) => r.request_id);
   }
-  async intents(runId: string) {
+  async intents(runInformationId: string) {
     return (
       await this.db.query<{ intent_id: string }>(
         "SELECT intent_id FROM information_native_tool_calls WHERE run_id=$1 AND intent_id IS NOT NULL ORDER BY step_index,call_index",
-        [runId],
+        [runInformationId],
       )
     ).rows.map((r) => r.intent_id);
   }

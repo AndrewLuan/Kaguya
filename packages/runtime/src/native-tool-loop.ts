@@ -121,6 +121,13 @@ export function fitToolTranscript(
   input: NativeMessage[],
   maxBytes: number,
 ): NativeMessage[] {
+  return fitToolTranscriptWithMetadata(input, maxBytes).messages;
+}
+/** 字节数只计当前 prompt 追加前的原生消息数组 JSON UTF-8；每个省略段均为完整闭合段。 */
+export function fitToolTranscriptWithMetadata(
+  input: NativeMessage[],
+  maxBytes: number,
+) {
   const segments: { messages: NativeMessage[]; pinned: boolean }[] = [];
   let current: NativeMessage[] = [];
   const calls = new Set<string>(),
@@ -154,17 +161,30 @@ export function fitToolTranscript(
   let used = Buffer.byteLength(
     JSON.stringify(segments.flatMap((s) => s.messages)),
   );
+  const originalBytes = used;
+  let omittedSegments = 0;
   while (used > maxBytes) {
     const index = segments.findIndex(
       (s, i) => !s.pinned && i < segments.length - 1,
     );
     if (index < 0) throw new Error("native-context-budget");
     segments.splice(index, 1);
+    omittedSegments++;
     used = Buffer.byteLength(
       JSON.stringify(segments.flatMap((s) => s.messages)),
     );
   }
-  return segments.flatMap((s) => s.messages);
+  return {
+    messages: segments.flatMap((s) => s.messages),
+    metadata: {
+      measurement: "native-message-array-json-utf8" as const,
+      truncated: omittedSegments > 0,
+      omittedSegments,
+      originalBytes,
+      retainedBytes: used,
+      budgetBytes: maxBytes,
+    },
+  };
 }
 
 export class NativeToolLoop {
@@ -437,6 +457,12 @@ export class NativeToolLoop {
           ]),
         ];
         const atoms = await this.deps.core.getMany(contextIds);
+        const fitted = transcript
+          ? fitToolTranscriptWithMetadata(
+              transcript,
+              budget.maxContextBytes - Buffer.byteLength(prompt.text) - 4096,
+            )
+          : undefined;
         const requestInput: ModelTaskRequest<T> = {
           ...request,
           prompt,
@@ -449,14 +475,10 @@ export class NativeToolLoop {
             maxContextBytes: budget.maxContextBytes,
             maxOutputBytes: budget.maxOutputBytes,
           },
-          ...(transcript
+          ...(fitted
             ? {
-                messages: fitToolTranscript(
-                  transcript,
-                  budget.maxContextBytes -
-                    Buffer.byteLength(prompt.text) -
-                    4096,
-                ),
+                messages: fitted.messages,
+                contextTrimming: fitted.metadata,
                 nativeContinuation: false,
               }
             : { nativeContinuation: request.nativeContinuation ?? false }),
@@ -469,7 +491,10 @@ export class NativeToolLoop {
               ? "final"
               : generated.status === "cancelled"
                 ? "cancelled"
-                : "model-failed",
+                : generated.status === "failed" &&
+                    generated.error.reasonCode === "dispatched-without-terminal"
+                  ? "model-outcome-unknown"
+                  : "model-failed",
             generated,
           );
         const calls = await this.deps.db.nativeTools.registerCalls(
@@ -761,24 +786,29 @@ export class NativeToolLoop {
     reason: string;
   }) {
     const atom = await this.deps.core.get(request.requestedInformationId);
-    const runId = (
+    const runInformationId = (
       atom?.payload.nativeStep as { runInformationId?: string } | undefined
     )?.runInformationId;
-    if (runId) await this.cancel(runId, request.requestedInformationId);
+    if (runInformationId)
+      await this.cancel(runInformationId, request.requestedInformationId);
     return this.deps.model.cancel(request);
   }
-  async cancel(runId: string, causeId: string, reason = "cancelled") {
-    const row = await this.deps.db.nativeTools.read(runId),
+  async cancel(
+    runInformationId: string,
+    causeId: string,
+    reason = "cancelled",
+  ) {
+    const row = await this.deps.db.nativeTools.read(runInformationId),
       spec = json(row.spec) as unknown as Spec;
     const stopped = await this.deps.db.nativeTools.stop(
-      runId,
+      runInformationId,
       reason,
       null,
       causeId,
     );
-    for (const id of await this.deps.db.nativeTools.requests(runId))
+    for (const id of await this.deps.db.nativeTools.requests(runInformationId))
       await this.deps.model.cancel({ requestedInformationId: id, reason });
-    for (const id of await this.deps.db.nativeTools.intents(runId)) {
+    for (const id of await this.deps.db.nativeTools.intents(runInformationId)) {
       const view = await this.deps.actions.read(id, spec.scope);
       const tool = this.registrations.get(view.intent.toolName);
       if (

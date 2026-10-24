@@ -95,6 +95,7 @@ export const nativeToolTerminalInformationKind = defineInformationKind({
       reason: z.enum([
         "final",
         "model-failed",
+        "model-outcome-unknown",
         "cancelled",
         "superseded",
         "budget",

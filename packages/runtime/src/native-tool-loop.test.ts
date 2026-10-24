@@ -36,6 +36,7 @@ import {
   NativeToolLoop,
   nativeToolWireName,
   fitToolTranscript,
+  fitToolTranscriptWithMetadata,
   type NativeToolRegistration,
 } from "./native-tool-loop.js";
 import { createNativeMemoryTools } from "./native-memory-tools.js";
@@ -864,9 +865,99 @@ for (const postgres of backends)
       spy.mockRestore();
       expect(f.requests).toHaveLength(1);
       await f.restart();
-      expect((await f.loop.execute(f.request)).status).toBe("failed");
+      const restored = await f.loop.execute(f.request);
+      expect(restored).toMatchObject({
+        status: "failed",
+        error: {
+          reasonCode: "dispatched-without-terminal",
+          stage: "native-protocol",
+          kind: "non-retryable",
+        },
+      });
+      const failed = await f.core.get(restored.terminalInformationId);
+      expect(failed?.kind).toBe("core.model.task.failed");
+      expect(failed?.payload.error).toMatchObject({
+        reasonCode: "dispatched-without-terminal",
+      });
+      const terminal = (
+        await f.db.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='agent.heavy.tool.terminal.v1'",
+        )
+      ).rows[0].payload;
+      expect(terminal).toMatchObject({
+        reason: "model-outcome-unknown",
+        modelResult: { error: { reasonCode: "dispatched-without-terminal" } },
+      });
+      await f.restart();
+      expect(await f.loop.execute(f.request)).toEqual(restored);
       expect(f.requests).toHaveLength(1);
       expect(f.providerCalls()).toBe(0);
+    });
+    it("persists exact transcript trimming metadata with the actual request and preserves original results", async () => {
+      const f = await fixture(postgres, {
+        budget: { maxContextBytes: 12000 },
+        noMemory: true,
+      });
+      f.behavior(async () => ({
+        ...outcome,
+        result: { value: "x".repeat(5000) },
+      }));
+      f.generate(async () =>
+        f.requests.length <= 2 ? [call(`trim-${f.requests.length}`)] : "完成",
+      );
+      expect((await f.loop.execute(f.request)).status).toBe("completed");
+      const requests = (
+        await f.db.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' ORDER BY (payload->'nativeStep'->>'stepIndex')::integer",
+        )
+      ).rows.map((r) => r.payload);
+      expect(requests).toHaveLength(3);
+      const trimming = requests[2].contextTrimming;
+      expect(trimming).toMatchObject({
+        measurement: "native-message-array-json-utf8",
+        truncated: true,
+        omittedSegments: expect.any(Number),
+      });
+      const completed = (
+        await f.db.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='core.model.task.completed' AND payload->'nativeStep'->>'stepIndex'='1'",
+        )
+      ).rows[0].payload;
+      const paired = (
+        await f.db.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='agent.heavy.tool.result.v1' ORDER BY (payload->>'stepIndex')::integer",
+        )
+      ).rows.map((r) => r.payload);
+      const source = [
+        ...requests[1].messages,
+        ...completed.native.messages,
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: paired[1].toolCallId,
+              toolName: completed.toolCalls[0].toolName,
+              output: { type: "json", value: paired[1].value },
+            },
+          ],
+        },
+      ];
+      const expected = fitToolTranscriptWithMetadata(
+        source,
+        trimming.budgetBytes,
+      );
+      expect(trimming).toEqual(expected.metadata);
+      expect(trimming.omittedSegments).toBeGreaterThan(0);
+      expect(requests[2].messages.slice(0, -1)).toEqual(expected.messages);
+      expect(requests[2].nativeStep.maxContextBytes).toBe(12000);
+      expect(paired.map((p) => p.value.result.value.length)).toEqual([
+        5000, 5000,
+      ]);
+      await f.restart();
+      expect((await f.loop.execute(f.request)).status).toBe("completed");
+      expect(f.requests).toHaveLength(3);
+      expect(f.providerCalls()).toBe(2);
     });
     it("preserves the raw JSON Schema and delegates validation to the host", async () => {
       const f = await fixture(postgres);
@@ -1211,6 +1302,18 @@ it("drops only complete interactions and rejects orphan tool results", () => {
   ];
   const last: any = { role: "user", content: "new" };
   expect(fitToolTranscript([...pair, last], 50)).toEqual([last]);
+  expect(fitToolTranscriptWithMetadata([...pair, last], 50).metadata).toEqual({
+    measurement: "native-message-array-json-utf8",
+    truncated: true,
+    omittedSegments: 1,
+    originalBytes: Buffer.byteLength(JSON.stringify([...pair, last])),
+    retainedBytes: Buffer.byteLength(JSON.stringify([last])),
+    budgetBytes: 50,
+  });
+  expect(fitToolTranscriptWithMetadata(pair, 1000).metadata).toMatchObject({
+    truncated: false,
+    omittedSegments: 0,
+  });
   expect(() => fitToolTranscript([pair[1]], 1000)).toThrow(
     "native-orphan-result",
   );

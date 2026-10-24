@@ -44,6 +44,7 @@ import {
 import {
   informationCompiledPromptSchema,
   modelTaskMetadataSchema,
+  modelTaskContextTrimmingSchema,
   modelTaskResolvedModelSchema,
   modelTaskSelectionPolicySchema,
   modelTaskRequestedInformationKind,
@@ -75,6 +76,7 @@ export interface ModelTaskRequest<TOutput> {
   readonly messages?: NativeMessage[];
   readonly nativeContinuation?: boolean;
   readonly tools?: readonly NativeToolDeclaration[];
+  readonly contextTrimming?: z.infer<typeof modelTaskContextTrimmingSchema>;
   readonly nativeStep?: {
     runInformationId: string;
     stepIndex: number;
@@ -202,6 +204,20 @@ export class ModelTaskClient implements ModelTaskCapability {
             ...request.messages,
             { role: "user", content: prompt.text },
           ]);
+    if (request.contextTrimming) {
+      const trimming = modelTaskContextTrimmingSchema.parse(
+        request.contextTrimming,
+      );
+      if (
+        !request.messages ||
+        trimming.retainedBytes !==
+          Buffer.byteLength(JSON.stringify(request.messages)) ||
+        trimming.retainedBytes > trimming.budgetBytes ||
+        trimming.originalBytes < trimming.retainedBytes ||
+        trimming.truncated !== trimming.omittedSegments > 0
+      )
+        throw new Error("Invalid native context trimming metadata");
+    }
     const metadata = modelTaskMetadataSchema
       .omit({ resolvedModel: true })
       .parse({
@@ -219,6 +235,9 @@ export class ModelTaskClient implements ModelTaskCapability {
         messagesDigest: messages ? digest(canonical(messages)) : null,
         provenance: prompt.provenance,
         ...(request.tools ? { tools: request.tools } : {}),
+        ...(request.contextTrimming
+          ? { contextTrimming: request.contextTrimming }
+          : {}),
         ...(request.nativeStep ? { nativeStep: request.nativeStep } : {}),
       });
     const selected = await this.#core.getMany(metadata.contextInformationIds);
@@ -339,6 +358,7 @@ export class ModelTaskClient implements ModelTaskCapability {
     const startedAt = this.#now().getTime();
     let metrics:
       { durationMs: number; usage?: Record<string, number> } | undefined;
+    let failureReasonCode: "dispatched-without-terminal" | undefined;
     let failureStage:
       | "provider-request"
       | "structured-output-parse"
@@ -434,6 +454,7 @@ export class ModelTaskClient implements ModelTaskCapability {
           if (winner)
             return resultFromWinner<TOutput>(winner, requested.informationId);
           failureStage = "native-protocol";
+          failureReasonCode = "dispatched-without-terminal";
           throw new Error(
             "Native request outcome unknown; automatic retry denied",
           );
@@ -543,6 +564,7 @@ export class ModelTaskClient implements ModelTaskCapability {
                   ? (error.stage ?? failureStage)
                   : failureStage,
               message: "Model task generation failed",
+              ...(failureReasonCode ? { reasonCode: failureReasonCode } : {}),
               ...(llmError?.structuredOutputFailure === undefined
                 ? {}
                 : {
@@ -790,6 +812,7 @@ export function modelTaskFingerprint(
     messagesDigest?: string | null;
     tools?: readonly NativeToolDeclaration[];
     nativeStep?: unknown;
+    contextTrimming?: unknown;
   },
 ): string {
   return digest(
@@ -805,6 +828,9 @@ export function modelTaskFingerprint(
       selectionPolicy: metadata.selectionPolicy,
       ...(metadata.tools ? { tools: metadata.tools } : {}),
       ...(metadata.nativeStep ? { nativeStep: metadata.nativeStep } : {}),
+      ...(metadata.contextTrimming
+        ? { contextTrimming: metadata.contextTrimming }
+        : {}),
       ...(metadata.messagesDigest
         ? { messagesDigest: metadata.messagesDigest }
         : {}),

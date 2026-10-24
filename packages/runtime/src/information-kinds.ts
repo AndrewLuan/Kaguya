@@ -284,6 +284,16 @@ const modelTaskProvenanceSchema = z.array(
     })
     .strict(),
 );
+export const modelTaskContextTrimmingSchema = z
+  .object({
+    measurement: z.literal("native-message-array-json-utf8"),
+    truncated: z.boolean(),
+    omittedSegments: z.number().int().nonnegative(),
+    originalBytes: z.number().int().nonnegative(),
+    retainedBytes: z.number().int().nonnegative(),
+    budgetBytes: z.number().int().positive(),
+  })
+  .strict();
 export const modelTaskMetadataSchema = z
   .object({
     taskId: nonBlankString,
@@ -297,6 +307,7 @@ export const modelTaskMetadataSchema = z
     promptDigest: nonBlankString,
     messagesDigest: nonBlankString.nullable().default(null),
     tools: z.array(nativeToolDeclarationSchema).max(64).exactOptional(),
+    contextTrimming: modelTaskContextTrimmingSchema.exactOptional(),
     nativeStep: z
       .object({
         runInformationId: informationIdSchema,
@@ -351,6 +362,7 @@ const modelTaskSafeErrorBaseSchema = z
       "native-protocol",
     ]),
     message: z.literal("Model task generation failed"),
+    reasonCode: z.enum(["dispatched-without-terminal"]).exactOptional(),
   })
   .strict();
 const structuredOutputFailureSchema = z.enum([
