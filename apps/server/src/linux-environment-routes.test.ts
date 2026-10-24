@@ -62,11 +62,26 @@ it("authenticates every management surface and retains private scope and credent
           },
           dataBase64: png.toString("base64"),
         };
-      if (method === "human.execute")
-        throw new Error("synthetic-lost-receipt-private-text");
+      if (method === "environment.resume") {
+        generation++;
+        mode = "ready";
+        sessionId = undefined;
+      }
+      if (method === "human.execute") {
+        if (params.toolName === "gui.act")
+          throw new Error("synthetic-lost-receipt-private-text");
+        return {
+          status: "succeeded",
+          evidence: "returned",
+          result: {},
+          artifacts: [],
+          truncated: false,
+        };
+      }
       if (method === "human.query") {
         const operation = requests.find(
-          (r) => r.method === "human.execute",
+          (r) =>
+            r.method === "human.execute" && r.params.toolName === "gui.act",
         )!.params;
         return {
           operationId: operation.operationId,
@@ -138,32 +153,92 @@ it("authenticates every management surface and retains private scope and credent
     });
     expect(handoff.statusCode).toBe(200);
     expect(handoff.json().human.sessionId).toBe(sessionId);
-    expect(handoff.body).not.toContain(requests[0]!.params.humanSession.token);
+    expect(handoff.body).not.toContain(
+      requests.find((r) => r.method === "environment.handoff")!.params
+        .humanSession.token,
+    );
     const operationId = randomUUID();
     const payload = {
       generation: 1,
       sessionId,
       operationId,
-      arguments: { target: { kind: "desktop" } },
+      arguments: {
+        action: "click",
+        observation: {
+          id: "a".repeat(64),
+          environmentId: "env",
+          workflowId: "human",
+          generation: 1,
+        },
+        selector: { kind: "pixel", x: 1, y: 2 },
+      },
     };
     const input = await app.inject({
       method: "POST",
-      url: `${prefix}/human/observe`,
+      url: `${prefix}/human/input`,
       headers,
       payload,
     });
     expect(input.statusCode).toBe(200);
     expect(input.json().outcome.status).toBe("unknown");
     expect(input.body).not.toContain("private-text");
+    const repeated = await app.inject({
+      method: "POST",
+      url: `${prefix}/human/input`,
+      headers,
+      payload,
+    });
+    expect(repeated.json()).toEqual(input.json());
+    const observe = await app.inject({
+      method: "POST",
+      url: `${prefix}/human/observe`,
+      headers,
+      payload: {
+        generation: 1,
+        sessionId,
+        operationId: randomUUID(),
+        arguments: { target: { kind: "desktop" } },
+      },
+    });
+    expect(observe.statusCode).toBe(200);
+    const verify = await app.inject({
+      method: "POST",
+      url: `${prefix}/human/verify`,
+      headers,
+      payload: {
+        generation: 1,
+        sessionId,
+        operationId: randomUUID(),
+        arguments: {
+          target: { kind: "desktop" },
+          original: { operationId, attemptId: input.json().attemptId },
+          verificationKind: "current-gui-state",
+          contains: "visible",
+        },
+      },
+    });
+    expect(verify.statusCode).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `${prefix}/human/renew`,
+          headers,
+          payload: { generation: 1, sessionId },
+        })
+      ).statusCode,
+    ).toBe(200);
     const query = await app.inject({
       method: "GET",
       url: `${prefix}/human/operations/${operationId}`,
       headers,
     });
     expect(query.json().attemptId).toBe(input.json().attemptId);
-    expect(requests.filter((r) => r.method === "human.execute")).toHaveLength(
-      1,
-    );
+    expect(
+      requests.filter(
+        (r) => r.method === "human.execute" && r.params.toolName === "gui.act",
+      ),
+    ).toHaveLength(1);
     expect(requests.every((r) => r.params.scope === "configured-scope")).toBe(
       true,
     );
@@ -194,8 +269,31 @@ it("authenticates every management surface and retains private scope and credent
     });
     expect(closed.json().state).toBe("human");
     expect(closed.json().human).toBeUndefined();
+    const late = await app.inject({
+      method: "POST",
+      url: `${prefix}/human/input`,
+      headers,
+      payload: { ...payload, operationId: randomUUID() },
+    });
+    expect(late.statusCode).toBe(409);
+    expect(
+      requests.filter(
+        (r) => r.method === "human.execute" && r.params.toolName === "gui.act",
+      ),
+    ).toHaveLength(1);
+    const resumed = await app.inject({
+      method: "POST",
+      url: `${prefix}/resume`,
+      headers,
+      payload: { generation: 2, controlAuthorizationId: randomUUID() },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json().state).toBe("ready");
   } finally {
-    await host.close();
-    await app.close();
+    try {
+      await host.close();
+    } finally {
+      await app.close();
+    }
   }
 });

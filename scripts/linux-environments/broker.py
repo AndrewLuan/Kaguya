@@ -921,7 +921,7 @@ class PodmanBackend:
     def prepare_gui_home(self, env):
         """在 rootless 用户 namespace 初始化固定命名卷；不提升容器 capability，也不递归 chown 用户内容。"""
         volume = "kaguya-private-" + digest(env["environmentId"])[:24]
-        self.command("volume", "create", volume)
+        self.command("volume", "create", "--ignore", volume)
         info = json.loads(self.command("volume", "inspect", volume))[0]
         if info.get("Name") != volume or not isinstance(info.get("Mountpoint"), str):
             raise BrokerError("gui-private-volume-unconfirmed")

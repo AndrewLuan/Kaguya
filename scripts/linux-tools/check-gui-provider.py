@@ -56,6 +56,7 @@ def main():
             app = lambda *values: backend.command("exec", "--user=1001:1001", container, *values)
             assert command("/usr/bin/stat", "-c", "%u:%g:%a", "/private/app").strip() == b"1001:1001:700"
             assert app("/usr/bin/test", "-w", "/private/app") == b""
+            app("/usr/bin/python3", "-I", "-c", "from pathlib import Path; Path('/private/app/recovery-marker').write_text('persistent-gui-home')")
             info = json.loads(backend.command("inspect", container))[0]
             oci = json.loads(backend.command("unshare", "/bin/cat", info["OCIConfigPath"]))
             assert oci["linux"]["resources"]["pids"]["limit"] == 384
@@ -88,13 +89,15 @@ def main():
                 assert result["status"] in ("succeeded", "unknown"), result
                 return result
 
-            desktop = execute("gui.observe", {"target": {"kind": "desktop"}})
+            desktop = until(lambda: execute("gui.observe", {"target": {"kind": "desktop"}}),
+                            lambda value: any(w["pid"] == pid and w["title"] == "Kaguya GUI acceptance" for w in value["result"]["windows"]))
             window = next(w for w in desktop["result"]["windows"] if w["pid"] == pid and w["title"] == "Kaguya GUI acceptance")
             target = {"kind": "window", "pid": pid, "windowId": window["windowId"]}
             observe = lambda ttl=60: execute("gui.observe", {"target": target}, ttl)
             def element(observation, name):
                 return next(e["id"] for e in observation["result"]["elements"] if name in e["description"])
-            before = observe()
+            before = until(observe, lambda value: all(any(name in e["description"] for e in value["result"]["elements"])
+                                                     for name in ("Unsaved text", "Increment once")))
             original_image = broker.read_artifact({"id": before["artifacts"][0]["id"], "scope": "ci-gui", "environmentId": key})
             image_bytes = base64.b64decode(original_image["dataBase64"])
             assert hashlib.sha256(image_bytes).hexdigest() == before["result"]["image"]["sha256"]
@@ -127,6 +130,22 @@ def main():
                 raise AssertionError("old-lease-was-admitted")
             except BrokerError:
                 pass
+            launches = []
+            launch = backend.launch
+            def counted_launch(environment, body):
+                launches.append(body.get("operationId"))
+                return launch(environment, body)
+            backend.launch = counted_launch
+            try:
+                try:
+                    broker.execute({**click, **binding})
+                    raise AssertionError("old-operation-was-redispatched")
+                except BrokerError as error:
+                    assert str(error) == "operation-conflict", error
+                assert launches == [], launches
+                assert ledger()["count"] == 1
+            finally:
+                backend.launch = launch
             verification = execute("gui.verify", {"target": target, "original": {"operationId": click["operationId"], "attemptId": click["attemptId"]}, "verificationKind": "current-gui-state", "contains": "W8 持久桌面"})
             assert verification["result"]["verification"]["matched"] is True
             automatic_capture = observe()["result"]["observation"]
@@ -166,6 +185,12 @@ def main():
             Path("gui-provider-final.png").write_bytes(base64.b64decode(final_image["dataBase64"]))
             evidence.update(passed=True, ledger=ledger(), originalUnknown=unknown, pidStartTime=started,
                             preservedOriginalImageSha256=hashlib.sha256(image_bytes).hexdigest())
+            # 交接保留 PID 的证明已经完成；另行模拟容器丢失，核对既存 HOME 卷的恢复。
+            backend.stop_container(container)
+            broker.takeover({"environmentId": key, "scope": "ci-gui", "generation": 3, "controlAuthorizationId": "restore-container"})
+            assert app("/bin/cat", "/private/app/recovery-marker") == b"persistent-gui-home"
+            assert app("/usr/bin/stat", "-c", "%u:%g:%a", "/private/app").strip() == b"1001:1001:700"
+            evidence["existingHomeRecovered"] = True
         except BaseException:
             evidence["failure"] = traceback.format_exc()
             failed_env = broker.environments.get(key)
@@ -177,9 +202,13 @@ def main():
                     evidence["containerLog"] = "unavailable"
             raise
         finally:
-            Path("gui-provider-receipt.json").write_text(json.dumps(evidence, ensure_ascii=False))
-            env = broker.environments.get(key, env)
+            primary = sys.exc_info()[1]
             failures = []
+            try:
+                Path("gui-provider-receipt.json").write_text(json.dumps(evidence, ensure_ascii=False))
+            except Exception as error:
+                failures.append(error)
+            env = broker.environments.get(key, env)
             for cleanup in [broker.close] + ([lambda: backend.stop_container(env["container"]), lambda: backend.command("rm", "--force", "--ignore", env["container"])] if env else []):
                 try:
                     cleanup()
@@ -191,7 +220,7 @@ def main():
                 except Exception as error:
                     failures.append(error)
             if failures:
-                raise ExceptionGroup("gui-provider-cleanup-unconfirmed", failures)
+                raise BaseExceptionGroup("gui-provider-cleanup-unconfirmed", ([primary] if primary else []) + failures)
 
 
 if __name__ == "__main__":

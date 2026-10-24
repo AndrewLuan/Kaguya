@@ -148,6 +148,17 @@ const humanReceiptSchema = z.object({
   attemptId: z.string(),
   outcome: actionOutcomeSchema,
 });
+interface HumanControl {
+  fingerprint: string;
+  session: { id: string; token: string; ttlSeconds: number };
+  input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    controlAuthorizationId: string;
+  };
+  confirmed: boolean;
+}
 export type HumanReceipt = z.infer<typeof humanReceiptSchema>;
 export type HumanOperation = {
   environmentId: string;
@@ -174,13 +185,10 @@ function sameReference(a: ActionEnvironment, b: ActionEnvironment) {
 export class LinuxEnvironmentClient {
   readonly #bindings = new Map<string, Binding>();
   readonly #humans = new Map<string, HumanBinding>();
-  readonly #humanControls = new Map<
-    string,
-    {
-      fingerprint: string;
-      session: { id: string; token: string; ttlSeconds: number };
-    }
-  >();
+  // 可执行绑定可立即撤销；清理 owner 必须保留到 broker 确认排空或后继代次已提交。
+  readonly #cleanupBindings = new Map<string, Binding>();
+  readonly #cleanupHumans = new Map<string, HumanBinding>();
+  readonly #humanControls = new Map<string, HumanControl>();
   readonly #humanOperations = new Map<
     string,
     { fingerprint: string; promise: Promise<HumanReceipt> }
@@ -225,6 +233,10 @@ export class LinuxEnvironmentClient {
       ...response,
       scope: input.scope,
     });
+    this.#cleanupBindings.set(this.#leaseKey(response.environment), {
+      ...response,
+      scope: input.scope,
+    });
     return structuredClone(response.environment);
   }
 
@@ -250,6 +262,7 @@ export class LinuxEnvironmentClient {
       scope,
     });
     this.#bindings.delete(environmentId);
+    this.#cleanupBindings.delete(this.#leaseKey(binding.environment));
     return result;
   }
 
@@ -260,7 +273,18 @@ export class LinuxEnvironmentClient {
     controlAuthorizationId: string;
   }) {
     try {
-      return await this.#transport("environment.recover", input);
+      const result = environmentControlSchema.parse(
+        await this.#transport("environment.recover", input),
+      );
+      if (
+        result.environmentId !== input.environmentId ||
+        result.scope !== input.scope ||
+        result.generation <= input.generation ||
+        result.state !== "ready"
+      )
+        throw new Error("environment-recovery-unconfirmed");
+      this.#forgetBefore(input.environmentId, result.generation);
+      return result;
     } finally {
       this.#bindings.delete(input.environmentId);
       this.#humans.delete(input.environmentId);
@@ -274,7 +298,18 @@ export class LinuxEnvironmentClient {
     controlAuthorizationId: string;
   }) {
     try {
-      return await this.#transport("environment.handoff", input);
+      const result = environmentControlSchema.parse(
+        await this.#transport("environment.handoff", input),
+      );
+      if (
+        result.environmentId !== input.environmentId ||
+        result.scope !== input.scope ||
+        result.generation !== input.generation + 1 ||
+        result.state !== "human"
+      )
+        throw new Error("environment-handoff-unconfirmed");
+      this.#forgetBefore(input.environmentId, input.generation + 1);
+      return result;
     } finally {
       this.#bindings.delete(input.environmentId);
     }
@@ -288,16 +323,30 @@ export class LinuxEnvironmentClient {
   }) {
     this.#bindings.delete(input.environmentId);
     this.#humans.delete(input.environmentId);
-    return this.#transport("environment.resume", input);
+    const result = environmentControlSchema.parse(
+      await this.#transport("environment.resume", input),
+    );
+    if (
+      result.environmentId !== input.environmentId ||
+      result.scope !== input.scope ||
+      result.generation !== input.generation + 1 ||
+      result.state !== "ready"
+    )
+      throw new Error("environment-resume-unconfirmed");
+    this.#forgetBefore(input.environmentId, input.generation + 1);
+    return result;
   }
 
   async inspect(
     environmentId: string,
     scope: string,
   ): Promise<EnvironmentControl> {
-    return environmentControlSchema.parse(
+    const result = environmentControlSchema.parse(
       await this.#transport("environment.inspect", { environmentId, scope }),
     );
+    if (result.environmentId !== environmentId || result.scope !== scope)
+      throw new Error("environment-control-identity-mismatch");
+    return result;
   }
 
   async openHuman(input: {
@@ -321,11 +370,23 @@ export class LinuxEnvironmentClient {
     let pending = this.#humanControls.get(key);
     if (pending && pending.fingerprint !== fingerprint)
       throw new Error("human-control-conflict");
+    this.#bindings.delete(input.environmentId);
+    this.#humans.delete(input.environmentId);
     if (!pending) {
       if (this.#humanControls.size >= 1024)
         throw new Error("human-control-capacity");
+      const current = await this.inspect(input.environmentId, input.scope);
+      if (current.generation !== input.generation)
+        throw new Error("human-control-stale-generation");
       pending = {
         fingerprint,
+        input: {
+          environmentId: input.environmentId,
+          scope: input.scope,
+          generation: input.generation,
+          controlAuthorizationId: input.controlAuthorizationId,
+        },
+        confirmed: false,
         session: {
           id: randomBytes(32).toString("hex"),
           token: randomBytes(32).toString("hex"),
@@ -333,9 +394,15 @@ export class LinuxEnvironmentClient {
         },
       };
       this.#humanControls.set(key, pending);
+      const candidate = {
+        environmentId: input.environmentId,
+        scope: input.scope,
+        generation: input.generation + 1,
+        sessionId: pending.session.id,
+        token: pending.session.token,
+      };
+      this.#cleanupHumans.set(this.#humanKey(candidate), candidate);
     }
-    this.#bindings.delete(input.environmentId);
-    this.#humans.delete(input.environmentId);
     const result = environmentControlSchema.parse(
       await this.#transport("environment.handoff", {
         environmentId: input.environmentId,
@@ -360,6 +427,8 @@ export class LinuxEnvironmentClient {
       sessionId: pending.session.id,
       token: pending.session.token,
     });
+    pending.confirmed = true;
+    this.#forgetBefore(input.environmentId, result.generation);
     return result;
   }
 
@@ -407,17 +476,23 @@ export class LinuxEnvironmentClient {
     generation: number;
     sessionId: string;
   }) {
-    const binding = this.#human(input);
+    const binding = this.#cleanupHumans.get(this.#humanKey(input));
+    if (!binding || binding.scope !== input.scope)
+      throw new Error("human-session-unavailable");
+    this.#humans.delete(input.environmentId);
     const result = environmentControlSchema.parse(
       await this.#transport("human.close", { ...binding }),
     );
     if (
+      result.environmentId !== binding.environmentId ||
+      result.scope !== binding.scope ||
       result.state !== "human" ||
       result.human ||
       result.generation !== binding.generation + 1
     )
       throw new Error("human-close-unconfirmed");
     this.#humans.delete(input.environmentId);
+    this.#cleanupHumans.delete(this.#humanKey(binding));
     return result;
   }
 
@@ -444,6 +519,156 @@ export class LinuxEnvironmentClient {
     );
     if (results.some((result) => result.status === "rejected"))
       throw new Error("human-cleanup-unconfirmed");
+  }
+
+  #leaseKey(environment: ActionEnvironment) {
+    return JSON.stringify([
+      environment.environmentId,
+      environment.generation,
+      environment.leaseId,
+    ]);
+  }
+  #forgetBefore(environmentId: string, generation: number) {
+    for (const [key, binding] of this.#cleanupBindings)
+      if (
+        binding.environment.environmentId === environmentId &&
+        binding.environment.generation < generation
+      )
+        this.#cleanupBindings.delete(key);
+    for (const [key, binding] of this.#cleanupHumans)
+      if (
+        binding.environmentId === environmentId &&
+        binding.generation < generation
+      )
+        this.#cleanupHumans.delete(key);
+  }
+  #humanKey(
+    binding: Pick<HumanBinding, "environmentId" | "generation" | "sessionId">,
+  ) {
+    return JSON.stringify([
+      binding.environmentId,
+      binding.generation,
+      binding.sessionId,
+    ]);
+  }
+
+  async closeOwnedInputs() {
+    this.#bindings.clear();
+    this.#humans.clear();
+    const pending = () =>
+      [...this.#humanControls.values()].filter((value) => !value.confirmed);
+    const resolvePending = async (value: HumanControl) => {
+      const { input } = value;
+      const current = await this.inspect(input.environmentId, input.scope);
+      if (
+        current.generation > input.generation ||
+        (current.generation === input.generation &&
+          current.state === "quarantined")
+      ) {
+        value.confirmed = true;
+        return;
+      }
+      const ack = environmentControlSchema.parse(
+        await this.#transport("environment.handoff", {
+          ...input,
+          humanSession: value.session,
+        }),
+      );
+      if (
+        ack.environmentId !== input.environmentId ||
+        ack.scope !== input.scope ||
+        ack.generation !== input.generation + 1 ||
+        ack.state !== "human" ||
+        ack.human?.sessionId !== value.session.id
+      )
+        throw new Error("human-cleanup-control-unconfirmed");
+      value.confirmed = true;
+    };
+    // 不重发输入。控制只以原 control ID 重试；一次未送达的 handoff 也须先确定其候选会话去向。
+    await Promise.allSettled(pending().map(resolvePending));
+    for (const [key, binding] of this.#cleanupBindings) {
+      try {
+        try {
+          const ack = environmentControlSchema.parse(
+            await this.#transport("lease.release", {
+              environment: binding.environment,
+              token: binding.token,
+              scope: binding.scope,
+            }),
+          );
+          if (
+            ack.environmentId !== binding.environment.environmentId ||
+            ack.scope !== binding.scope ||
+            ack.state !== "quarantined" ||
+            ack.generation !== binding.environment.generation
+          )
+            throw new Error("lease-cleanup-unconfirmed");
+        } catch {
+          const current = await this.inspect(
+            binding.environment.environmentId,
+            binding.scope,
+          );
+          if (!(
+            current.generation > binding.environment.generation &&
+            ["ready", "human", "quarantined"].includes(current.state)
+          ))
+            throw new Error("lease-cleanup-unconfirmed");
+        }
+        this.#cleanupBindings.delete(key);
+      } catch {
+        /* 保留 owner；其余会话仍独立尝试清理。 */
+      }
+    }
+    for (const [key, binding] of this.#cleanupHumans) {
+      try {
+        try {
+          const ack = environmentControlSchema.parse(
+            await this.#transport("human.close", { ...binding }),
+          );
+          if (
+            ack.environmentId !== binding.environmentId ||
+            ack.scope !== binding.scope ||
+            ack.state !== "human" ||
+            ack.human ||
+            ack.generation !== binding.generation + 1
+          )
+            throw new Error("human-close-unconfirmed");
+        } catch {
+          const current = await this.inspect(
+            binding.environmentId,
+            binding.scope,
+          );
+          const neverAdmitted =
+            current.state === "quarantined" &&
+            current.generation === binding.generation - 1 &&
+            [...this.#humanControls.values()].some(
+              (value) =>
+                value.session.id === binding.sessionId &&
+                value.input.generation === current.generation,
+            );
+          if (
+            !neverAdmitted &&
+            !(
+              current.generation >= binding.generation &&
+              ["ready", "human", "quarantined"].includes(current.state) &&
+              (current.generation > binding.generation ||
+                current.human?.sessionId !== binding.sessionId)
+            )
+          )
+            throw new Error("human-cleanup-unconfirmed");
+        }
+        this.#cleanupHumans.delete(key);
+      } catch {
+        /* 保留 owner；关闭失败不得表现成已清理。 */
+      }
+    }
+    await Promise.allSettled(pending().map(resolvePending));
+    if (
+      this.#cleanupBindings.size ||
+      this.#cleanupHumans.size ||
+      pending().length
+    )
+      throw new Error("environment-owned-input-cleanup-unconfirmed");
   }
 
   operateHuman(input: HumanOperation): Promise<HumanReceipt> {

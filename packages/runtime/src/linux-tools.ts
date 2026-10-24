@@ -94,6 +94,7 @@ export class LinuxToolsHost {
   private readonly leases = new Map<string, ActionEnvironment>();
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly unavailable = new Set<string>();
+  private readonly manualBlocked = new Set<string>();
   private readonly timer: ReturnType<typeof setInterval>;
   private closed = false;
   constructor(
@@ -196,12 +197,14 @@ export class LinuxToolsHost {
   ) {
     const { scope } = this.managed(environmentId);
     this.unavailable.add(scope);
+    this.manualBlocked.add(environmentId);
     const work = (this.locks.get(scope) ?? Promise.resolve())
       .catch(() => undefined)
       .then(async () => {
         if (this.closed) throw new Error("linux-tools-closed");
+        const result = await operation(scope);
         this.leases.delete(scope);
-        return operation(scope);
+        return result;
       });
     this.locks.set(scope, work);
     return work;
@@ -212,14 +215,16 @@ export class LinuxToolsHost {
     generation: number,
     controlAuthorizationId: string,
   ) {
-    return this.manage(environmentId, (scope) =>
-      this.client.openHuman({
+    return this.manage(environmentId, async (scope) => {
+      const result = await this.client.openHuman({
         environmentId,
         scope,
         generation,
         controlAuthorizationId,
-      }),
-    );
+      });
+      this.manualBlocked.delete(environmentId);
+      return result;
+    });
   }
 
   resume(
@@ -244,6 +249,8 @@ export class LinuxToolsHost {
 
   operateHuman(input: Omit<HumanOperation, "scope">) {
     const { scope } = this.managed(input.environmentId);
+    if (this.manualBlocked.has(input.environmentId))
+      throw new Error("human-session-unavailable");
     return this.client.operateHuman({ ...input, scope });
   }
 
@@ -252,6 +259,8 @@ export class LinuxToolsHost {
     generation: number;
     sessionId: string;
   }) {
+    if (this.manualBlocked.has(input.environmentId))
+      throw new Error("human-session-unavailable");
     return this.client.renewHuman({
       ...input,
       scope: this.managed(input.environmentId).scope,
@@ -415,14 +424,7 @@ export class LinuxToolsHost {
     this.closed = true;
     clearInterval(this.timer);
     await Promise.allSettled(this.locks.values());
-    const results = await Promise.allSettled([
-      this.client.closeHumans(),
-      ...[...this.leases].map(async ([scope, ref]) => {
-        await this.client.release(ref.environmentId, scope);
-        this.leases.delete(scope);
-      }),
-    ]);
-    if (results.some((r) => r.status === "rejected"))
-      throw new Error("linux-tools-cleanup-unconfirmed");
+    await this.client.closeOwnedInputs();
+    this.leases.clear();
   }
 }

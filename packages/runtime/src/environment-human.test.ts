@@ -23,10 +23,15 @@ function fixture() {
     sessionId: "",
     failHandoff: false,
     failInput: false,
+    failBeforeHandoff: false,
+    failBeforeResume: false,
+    failCleanup: false,
+    renewGate: undefined as Promise<void> | undefined,
     handoffGate: undefined as Promise<void> | undefined,
     inputGate: undefined as Promise<void> | undefined,
   };
   const entered = Promise.withResolvers<void>();
+  const renewEntered = Promise.withResolvers<void>();
   const inputEntered = Promise.withResolvers<void>();
   const snapshot = () => ({
     environmentId: "env",
@@ -45,6 +50,21 @@ function fixture() {
   });
   const transport: BrokerTransport = async (method, params) => {
     calls.push({ method, params });
+    if (
+      state.failCleanup &&
+      ["environment.inspect", "human.close", "lease.release"].includes(method)
+    )
+      throw new Error("cleanup-offline");
+    if (method === "lease.renew") {
+      renewEntered.resolve();
+      await state.renewGate;
+    }
+    if (method === "lease.release") {
+      if ((params.environment as any).generation !== state.generation)
+        throw new Error("stale-lease");
+      state.state = "quarantined";
+      return snapshot();
+    }
     if (method === "lease.acquire" || method === "lease.renew")
       return method === "lease.acquire"
         ? {
@@ -64,6 +84,7 @@ function fixture() {
     if (method === "environment.handoff") {
       entered.resolve();
       await state.handoffGate;
+      if (state.failBeforeHandoff) throw new Error("not-delivered");
       state.generation = Number(params.generation) + 1;
       state.state = "human";
       state.sessionId = (params.humanSession as { id: string }).id;
@@ -90,6 +111,14 @@ function fixture() {
       };
     }
     if (method === "human.close" || method === "environment.resume") {
+      if (method === "environment.resume" && state.failBeforeResume)
+        throw new Error("resume-not-delivered");
+      if (
+        Number(params.generation) !== state.generation ||
+        state.state !== "human" ||
+        (method === "human.close" && params.sessionId !== state.sessionId)
+      )
+        throw new Error("stale-human");
       state.generation = Number(params.generation) + 1;
       state.state = method === "human.close" ? "human" : "ready";
       state.sessionId = "";
@@ -107,7 +136,7 @@ function fixture() {
     },
     client,
   );
-  return { client, host, calls, state, entered, inputEntered };
+  return { client, host, calls, state, entered, inputEntered, renewEntered };
 }
 
 describe("manual GUI host", () => {
@@ -119,9 +148,12 @@ describe("manual GUI host", () => {
         "lost-ack",
       );
       const publicState = await f.host.handoff("env", 0, "control");
-      expect(f.calls[0]!.params).toEqual(f.calls[1]!.params);
+      const handoffs = f.calls.filter(
+        (call) => call.method === "environment.handoff",
+      );
+      expect(handoffs[0]!.params).toEqual(handoffs[1]!.params);
       expect(JSON.stringify(publicState)).not.toContain("token");
-      const privateToken = f.calls[0]!.params.humanSession.token;
+      const privateToken = handoffs[0]!.params.humanSession.token;
       expect(JSON.stringify(publicState)).not.toContain(privateToken);
       expect(publicState.human?.sessionId).toHaveLength(64);
       await expect(f.host.bind("scope")).rejects.toThrow();
@@ -134,27 +166,94 @@ describe("manual GUI host", () => {
     }
   });
 
-  it("fences queued lease renewal at handoff and resumes only after confirmed control", async () => {
+  it("fences a renewal queued behind an admitted renewal before handoff", async () => {
     const f = fixture();
     const gate = Promise.withResolvers<void>();
-    f.state.handoffGate = gate.promise;
-    let handoff: Promise<unknown> | undefined;
+    const work: Promise<unknown>[] = [];
     try {
       await f.host.bind("scope");
-      handoff = f.host.handoff("env", 0, "control");
-      await f.entered.promise;
-      await f.host.maintain();
-      await expect(f.host.bind("scope")).rejects.toThrow();
+      f.state.renewGate = gate.promise;
+      const first = f.host.bind("scope");
+      work.push(first);
+      await f.renewEntered.promise;
+      const queued = f.host.bind("scope");
+      const denied = expect(queued).rejects.toThrow();
+      work.push(denied);
+      const handoff = f.host.handoff("env", 0, "control");
+      work.push(handoff);
+      gate.resolve();
+      await Promise.all([first, denied, handoff]);
       expect(
         f.calls.filter((call) => call.method === "lease.renew"),
-      ).toHaveLength(0);
-      gate.resolve();
-      await handoff;
+      ).toHaveLength(1);
       await f.host.resume("env", 1, "resume");
       expect((await f.host.bind("scope")).generation).toBe(2);
     } finally {
       gate.resolve();
-      await handoff;
+      try {
+        await Promise.allSettled(work);
+      } finally {
+        await f.host.close();
+      }
+    }
+  });
+
+  it("retains cleanup owners when handoff never reaches the broker", async () => {
+    const f = fixture();
+    try {
+      await f.host.bind("scope");
+      f.state.failBeforeHandoff = true;
+      await expect(f.host.handoff("env", 0, "control")).rejects.toThrow(
+        "not-delivered",
+      );
+      await expect(f.host.bind("scope")).rejects.toThrow();
+      await f.host.close();
+      expect(f.state.state).toBe("quarantined");
+      expect(
+        f.calls.filter((call) => call.method === "lease.release"),
+      ).toHaveLength(1);
+    } finally {
+      await f.host.close();
+    }
+  });
+
+  it("closes the candidate session after a lost handoff ACK without returning to automation", async () => {
+    const f = fixture();
+    try {
+      await f.host.bind("scope");
+      f.state.failHandoff = true;
+      await expect(f.host.handoff("env", 0, "control")).rejects.toThrow(
+        "lost-ack",
+      );
+      expect(f.state.state).toBe("human");
+      await f.host.close();
+      expect(f.state.state).toBe("human");
+      expect(f.state.sessionId).toBe("");
+      expect(
+        f.calls.filter((call) => call.method === "human.close"),
+      ).toHaveLength(1);
+    } finally {
+      await f.host.close();
+    }
+  });
+
+  it("retains the manual owner when resume is not delivered and reports unconfirmed cleanup", async () => {
+    const f = fixture();
+    try {
+      await f.host.handoff("env", 0, "control");
+      f.state.failBeforeResume = true;
+      await expect(f.host.resume("env", 1, "resume")).rejects.toThrow(
+        "resume-not-delivered",
+      );
+      f.state.failCleanup = true;
+      await expect(f.host.close()).rejects.toThrow("cleanup-unconfirmed");
+      expect(f.state.sessionId).not.toBe("");
+      f.state.failCleanup = false;
+      await f.host.close();
+      expect(f.state.state).toBe("human");
+      expect(f.state.sessionId).toBe("");
+    } finally {
+      f.state.failCleanup = false;
       await f.host.close();
     }
   });
@@ -169,8 +268,17 @@ describe("manual GUI host", () => {
         generation: current.generation,
         sessionId: current.human!.sessionId,
         operationId: "op",
-        toolName: "gui.observe" as const,
-        arguments: { target: { kind: "desktop" } },
+        toolName: "gui.act" as const,
+        arguments: {
+          action: "click",
+          observation: {
+            id: "a".repeat(64),
+            environmentId: "env",
+            workflowId: "human",
+            generation: current.generation,
+          },
+          selector: { kind: "pixel", x: 1, y: 2 },
+        },
       };
       const first = await f.host.operateHuman(request);
       expect(first.outcome.status).toBe("unknown");
@@ -185,7 +293,10 @@ describe("manual GUI host", () => {
       expect(() =>
         f.host.operateHuman({
           ...request,
-          arguments: { target: { kind: "window", pid: 1, windowId: 2 } },
+          arguments: {
+            ...request.arguments,
+            selector: { kind: "pixel", x: 3, y: 2 },
+          },
         }),
       ).toThrow("human-operation-conflict");
     } finally {
@@ -226,8 +337,11 @@ describe("manual GUI host", () => {
       ).toHaveLength(1);
     } finally {
       gate.resolve();
-      await action;
-      await f.host.close();
+      try {
+        await action;
+      } finally {
+        await f.host.close();
+      }
     }
   });
 });

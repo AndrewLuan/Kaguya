@@ -224,12 +224,24 @@ describe("Linux native shell registry", () => {
         if (method === "environment.recover") {
           generation++;
           expires = Date.now() + 3000;
-          return {};
+          return {
+            environmentId: "env",
+            scope: "scope",
+            generation,
+            state: "ready",
+          };
         }
         if (method === "lease.release" && failRelease) {
           failRelease = false;
           throw new Error("ack-lost");
         }
+        if (method === "lease.release")
+          return {
+            environmentId: "env",
+            scope: "scope",
+            generation,
+            state: "quarantined",
+          };
         return {};
       }),
       3,
@@ -275,6 +287,13 @@ describe("Linux native shell registry", () => {
       if (method === "lease.acquire")
         return { environment, token: "private-token-not-for-the-model-123456" };
       if (method === "lease.renew") return environment;
+      if (method === "lease.release")
+        return {
+          environmentId: "env",
+          scope: "scope",
+          generation: environment.generation,
+          state: "quarantined",
+        };
       return {};
     });
     const host = new LinuxToolsHost(
