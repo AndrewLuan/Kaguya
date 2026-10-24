@@ -34,6 +34,6 @@ Server 从敏感配置目录的 `linux-tools.json` 显式启用；文件不存�
 
 输入函数在独立 world 的同一 renderer 任务里核对完整 HTML、表单属性、视口、URL 和截止时间。准备阶段及每次 pipe 写入另验固定 permit。handoff 先封门、清空旧观察，再等待 connection/session/id 表中的真实 CDP 回执；断连、丢失回执和目标异常保持 unknown/draining，不用 detach 或客户端超时制造成功 ACK。页面、owner PID、未保存输入和 profile 在正常 handoff/resume 中保留；恢复自动化后必须重新观察。已接受输入启动的异步网站业务可能随后完成，使用新 operation 下的 verify 核对，不重复点击。
 
-`verify` 明确引用原 operationId/attemptId；broker 核对原 browser.act 属于同一 scope/environment/workspace。页面核对读取当前 DOM；下载核对读取私有持久文件的 hash 与范围，不重放输入。下载保留原 URL、报告的 MIME、文件名、时间和原操作关联窗口；该关联窗口不单独证明网站因果。完整文件在 `/private` 保留，附件仍遵循 16 MiB 总额，可按 offset/maxBytes 分段导出。未知下载不会被当作原操作已完成。
+`verify` 明确引用原 operationId/attemptId；broker 核对原 browser.act 属于同一 scope/environment/workspace。页面核对读取当前 DOM；下载核对要求 `verificationKind: "current-file-state"`，读取私有持久文件的 hash 与范围，不重放输入。下载保留原 URL、报告的 MIME、文件名、时间和原操作关联窗口；回执固定标注 `association=heuristic` 与 `causalAttribution=unconfirmed`，不把文件核对当作原操作造成下载的证明。完整文件在 `/private` 保留，附件仍遵循 16 MiB 总额，可按 offset/maxBytes 分段导出。未知下载不会被当作原操作已完成。
 
-`check-browser.mjs` 使用独立本机站点与 fsync 提交计数验证真实 DOM、下载及页面保留。CI 同镜像默认/候选策略 A/B 读取 Chromium 自身 sandbox 状态，并记录实际 OCI 的非 root、空 capabilities、NNP、只读 rootfs。Ubuntu 24.04 / Podman 4.9.3 的结果与生产 Ubuntu 26.04 / Podman 5.7.0 的现场验收分别记录。
+`browser_checks.py` 经生产 broker/helper 驱动单一 owner，使用独立本机站点与 fsync 提交计数验证真实 DOM、下载及页面保留。CI 同镜像默认/候选策略 A/B 读取 Chromium 自身 sandbox 状态，并记录实际 OCI 的非 root、空 capabilities、NNP、只读 rootfs。Ubuntu 24.04 / Podman 4.9.3 的结果与生产 Ubuntu 26.04 / Podman 5.7.0 的现场验收分别记录。

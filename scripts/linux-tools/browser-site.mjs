@@ -27,8 +27,27 @@ const atomic = async (name, value) => {
 let submissions = 0,
   pending = Promise.resolve();
 const nonce = randomUUID();
+let released = true;
+const releaseWaiters = new Set();
 const server = createServer(async (request, response) => {
-  if (request.url === "/submit" && request.method === "POST") {
+  if (request.url === "/prepare") {
+    released = false;
+    await atomic("block", { entered: false });
+    response.end("prepared");
+  } else if (request.url === "/entered") {
+    await atomic("block", { entered: true });
+    response.end("entered");
+  } else if (request.url === "/release") {
+    if (released) response.end("released");
+    else releaseWaiters.add(response);
+    response.once("close", () => releaseWaiters.delete(response));
+  } else if (request.url === "/admin/release") {
+    released = true;
+    for (const waiter of releaseWaiters) waiter.end("released");
+    releaseWaiters.clear();
+    await atomic("block", { entered: false });
+    response.end("released");
+  } else if (request.url === "/submit" && request.method === "POST") {
     for await (const chunk of request) {
       /* consume synthetic request */
     }
@@ -46,15 +65,30 @@ const server = createServer(async (request, response) => {
     });
     response.end("name,value\nkaguya,42\n");
   } else {
-    response.writeHead(200, { "content-type": "text/html" });
+    response.writeHead(200, {
+      "content-type": "text/html",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-embedder-policy": "require-corp",
+    });
     response.end(
       '<input aria-label="unsaved"><button id="submit">submit once</button><output id="count">0</output><output id="nonce">' +
         nonce +
-        '</output><a href="/file.csv">download CSV</a><script>submit.onclick=async()=>{count.textContent=await(await fetch("/submit",{method:"POST",body:document.querySelector("input").value})).text()}</script>',
+        `</output><a href="/file.csv">download CSV</a><button id="hide">hide submit</button><button id="show">show submit</button><button id="arm">arm block</button><style></style><script>
+submit.onclick=async()=>{count.textContent=await(await fetch('/submit',{method:'POST',body:document.querySelector('input').value})).text()};
+hide.onclick=()=>document.styleSheets[0].insertRule('#submit {display:none}',0);
+show.onclick=()=>document.styleSheets[0].deleteRule(0);
+arm.onclick=async()=>{await fetch('/prepare');setTimeout(()=>{
+  const buffer=new SharedArrayBuffer(4), view=new Int32Array(buffer);
+  const worker=new Worker(URL.createObjectURL(new Blob(["onmessage=async({data})=>{await fetch(data.url);Atomics.store(new Int32Array(data.buffer),0,1)}"],{type:'text/javascript'})));
+  worker.postMessage({buffer,url:location.origin+'/release'});fetch('/entered');
+  while(Atomics.load(view,0)===0){} worker.terminate();
+},0)};
+</script>`,
     );
   }
 });
 await atomic("ledger", { submissions });
+await atomic("block", { entered: false });
 await new Promise((resolve) => server.listen(8765, "127.0.0.1", resolve));
 await atomic("ready", {
   pid: process.pid,

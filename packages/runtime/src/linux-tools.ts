@@ -195,7 +195,7 @@ export class LinuxToolsHost {
         inputSchema: linuxBrowserVerifySchema,
         readonly: true,
         description:
-          "在新操作中引用原 operationId/attemptId，读取真实页面状态或核对并导出持久下载；不会重放原输入。",
+          "在新操作中引用原 operationId/attemptId，读取真实页面状态或核对并导出下载当前文件；下载操作关联为启发式、因果未确认，不重放原输入。",
       },
     ].filter(
       (tool) =>

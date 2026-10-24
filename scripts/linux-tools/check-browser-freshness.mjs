@@ -7,6 +7,9 @@ import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import { BrowserComponent } from "./browser.mjs";
 import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const fixture = () => {
   let now = 0;
@@ -136,8 +139,11 @@ test(
       assert.equal(await f.component.isolate(), true);
     } finally {
       release.resolve();
-      await checked;
-      f.close();
+      try {
+        await checked;
+      } finally {
+        f.close();
+      }
     }
   },
 );
@@ -170,8 +176,11 @@ test(
       await checked;
     } finally {
       release.resolve();
-      await checked;
-      f.close();
+      try {
+        await checked;
+      } finally {
+        f.close();
+      }
     }
   },
 );
@@ -208,5 +217,67 @@ test("handoff closes the old download attribution window", async () => {
     assert.equal(file.generation, undefined);
   } finally {
     f.close();
+  }
+});
+
+test("a delayed A download correlated with latest B verifies file state without claiming B caused it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kaguya-download-"));
+  try {
+    const component = new BrowserComponent({ root });
+    component.service = { mode: "automation", generation: 0 };
+    component.lastInput = {
+      scope: "scope",
+      environmentId: "env",
+      frameId: "frame",
+      generation: 0,
+      controlEpoch: 0,
+      deadline: Date.now() + 30000,
+      operationId: "B",
+      attemptId: "attempt-B",
+    };
+    const id = "12345678-1234-4234-8234-123456789abc";
+    component.event({
+      method: "Browser.downloadWillBegin",
+      params: {
+        guid: id,
+        frameId: "frame",
+        url: "https://example.com/delayed-A.csv",
+        suggestedFilename: "A.csv",
+      },
+    });
+    const metadata = component.downloads.get(id);
+    assert.equal(metadata.operationId, "B");
+    assert.equal(metadata.association, "heuristic");
+    assert.equal(metadata.causalAttribution, "unconfirmed");
+    await mkdir(join(root, "downloads"));
+    const bytes = Buffer.from("A\n");
+    await writeFile(join(root, "downloads", id), bytes);
+    Object.assign(metadata, {
+      state: "completed",
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    const result = await component.exportDownload(
+      {
+        scope: "scope",
+        permit: { environmentId: "env" },
+        arguments: {
+          verificationKind: "current-file-state",
+          downloadId: id,
+          sha256: metadata.sha256,
+          original: { operationId: "B", attemptId: "attempt-B" },
+        },
+      },
+      { check() {} },
+    );
+    assert.equal(result.result.verificationKind, "current-file-state");
+    assert.equal(result.result.causalAttribution, "unconfirmed");
+    assert.equal(result.result.association, "heuristic");
+    assert.equal(
+      Buffer.from(result.artifacts[0].dataBase64, "base64").toString(),
+      "A\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

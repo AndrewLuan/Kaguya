@@ -78,6 +78,7 @@ export const linuxBrowserVerifySchema = z.discriminatedUnion("mode", [
     .object({
       ...observed,
       mode: z.literal("download"),
+      verificationKind: z.literal("current-file-state"),
       original: z.object({ operationId: text, attemptId: text }).strict(),
       downloadId: z.string().uuid(),
       sha256: z.string().regex(/^[a-f0-9]{64}$/),

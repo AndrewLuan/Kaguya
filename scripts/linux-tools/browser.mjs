@@ -524,6 +524,8 @@ export class BrowserComponent {
         state: "in-progress",
         startedAt: new Date().toISOString(),
         correlation: source ? "latest-input-window" : "unattributed",
+        association: source ? "heuristic" : "unattributed",
+        causalAttribution: "unconfirmed",
         ...source,
       };
       this.downloads.set(params.guid, metadata);
@@ -590,6 +592,8 @@ export class BrowserComponent {
 
   async exportDownload(req, permit) {
     const args = req.arguments;
+    if (args.verificationKind !== "current-file-state")
+      throw new Error("download-verification-kind-required");
     if (!uuid.test(args.downloadId)) throw new Error("download-id-invalid");
     await Promise.all([...this.downloadTasks]);
     const metadata = this.downloads.get(args.downloadId);
@@ -635,6 +639,9 @@ export class BrowserComponent {
         ...output(
           {
             original: args.original,
+            verificationKind: "current-file-state",
+            association: "heuristic",
+            causalAttribution: "unconfirmed",
             download: metadata,
             offset,
             bytesReturned: bytesRead,
