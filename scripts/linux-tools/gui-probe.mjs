@@ -5,19 +5,37 @@
  * 输入输出与副作用：证据写入可信 HOME，stdout 只含摘要；finally 等待 Driver 进程组消失。
  */
 import { mkdir, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
 import { CuaStdio } from "./cua-stdio.mjs";
 await mkdir("/home/tool/runtime", { mode: 0o700, recursive: true });
 const driver = new CuaStdio();
+const evidence = {};
 try {
-  const discovery = await driver.start();
-  const windows = await driver.call("list_windows", {});
-  const desktop = await driver.call("get_desktop_state", {
+  const discovery = (evidence.discovery = await driver.start());
+  const windows = (evidence.windows = await driver.call("list_windows", {}));
+  assert.notEqual(windows.isError, true);
+  assert.match(JSON.stringify(windows), /Kaguya GUI acceptance/);
+  const pid = Number(process.argv[2]);
+  assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  const window = (evidence.window = await driver.call("get_window_state", {
+    pid,
     max_image_dimension: 0,
-  });
-  await writeFile(
-    "/home/tool/gui-probe.json",
-    JSON.stringify({ discovery, windows, desktop }, null, 2),
-  );
+  }));
+  assert.notEqual(window.isError, true);
+  assert.match(JSON.stringify(window), /Unsaved text/);
+  assert.match(JSON.stringify(window), /Increment once/);
+  const desktop = (evidence.desktop = await driver.call("get_desktop_state", {
+    max_image_dimension: 0,
+  }));
+  assert.notEqual(desktop.isError, true);
+  for (const result of [window, desktop]) {
+    const image = result.content?.find((c) => c.type === "image");
+    assert.equal(image?.mimeType, "image/png");
+    const bytes = Buffer.from(image.data, "base64");
+    assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+    assert.ok(bytes.readUInt32BE(16) > 0 && bytes.readUInt32BE(16) <= 1280);
+    assert.ok(bytes.readUInt32BE(20) > 0 && bytes.readUInt32BE(20) <= 800);
+  }
   console.log(
     JSON.stringify({
       driver: driver.identity(),
@@ -41,5 +59,12 @@ try {
   console.error(driver.diagnostics);
   throw error;
 } finally {
-  await driver.stop();
+  try {
+    await writeFile(
+      "/home/tool/gui-probe.json",
+      JSON.stringify(evidence, null, 2),
+    );
+  } finally {
+    await driver.stop();
+  }
 }

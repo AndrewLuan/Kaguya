@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 import uuid
 
@@ -49,9 +50,9 @@ try:
             "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
             "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
             "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
-            "--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,uid=1001,gid=1001,mode=0711",
-            "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,uid=1001,gid=1001,mode=0700",
-            "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700", image)
+            "--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,mode=1777",
+            "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,mode=1777",
+            "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U", image)
     container = json.loads(command("inspect", name).stdout)[0]
     oci = json.loads(command("unshare", "/bin/cat", container["OCIConfigPath"]).stdout)
     assert oci["process"]["user"]["uid"] == 1000
@@ -60,15 +61,35 @@ try:
     assert oci["root"]["readonly"] is True
     command("exec", "--detach", "--user=1001:1001", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
     until(["exec", name, "/usr/bin/dbus-send", "--session", "--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
-    command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-fixture.py")
-    until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/gui-ledger.json"])
-    probe = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", timeout=120)
+    command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-fixture.py")
+    until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/session/gui-ledger.json"])
+    ledger = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
+    assert ledger["uid"] == 1001
+    probe = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"]), timeout=120)
     print(probe.stdout.decode(), flush=True)
     Path("gui-probe.json").write_bytes(command("exec", name, "/bin/cat", "/home/tool/gui-probe.json").stdout)
     Path("gui-packages.txt").write_bytes(command("exec", name, "/bin/cat", "/usr/share/kaguya-gui-packages.txt").stdout)
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
 finally:
-    logs = command("logs", name, check=False)
-    print(logs.stdout.decode(errors="replace"), flush=True)
-    print(logs.stderr.decode(errors="replace"), flush=True)
-    command("rm", "--force", "--ignore", name)
+    primary = sys.exc_info()[1]
+    cleanup_errors = []
+    for source, destination in [("/home/tool/gui-probe.json", "gui-probe.json"),
+                                ("/usr/share/kaguya-gui-packages.txt", "gui-packages.txt")]:
+        try:
+            value = command("exec", name, "/bin/cat", source, check=False)
+            if value.returncode == 0:
+                Path(destination).write_bytes(value.stdout)
+        except Exception as error:
+            cleanup_errors.append(error)
+    try:
+        logs = command("logs", name, check=False)
+        print(logs.stdout.decode(errors="replace"), flush=True)
+        print(logs.stderr.decode(errors="replace"), flush=True)
+    except Exception as error:
+        cleanup_errors.append(error)
+    try:
+        command("rm", "--force", "--ignore", name)
+    except Exception as error:
+        cleanup_errors.append(error)
+    if cleanup_errors:
+        raise BaseExceptionGroup("gui fixture cleanup failed", ([primary] if primary else []) + cleanup_errors)

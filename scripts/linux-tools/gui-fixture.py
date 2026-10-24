@@ -2,7 +2,7 @@
 """功能概述：Linux CI 的真实 GTK 合成窗口，作为截图/AX/输入的独立应用证据。
 主要职责：提供未保存文本框和计数按钮；每次 GTK 事件写入应用 UID 的 ledger。
 代码库关系：check-gui-container.py 仅以 UID1001 启动；不访问控制 socket 或模型。
-输入输出与副作用：固定合成内容写 /home/app/gui-ledger.json，窗口关闭退出。
+输入输出与副作用：固定合成内容写 /home/app/session/gui-ledger.json，窗口关闭退出。
 """
 import json
 import os
@@ -24,7 +24,7 @@ count = 0
 
 
 def save(*_args):
-    Path("/home/app/gui-ledger.json").write_text(json.dumps({"uid": os.getuid(), "pid": os.getpid(), "text": entry.get_text(), "count": count}))
+    Path("/home/app/session/gui-ledger.json").write_text(json.dumps({"uid": os.getuid(), "pid": os.getpid(), "text": entry.get_text(), "count": count}))
 
 
 def increment(_button):

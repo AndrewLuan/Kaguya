@@ -5,14 +5,21 @@
 输入输出与副作用：只接受镜像内固定程序；子进程异常使会话失败，SIGTERM 回收本会话子进程。
 """
 import os
+from pathlib import Path
 import signal
 import subprocess
 import time
 
 if os.getuid() != 1001:
     raise RuntimeError("gui-app-uid-required")
-os.environ.update(HOME="/home/app", DISPLAY=":99", XDG_RUNTIME_DIR="/run/kaguya-app",
-                  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/kaguya-app/session-bus",
+for directory, mode in [("/home/app/session", 0o700), ("/run/kaguya-app/session", 0o711)]:
+    path = Path(directory)
+    path.mkdir(mode=mode, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or info.st_uid != 1001 or info.st_mode & 0o022:
+        raise RuntimeError("unsafe-app-session-directory")
+os.environ.update(HOME="/home/app/session", DISPLAY=":99", XDG_RUNTIME_DIR="/run/kaguya-app/session",
+                  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/kaguya-app/session/bus",
                   GTK_MODULES="gail:atk-bridge", NO_AT_BRIDGE="0", GTK_A11Y="always")
 children = []
 

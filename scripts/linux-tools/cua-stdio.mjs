@@ -33,7 +33,7 @@ export class CuaStdio {
           PATH: "/usr/local/bin:/usr/bin:/bin",
           HOME: "/home/tool",
           DISPLAY: ":99",
-          DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/kaguya-app/session-bus",
+          DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/kaguya-app/session/bus",
           XDG_RUNTIME_DIR: "/home/tool/runtime",
           CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
           DO_NOT_TRACK: "1",
