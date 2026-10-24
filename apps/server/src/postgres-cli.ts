@@ -41,6 +41,7 @@ export const POSTGRES_TEST_FILES = [
   "packages/database/src/postgres-reliable.test.ts",
   "packages/database/src/memory-graph.test.ts",
   "packages/database/src/native-memory.test.ts",
+  "packages/database/src/native-memory-revisions.test.ts",
   "packages/database/src/web-conversation-storage.test.ts",
   "packages/database/src/one-shot-schedule-repository.test.ts",
   "packages/database/src/model-request-metrics.test.ts",

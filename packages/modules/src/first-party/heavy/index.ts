@@ -1090,25 +1090,27 @@ export function createHeavyModule<
                   const selectedCandidates = candidates.filter((n) =>
                     request.payload.candidateIds.includes(n.id),
                   );
-                  snapshot = await (memory.recall ?? memory.freeze).call(
-                    memory,
-                    {
-                      scope: base.scope,
-                      owners: [
-                        ...new Set([
-                          ...base.owners,
-                          ...selectedCandidates.map((n) => n.metadata.ownerId),
-                        ]),
-                      ],
-                      asOf: base.frozenAt,
-                      people: base.people,
-                      participants: base.participants,
-                      query: request.payload.query,
-                      explicitIds: request.payload.candidateIds.filter((id) =>
-                        candidates.some((n) => n.id === id),
-                      ),
-                    },
-                  );
+                  snapshot = !base.cutoff
+                    ? base
+                    : await (memory.recall ?? memory.freeze).call(memory, {
+                        scope: base.scope,
+                        owners: [
+                          ...new Set([
+                            ...base.owners,
+                            ...selectedCandidates.map(
+                              (n) => n.metadata.ownerId,
+                            ),
+                          ]),
+                        ],
+                        asOf: base.frozenAt,
+                        cutoff: base.cutoff,
+                        people: base.people,
+                        participants: base.participants,
+                        query: request.payload.query,
+                        explicitIds: request.payload.candidateIds.filter((id) =>
+                          candidates.some((n) => n.id === id),
+                        ),
+                      });
                   status = "completed";
                 } catch {
                   status = "failed";

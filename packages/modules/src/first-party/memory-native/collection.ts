@@ -1,5 +1,8 @@
-/** Resolve only explicit source references. Collection never reads another module's private storage. */
-/** Resolve only explicit source references. Collection never reads another module's private storage. */
+/**
+ * 功能概述：沿明确账本引用选择 Memory 来源、参与者和原批次恢复事实。
+ * 主要职责：sourceSelector 还原调度上下文；sourceParticipants 保留未知归属；恢复只读取原请求和终态。
+ * 代码库关系：通过 SDK ledger selector 访问证据，不读取其他模块的私有存储。
+ */
 import { defineInformationSelector } from "@kaguya/sdk";
 import { oneShotDueInformationKind } from "@kaguya/scheduler";
 export const sourceSelector = defineInformationSelector({
@@ -106,3 +109,28 @@ export async function sourceParticipants(
     }),
   ];
 }
+
+/** 恢复只读取原批次的已持久请求与终态，不能用当前模型重新生成历史成功。 */
+export const recoveryFormationSelector = defineInformationSelector({
+  selectorId: "memory.native.recovery-formation",
+  select: async ({ sourceAtom, ledger }) => {
+    const requests = await ledger.find({
+      kinds: ["memory.native.formation.requested.v1"],
+      payloadContains: { batchId: String(sourceAtom.payload.batchId) },
+      limit: 1,
+    });
+    if (!requests[0]) return [];
+    const results = await ledger.related({
+      from: [requests[0].informationId],
+      relation: "core:status-of",
+      direction: "incoming",
+      limit: 100,
+    });
+    return [
+      requests[0].informationId,
+      ...results
+        .filter((a) => a.kind === "memory.native.formation.completed.v1")
+        .map((a) => a.informationId),
+    ];
+  },
+});
