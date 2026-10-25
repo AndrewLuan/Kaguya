@@ -30,7 +30,11 @@ describe("Linux native shell registry", () => {
             environmentId: "desktop",
             workflowId: "gui-flow",
             gui: true,
-            guiModel: {routeId: "gui.approved", providerId: "vision", modelId: "gui"},
+            guiModel: {
+              routeId: "gui.approved",
+              providerId: "vision",
+              modelId: "gui",
+            },
           },
         ],
       },
@@ -39,8 +43,28 @@ describe("Linux native shell registry", () => {
       }),
     );
     try {
-      expect(host.snapshot().nativeTools.modelRoutes).toEqual([{scope: "gui-scope", definitionId: "agent.heavy",
-        taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy", routeId: "gui.approved"}}]);
+      expect(host.snapshot().nativeTools.guiTasks?.bindings).toEqual([
+        {
+          scope: "gui-scope",
+          environmentId: "desktop",
+          workflowId: "gui-flow",
+          routeId: "gui.approved",
+          revision: "gui-one",
+        },
+      ]);
+      expect(host.snapshot().nativeTools.tasks).toEqual([
+        {
+          definitionId: "agent.heavy",
+          taskId: "agent.heavy.respond",
+          toolIds: ["shell.exec"],
+        },
+        {
+          definitionId: "agent.heavy",
+          taskId: "agent.gui.execute",
+          routeId: "gui.approved",
+          toolIds: ["gui.observe", "gui.act", "gui.verify"],
+        },
+      ]);
       const registrations = host.snapshot().nativeTools.registrations;
       expect(registrations.map((tool) => tool.id)).toEqual([
         "shell.exec",

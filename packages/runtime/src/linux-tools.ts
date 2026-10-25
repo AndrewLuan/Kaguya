@@ -1,5 +1,5 @@
 /**
- * guiModel 显式选定 scope 的模型路由；原生 GUI bind 要求此配置，人工控制仍独立使用已配置桌面。
+ * guiModel 显式选定独立 GUI 任务的模型路由；原生 GUI bind 要求此配置，人工控制仍独立使用已配置桌面。
  * readArtifact 只允许绑定环境与 scope，并向原生循环提供归档 blob，无截图副作用。
  * 功能概述：把显式宿主配置的 Linux shell/Chromium/GUI 工具接入 W4 原生目录和 W3/W6 执行边界。
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
@@ -76,7 +76,10 @@ export const linuxToolsConfigurationSchema = z
             workflowId: text,
             browser: z.boolean().optional(),
             gui: z.boolean().optional(),
-            guiModel: z.object({routeId: text, providerId: text, modelId: text}).strict().optional(),
+            guiModel: z
+              .object({ routeId: text, providerId: text, modelId: text })
+              .strict()
+              .optional(),
           })
           .strict(),
       )
@@ -85,8 +88,10 @@ export const linuxToolsConfigurationSchema = z
   .strict()
   .refine(
     (v) =>
-      v.bindings.every(b => !b.guiModel || b.gui === true) &&
-      new Set(v.bindings.flatMap(b => b.guiModel ? [b.guiModel.routeId] : [])).size === v.bindings.filter(b => b.guiModel).length &&
+      v.bindings.every((b) => !b.guiModel || b.gui === true) &&
+      new Set(
+        v.bindings.flatMap((b) => (b.guiModel ? [b.guiModel.routeId] : [])),
+      ).size === v.bindings.filter((b) => b.guiModel).length &&
       new Set(v.bindings.map((b) => b.scope)).size === v.bindings.length &&
       new Set(v.bindings.map((b) => b.environmentId)).size ===
         v.bindings.length,
@@ -353,14 +358,59 @@ export class LinuxToolsHost {
       (tool) =>
         tool.id === "shell.exec" ||
         this.configuration.bindings.some((b) =>
-          tool.id.startsWith("gui.") ? b.gui === true && Boolean(b.guiModel) : b.browser === true,
+          tool.id.startsWith("gui.")
+            ? b.gui === true && Boolean(b.guiModel)
+            : b.browser === true,
         ),
     );
     const tools: NativeToolLoopOptions = {
-      modelRoutes: this.configuration.bindings.flatMap(b => b.guiModel ? [{scope: b.scope,
-        definitionId: "agent.heavy", taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy" as const, routeId: b.guiModel.routeId}}] : []),
-      readArtifact: ({id, scope, environmentId}) => {
-        if (!this.configuration.bindings.some(b => b.gui && b.scope === scope && b.environmentId === environmentId))
+      guiTasks: {
+        bindings: this.configuration.bindings.flatMap((b) =>
+          b.guiModel
+            ? [
+                {
+                  environmentId: b.environmentId,
+                  scope: b.scope,
+                  workflowId: b.workflowId,
+                  routeId: b.guiModel.routeId,
+                  revision: this.configuration.revision,
+                },
+              ]
+            : [],
+        ),
+        inspect: (environmentId) => this.inspect(environmentId),
+        validate: async (input) => {
+          if (
+            this.closed ||
+            this.unavailable.has(input.scope) ||
+            this.manualBlocked.has(input.environmentId) ||
+            !this.configuration.bindings.some(
+              (b) =>
+                b.gui &&
+                b.guiModel &&
+                b.environmentId === input.environmentId &&
+                b.scope === input.scope &&
+                b.workflowId === input.workflowId,
+            )
+          )
+            return false;
+          try {
+            const state = await this.inspect(input.environmentId);
+            return (
+              state.state === "ready" && state.generation === input.generation
+            );
+          } catch {
+            return false;
+          }
+        },
+      },
+      readArtifact: ({ id, scope, environmentId }) => {
+        if (
+          !this.configuration.bindings.some(
+            (b) =>
+              b.gui && b.scope === scope && b.environmentId === environmentId,
+          )
+        )
           throw new Error("native-image-scope-denied");
         return this.client.readArtifact(id, scope, environmentId);
       },
@@ -421,8 +471,24 @@ export class LinuxToolsHost {
             {
               definitionId: "agent.heavy",
               taskId: "agent.heavy.respond",
-              toolIds: declarations.map((tool) => tool.id),
+              toolIds: declarations
+                .filter((tool) => !tool.id.startsWith("gui."))
+                .map((tool) => tool.id),
             },
+            ...this.configuration.bindings.flatMap((b) =>
+              b.guiModel
+                ? [
+                    {
+                      definitionId: "agent.heavy",
+                      taskId: "agent.gui.execute",
+                      routeId: b.guiModel.routeId,
+                      toolIds: declarations
+                        .filter((tool) => tool.id.startsWith("gui."))
+                        .map((tool) => tool.id),
+                    },
+                  ]
+                : [],
+            ),
           ]
         : [],
     };

@@ -1,6 +1,6 @@
 /**
  * 功能概述：Linux GUI 的管理 HTTP 边界，复用 Gateway management 认证与已有 LinuxToolsHost。
- * 主要职责：注册状态、双向接管、人工观察/输入/核对、续期/关闭及原图读取；scope 从宿主配置取得。
+ * 主要职责：严格校验独立 GUI 任务的提交/查询/取消，复用 GuiTaskService 持久执行；注册状态、双向接管、人工观察/输入/核对、续期/关闭及原图读取；scope 从宿主配置取得。
  * 代码库关系：mcp-host.ts 随现有 HTTP 生命周期注册，宿主 client 持有会话秘密，broker 负责持久身份及排空。
  * 输入输出与副作用：浏览器只持公开 sessionId/generation；写请求严格校验，回执丢失只查询原 operation。
  * 图像路由要求同样 Bearer 认证并设置 no-store，不提供 URL 凭证；错误不回显参数或内部异常。
@@ -8,7 +8,11 @@
 import { createHash } from "node:crypto";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "@kaguya/schema";
-import type { LinuxToolsHost } from "@kaguya/runtime";
+import {
+  guiTaskInputSchema,
+  type GuiTaskService,
+  type LinuxToolsHost,
+} from "@kaguya/runtime";
 import type { GatewayAuthenticator } from "./gateway-auth.js";
 
 const id = z.string().min(1).max(200);
@@ -36,6 +40,7 @@ export function registerLinuxEnvironmentRoutes(
   app: FastifyInstance,
   getHost: () => LinuxToolsHost | undefined,
   auth: GatewayAuthenticator,
+  getGuiTasks?: () => GuiTaskService | undefined,
 ) {
   const options = {
     onRequest: async (request: FastifyRequest, reply: FastifyReply) => {
@@ -48,6 +53,81 @@ export function registerLinuxEnvironmentRoutes(
     },
   };
   const prefix = "/api/v1/environments/:environmentId";
+  const taskParams = paramsSchema
+    .extend({ taskRequestId: z.string().uuid() })
+    .strict();
+  const taskError = (reply: FastifyReply, error: unknown) => {
+    const reason = error instanceof Error ? error.message : "";
+    if (reason === "gui-task-not-found")
+      return reply.code(404).send({ error: reason });
+    const publicReasons = [
+      "gui-task-id-conflict",
+      "gui-task-unavailable",
+      "gui-environment-unavailable",
+      "gui-observation-required",
+    ];
+    return reply.code(409).send({
+      error: publicReasons.includes(reason) ? reason : "gui-task-unconfirmed",
+    });
+  };
+  app.post(`${prefix}/tasks`, options, async (request, reply) => {
+    const params = paramsSchema.safeParse(request.params),
+      input = guiTaskInputSchema.safeParse(request.body);
+    if (!params.success || !input.success)
+      return reply.code(400).send({ error: "gui-task-request-invalid" });
+    const service = getGuiTasks?.();
+    if (!service)
+      return reply.code(503).send({ error: "gui-task-unavailable" });
+    try {
+      return reply
+        .code(202)
+        .send(await service.submit(params.data.environmentId, input.data));
+    } catch (error) {
+      return taskError(reply, error);
+    }
+  });
+  app.get(`${prefix}/tasks/:taskRequestId`, options, async (request, reply) => {
+    const params = taskParams.safeParse(request.params);
+    if (!params.success)
+      return reply.code(400).send({ error: "gui-task-request-invalid" });
+    const service = getGuiTasks?.();
+    if (!service)
+      return reply.code(503).send({ error: "gui-task-unavailable" });
+    try {
+      return await service.read(
+        params.data.environmentId,
+        params.data.taskRequestId,
+      );
+    } catch (error) {
+      return taskError(reply, error);
+    }
+  });
+  app.post(
+    `${prefix}/tasks/:taskRequestId/cancel`,
+    options,
+    async (request, reply) => {
+      const params = taskParams.safeParse(request.params);
+      if (
+        !params.success ||
+        !z
+          .object({})
+          .strict()
+          .safeParse(request.body ?? {}).success
+      )
+        return reply.code(400).send({ error: "gui-task-request-invalid" });
+      const service = getGuiTasks?.();
+      if (!service)
+        return reply.code(503).send({ error: "gui-task-unavailable" });
+      try {
+        return await service.cancel(
+          params.data.environmentId,
+          params.data.taskRequestId,
+        );
+      } catch (error) {
+        return taskError(reply, error);
+      }
+    },
+  );
   app.get("/api/v1/environments", options, async (_request, reply) => {
     const host = getHost();
     if (!host)

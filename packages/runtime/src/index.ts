@@ -53,3 +53,9 @@ export {
   linuxGuiActSchema,
   linuxGuiVerifySchema,
 } from "./linux-gui.js";
+
+export {
+  GuiTaskService,
+  guiTaskInputSchema,
+  type GuiTaskHost,
+} from "./gui-tasks.js";

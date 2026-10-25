@@ -14,6 +14,7 @@
  * 代码库关系：依赖 Database、Core、ModuleHost 和平台适配契约；具体 Agent 列表与 LLM 模型绑定位于 apps composition root。
  * 输入输出与副作用：连接、迁移、账本写入和 transport I/O 均在生命周期内执行；close 拒绝新入口并停止可靠领取。
  * 数据库初始化错误脱敏；只关闭自行创建的连接。submit 的 deliveries 是当次实际收集快照，可靠链通常异步完成。
+ * guiTasks 仅向管理 Server 提供独立任务入口；私有 WeakMap 复用同一个 NativeToolLoop，模块不能提交 GUI 任务或 native 内部字段。
  * nativeTools 可选注入宿主工具目录，经批准任务协调持久原生循环；独立 route 不替换 Heavy 全局模型。
  * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
  * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
@@ -131,6 +132,9 @@ import {
   modelTaskSelectionPolicySchema,
   modelTaskInformationKinds,
 } from "./information-kinds.js";
+
+import { GuiTaskService } from "./gui-tasks.js";
+const hostNativeLoops = new WeakMap<ModelTaskClient, NativeToolLoop>();
 
 export interface RuntimeModelTaskApproval {
   readonly activation: ModuleActivationProvenance;
@@ -352,6 +356,10 @@ export class KaguyaRuntime implements InformationIngress {
   #hostCapabilities: readonly ModuleCapabilityImplementation[] = [];
   #memoryOptions: RuntimeMemoryOptions = { enabled: false };
   #nativeAccess: NativeMemoryAccess | undefined;
+  #guiTasks: GuiTaskService | undefined;
+  get guiTasks(): GuiTaskService | undefined {
+    return this.#state === "started" ? this.#guiTasks : undefined;
+  }
   #actionExecutor: ActionExecutor | undefined;
   get actions(): ActionExecutor {
     return required(this.#actionExecutor, "action executor");
@@ -791,6 +799,21 @@ export class KaguyaRuntime implements InformationIngress {
       ];
 
       this.#hostCapabilities = capabilities;
+      const modelClient = capabilities.find(
+        (c) => c.capability.id === modelTaskCapability.id,
+      )?.value;
+      const nativeLoop =
+        modelClient instanceof ModelTaskClient
+          ? hostNativeLoops.get(modelClient)
+          : undefined;
+      if (nativeLoop)
+        this.#guiTasks = new GuiTaskService({
+          db: database,
+          core,
+          loop: nativeLoop,
+          host: nativeOptions.nativeTools?.guiTasks,
+          activations: this.options.activations,
+        });
       this.#memoryOptions = this.options.memory ?? { enabled: false };
       const moduleHost = new ModuleHost({
         drainTimeoutMs: this.options.drainTimeoutMs ?? 5000,
@@ -1502,7 +1525,8 @@ class ApprovedModelTaskClient extends ModelTaskClient {
         ...native,
         core: options.core,
         resolveModel: (request) => {
-          if (!this.approved(request)) throw new Error("Unapproved native model route");
+          if (!this.approved(request))
+            throw new Error("Unapproved native model route");
           return options.resolveModel(request.selectionPolicy);
         },
         model: {
@@ -1510,6 +1534,7 @@ class ApprovedModelTaskClient extends ModelTaskClient {
           cancel: (request) => super.cancel(request),
         },
       });
+    if (this.#loop) hostNativeLoops.set(this, this.#loop);
     this.#approvals = approvals.map(
       ({ activation, selectionPolicy, taskId }) => ({
         ...(taskId ? { taskId } : {}),
@@ -1527,20 +1552,33 @@ class ApprovedModelTaskClient extends ModelTaskClient {
       : super.cancel(request);
   }
   private approved(request: ModelTaskRequest<unknown>) {
-    return this.#approvals.some(({activation, selectionPolicy, taskId}) =>
-      activation.instanceId === request.activation.instanceId &&
-      activation.definitionId === request.activation.definitionId &&
-      selectionPolicy.tier === request.selectionPolicy.tier &&
-      selectionPolicy.routeId === request.selectionPolicy.routeId &&
-      (!selectionPolicy.routeId || taskId === request.task.taskId) &&
-      (!taskId || taskId === request.task.taskId));
+    return this.#approvals.some(
+      ({ activation, selectionPolicy, taskId }) =>
+        activation.instanceId === request.activation.instanceId &&
+        activation.definitionId === request.activation.definitionId &&
+        selectionPolicy.tier === request.selectionPolicy.tier &&
+        selectionPolicy.routeId === request.selectionPolicy.routeId &&
+        (!selectionPolicy.routeId || taskId === request.task.taskId) &&
+        (!taskId || taskId === request.task.taskId),
+    );
   }
   override async execute<TOutput>(request: ModelTaskRequest<TOutput>) {
+    if (request.task?.taskId === "agent.gui.execute")
+      throw new Error("GUI tasks require the host management entry");
+    if (request.nativeStep || request.nativeModelBinding)
+      throw new Error("Native step fields are reserved for the host");
     // 恢复必须先查稳定原点；关闭 native 或删除路由不会降级成普通新请求。
-    if (request.task?.taskId && request.sourceInformationId && await this.#loop?.existing(request)) return this.#loop!.execute(request);
+    if (
+      request.task?.taskId &&
+      request.sourceInformationId &&
+      (await this.#loop?.existing(request))
+    )
+      return this.#loop!.execute(request);
     if (!this.approved(request))
       throw new Error("Model task activation or policy is not approved");
-    return this.#loop?.enabled(request) ? this.#loop.execute(request) : super.execute(request);
+    return this.#loop?.enabled(request)
+      ? this.#loop.execute(request)
+      : super.execute(request);
   }
 }
 
@@ -1583,7 +1621,9 @@ function composeModelTaskCapabilities(
         {
           ...options.modelTask,
           ...context,
-          ...(options.nativeTools?.readArtifact ? {readNativeArtifact: options.nativeTools.readArtifact} : {}),
+          ...(options.nativeTools?.readArtifact
+            ? { readNativeArtifact: options.nativeTools.readArtifact }
+            : {}),
           ...(native
             ? {
                 admitNativeDispatch: (id, step) =>
@@ -1598,7 +1638,10 @@ function composeModelTaskCapabilities(
         },
         approvals,
         native
-          ? { ...native, options: options.nativeTools ?? {registrations: [], tasks: []} }
+          ? {
+              ...native,
+              options: options.nativeTools ?? { registrations: [], tasks: [] },
+            }
           : undefined,
       ),
     });

@@ -77,7 +77,7 @@ export function mergeLinuxTools<
     nativeTools: {
       ...composition.nativeTools,
       readArtifact: linux.nativeTools.readArtifact,
-      modelRoutes: [...(composition.nativeTools?.modelRoutes ?? []), ...(linux.nativeTools.modelRoutes ?? [])],
+      guiTasks: linux.nativeTools.guiTasks,
       registrations: [
         ...(composition.nativeTools?.registrations ?? []),
         ...linux.nativeTools.registrations,

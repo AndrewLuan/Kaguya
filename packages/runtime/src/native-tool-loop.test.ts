@@ -5,7 +5,11 @@
  * 同一用例检查实际 requested、dispatch、call→intent→receipt、下一步 messages 与停止状态。
  * barrier 控制取消/重启窗口；恢复复用持久证据，清理释放所有后台任务后关闭 Core 和数据库。
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { crc32 } from "node:zlib";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   createTestingDatabase,
@@ -42,6 +46,8 @@ import {
 } from "./native-tool-loop.js";
 import { createNativeMemoryTools } from "./native-memory-tools.js";
 import { ActionExecutor } from "./action.js";
+import { GuiTaskService } from "./gui-tasks.js";
+import { guiTaskRequestedKind, guiTaskTerminalKind } from "./gui-task-kinds.js";
 const url = process.env.KAGUYA_TEST_DATABASE_URL;
 if (process.env.KAGUYA_REQUIRE_POSTGRES_TESTS === "1" && !url)
   throw new Error("PostgreSQL test URL required");
@@ -64,7 +70,14 @@ const sourceKind = defineInformationKind({
   displayName: "原生测试来源",
   description: "宿主持久来源",
   payloadSchema: z
-    .object({ turn: z.object({ claimInformationId: z.string() }).strict() })
+    .object({
+      turn: z
+        .object({
+          claimInformationId: z.string(),
+          candidateInformationId: z.string().exactOptional(),
+        })
+        .strict(),
+    })
     .strict(),
   references: {
     "core:context": {
@@ -92,7 +105,14 @@ const call = (id: string, tool = "test.tool", input: unknown = {}) =>
   }) as NativeToolCall;
 async function fixture(
   postgres: boolean,
-  options: { budget?: any; memory?: boolean; noMemory?: boolean; guiRoute?: "matching" | "other" } = {},
+  options: {
+    budget?: any;
+    memory?: boolean;
+    noMemory?: boolean;
+    guiRoute?: "matching" | "other";
+    guiImage?: boolean;
+    largeGuiImage?: boolean;
+  } = {},
 ) {
   const pg = postgres
     ? await createPostgresTestingDatabaseScope(url!)
@@ -200,6 +220,8 @@ async function fixture(
   ])
     registry.register(kind);
   registry.register(sourceKind);
+  registry.register(guiTaskRequestedKind);
+  registry.register(guiTaskTerminalKind);
   let core = new InformationCore({
     registry,
     store: db.information,
@@ -214,7 +236,12 @@ async function fixture(
     references: [],
   });
   const source = await core.register(sourceKind, {
-    payload: { turn: { claimInformationId: actionRun } },
+    payload: {
+      turn: {
+        claimInformationId: actionRun,
+        candidateInformationId: actionRun,
+      },
+    },
     source: "test:native",
     occurredAt: new Date().toISOString(),
     references: [
@@ -229,7 +256,10 @@ async function fixture(
       allowedTiers: ["heavy"],
     },
     activation: { instanceId: "heavy", definitionId: "agent.heavy" },
-    selectionPolicy: { tier: "heavy" },
+    selectionPolicy:
+      options.guiRoute === "matching"
+        ? { tier: "heavy", routeId: "gui.approved" }
+        : { tier: "heavy" },
     sourceInformationId: source.informationId,
     contextInformationId: context.informationId,
     contextAtoms: [source],
@@ -241,6 +271,47 @@ async function fixture(
       variables: [],
     },
   };
+  const archive = options.guiImage
+    ? await mkdtemp(join(tmpdir(), "kaguya-native-image-"))
+    : undefined;
+  if (archive)
+    cleanups.push(() => rm(archive, { recursive: true, force: true }));
+  let png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jK1EAAAAASUVORK5CYII=",
+    "base64",
+  );
+  if (options.largeGuiImage) {
+    const data = Buffer.from("padding\0" + "a".repeat(80_000));
+    const chunk = Buffer.alloc(data.length + 12);
+    chunk.writeUInt32BE(data.length, 0);
+    chunk.write("tEXt", 4);
+    data.copy(chunk, 8);
+    chunk.writeUInt32BE(crc32(chunk.subarray(4, -4)), chunk.length - 4);
+    png = Buffer.concat([png.subarray(0, -12), chunk, png.subarray(-12)]);
+  }
+  let archiveReads = 0;
+  const readArchive = async (reference: {
+    id: string;
+    scope: string;
+    environmentId: string;
+  }) => {
+    if (!archive) throw new Error("no synthetic archive");
+    expect(reference).toEqual({
+      id: "original-png",
+      scope,
+      environmentId: "synthetic-desktop",
+    });
+    archiveReads++;
+    return {
+      artifact: JSON.parse(
+        await readFile(join(archive, "metadata.json"), "utf8"),
+      ),
+      dataBase64: (await readFile(join(archive, "original.png"))).toString(
+        "base64",
+      ),
+    };
+  };
+  let rawModel: ModelTaskClient;
   let effects = 0,
     providerCalls = 0,
     requests: any[] = [];
@@ -249,7 +320,9 @@ async function fixture(
     return outcome;
   };
   let generate = async (_request: any): Promise<NativeToolCall[] | string> =>
-    requests.length === 1 ? [call("call-1")] : "完成";
+    requests.length === 1
+      ? [call("call-1", options.guiImage ? "gui.observe" : "test.tool")]
+      : "完成";
   const provider: ActionProvider = {
     id: "test",
     version: "1",
@@ -258,17 +331,61 @@ async function fixture(
       idempotency: "operation",
       reconciliation: false,
       successEvidence: "effect-verified",
-      fencing: "none",
+      fencing: options.guiImage ? "environment" : "none",
     },
-    execute: () => {
+    execute: async (input) => {
       providerCalls++;
-      return behavior();
+      const result = await behavior();
+      if (!archive) return result;
+      const hash = createHash("sha256").update(png).digest("hex");
+      const artifact = {
+        id: "original-png",
+        hash,
+        mime: "image/png",
+        size: png.length,
+        scope,
+        actionId: input.intentId,
+        generation: 1,
+        observedAt: "2026-10-25T00:00:00.000Z",
+        source: "environment-helper",
+        retention: "explicit-delete-only",
+      };
+      await writeFile(join(archive, "original.png"), png);
+      await writeFile(join(archive, "metadata.json"), JSON.stringify(artifact));
+      return {
+        ...result,
+        artifacts: [artifact],
+        result: {
+          observation: {
+            id: "a".repeat(64),
+            environmentId: "synthetic-desktop",
+            workflowId: "synthetic",
+            generation: 1,
+          },
+          image: {
+            captureId: "original-capture",
+            coordinateFrame: "window",
+            width: 1,
+            height: 1,
+            originalWidth: 1,
+            originalHeight: 1,
+            scale: 1,
+            origin: { x: 27, y: 41 },
+            target: { kind: "window", pid: 1, windowId: 2 },
+            sha256: hash,
+            mime: "image/png",
+            capturedAt: "2026-10-25T00:00:00.000Z",
+            serviceInstanceId: "service",
+            driverInstanceId: "driver",
+          },
+        },
+      };
     },
     cancel: async () => undefined,
   };
   let environmentValidation: (() => boolean) | undefined;
   const tool: NativeToolRegistration = {
-    id: "test.tool",
+    id: options.guiImage ? "gui.observe" : "test.tool",
     version: "1",
     description: "受控测试工具",
     inputSchema: z.object({}).strict(),
@@ -278,30 +395,72 @@ async function fixture(
     policyVersion: "1",
     readonly: false,
     independent: false,
-    bind: async () => ({ target: { resource: "test" } }),
+    bind: async () => ({
+      target: { resource: "test" },
+      ...(options.guiImage
+        ? {
+            environment: {
+              environmentId: "synthetic-desktop",
+              generation: 1,
+              workspaceId: "workspace",
+              resourceIds: [],
+              workflowId: "synthetic",
+              leaseId: "lease",
+              fencing: "1",
+              expiresAt: new Date(Date.now() + 120000).toISOString(),
+            },
+          }
+        : {}),
+    }),
     authorize: async () => true,
   };
   let executor: ActionExecutor;
-  let modelIdentity = { providerId: "test", modelId: "native", configurationDigest: "a".repeat(64) };
+  let modelIdentity = {
+    providerId: "test",
+    modelId: "native",
+    configurationDigest: "a".repeat(64),
+  };
   let nativeEnabled = true;
   let routeAvailable = true;
+  let guiState = "ready",
+    guiGeneration = 1;
+  const guiHost = {
+    bindings: [
+      {
+        environmentId: "synthetic-desktop",
+        scope,
+        workflowId: "synthetic",
+        routeId: "gui.approved",
+        revision: "one",
+      },
+    ],
+    inspect: async () => ({ state: guiState, generation: guiGeneration }),
+    validate: async (input: { generation: number }) =>
+      guiState === "ready" && input.generation === guiGeneration,
+  };
   const createLoop = () => {
     const memoryTools = options.memory
       ? createNativeMemoryTools(db)
       : undefined;
     executor = new ActionExecutor({
       store: db.actions,
-      resolveLeaseCredential: async () => ({ token: "synthetic" }),
+      resolveLeaseCredential: async () => ({
+        token: "private-lease-token-for-test",
+      }),
       validateEnvironment: async (_i, mode) =>
         mode !== "result" || !environmentValidation || environmentValidation(),
       providers: [provider, ...(memoryTools ? [memoryTools.provider] : [])],
     });
     cleanups.push(() => executor.close());
-    const model = new ModelTaskClient({
+    const model = (rawModel = new ModelTaskClient({
+      readNativeArtifact: readArchive,
       core,
       renderStructuredOutputPrompt:
         createStructuredOutputPromptRenderer("{{json_schema}}"),
-      resolveModel: () => { if (!routeAvailable) throw new Error("route deleted"); return modelIdentity; },
+      resolveModel: () => {
+        if (!routeAvailable) throw new Error("route deleted");
+        return modelIdentity;
+      },
       admitNativeDispatch: (id, step) =>
         db.nativeTools.admitModel(
           step.runInformationId,
@@ -347,33 +506,71 @@ async function fixture(
               };
         },
       } as any,
-    });
+    }));
     return new NativeToolLoop({
       db,
       core,
       actions: executor,
       model,
-      resolveModel: () => { if (!routeAvailable) throw new Error("route deleted"); return modelIdentity; },
+      resolveModel: () => {
+        if (!routeAvailable) throw new Error("route deleted");
+        return modelIdentity;
+      },
       options: {
+        readArtifact: readArchive,
+        guiTasks: guiHost,
         registrations: [tool, ...(memoryTools?.registrations ?? [])],
-        tasks: nativeEnabled ? [
-          {
-            taskId: request.task.taskId,
-            definitionId: "agent.heavy",
-            toolIds: [
-              tool.id,
-              ...(memoryTools?.registrations.map((t) => t.id) ?? []),
-            ],
-          },
-        ] : [],
+        tasks: nativeEnabled
+          ? [
+              {
+                taskId: request.task.taskId,
+                definitionId: "agent.heavy",
+                ...(request.selectionPolicy.routeId
+                  ? { routeId: request.selectionPolicy.routeId }
+                  : {}),
+                toolIds: [
+                  tool.id,
+                  ...(memoryTools?.registrations.map((t) => t.id) ?? []),
+                ],
+              },
+              {
+                definitionId: "agent.heavy",
+                taskId: "agent.gui.execute",
+                routeId: "gui.approved",
+                toolIds: [tool.id],
+              },
+            ]
+          : [],
         budget: options.budget,
-        modelRoutes: options.guiRoute ? [{scope: options.guiRoute === "matching" ? scope : "other",
-          definitionId: "agent.heavy", taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy", routeId: "gui.approved"}}] : [],
       },
     });
   };
   let loop = createLoop();
   return {
+    guiService: async () => {
+      const service = new GuiTaskService({
+        db,
+        core,
+        loop,
+        host: guiHost,
+        activations: [request.activation],
+      });
+      // 生产 Runtime 在 HTTP 可用前同步订阅；此处只建立相同的持久收件箱，测试控制 runner 启动时刻。
+      await db.information.reliable!.setSubscription!(
+        { subscriptionId: "kaguya.gui.task", kind: guiTaskRequestedKind.kind },
+        true,
+      );
+      return service;
+    },
+    guiState: (state: string, generation = 1) => {
+      guiState = state;
+      guiGeneration = generation;
+    },
+    get rawModel() {
+      return rawModel;
+    },
+    archiveReads: () => archiveReads,
+    originalPng: png,
     get db() {
       return db;
     },
@@ -384,9 +581,15 @@ async function fixture(
       return loop;
     },
     request,
-    modelIdentity: (value: Partial<typeof modelIdentity>) => { modelIdentity = {...modelIdentity, ...value}; },
-    disableNative: () => { nativeEnabled = false; },
-    deleteRoute: () => { routeAvailable = false; },
+    modelIdentity: (value: Partial<typeof modelIdentity>) => {
+      modelIdentity = { ...modelIdentity, ...value };
+    },
+    disableNative: () => {
+      nativeEnabled = false;
+    },
+    deleteRoute: () => {
+      routeAvailable = false;
+    },
     scope,
     original,
     actionRun,
@@ -513,85 +716,564 @@ async function fixture(
       }),
   };
 }
+async function imageHistory(
+  f: Awaited<ReturnType<typeof fixture>>,
+  closed = false,
+) {
+  const historyIds = (
+    await f.db.sql.query<{ information_id: string }>(
+      "SELECT information_id FROM information_atoms WHERE kind='agent.heavy.tool.result.v1' OR (kind='core.model.task.completed' AND payload->>'generationKind'='tool-calls')",
+    )
+  ).rows.map((r) => r.information_id);
+  if (closed)
+    historyIds.push(
+      await f.append("agent.router.turn.completed", {
+        candidateInformationId: f.actionRun,
+      }),
+    );
+  const source = await f.core.register(sourceKind, {
+    payload: {
+      turn: {
+        claimInformationId: f.actionRun,
+        candidateInformationId: f.actionRun,
+      },
+    },
+    source: "test:native",
+    occurredAt: new Date().toISOString(),
+    references: [
+      {
+        relation: "core:context",
+        informationId: f.request.contextInformationId,
+      },
+    ],
+  });
+  return {
+    ...f.request,
+    sourceInformationId: source.informationId,
+    contextAtoms: await f.core.getMany([
+      source.informationId,
+      f.request.sourceInformationId,
+      ...historyIds,
+    ]),
+    nativeContinuation: true,
+  };
+}
 for (const postgres of backends)
   describe(postgres ? "native PostgreSQL" : "native PGlite", () => {
-    it.each(["matching", "other"] as const)("selects the explicit GUI route before the first model request only in its scope: %s", async guiRoute => {
-      const f = await fixture(postgres, {guiRoute});
-      await f.loop.execute(f.request);
-      const rows = (await f.db.sql.query<any>("SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' ORDER BY payload->'nativeStep'->>'stepIndex'")).rows;
-      expect(rows).toHaveLength(2);
-      for (const {payload} of rows) {
-        expect(payload.selectionPolicy).toEqual(guiRoute === "matching" ? {tier: "heavy", routeId: "gui.approved"} : {tier: "heavy"});
-        expect(payload.nativeModelBinding.selectionPolicy).toEqual(payload.selectionPolicy);
-      }
-    });
-    it("refuses a legacy source candidate without requested-origin proof before creating any replacement", async () => {
-      const f = await fixture(postgres);
-      const boundary = vi.spyOn(f.db.nativeTools, "freeze").mockRejectedValueOnce(new Error("before first request"));
-      await expect(f.loop.execute(f.request)).rejects.toThrow("before first request");
-      boundary.mockRestore();
-      await f.db.sql.query("UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'");
+    it("persists one explicit GUI task across duplicate HTTP submissions and core restart", async () => {
+      const f = await fixture(postgres, { guiImage: true });
+      let service = await f.guiService();
+      const input = { taskRequestId: randomUUID(), prompt: "inspect desktop" };
+      const queued = await service.submit("synthetic-desktop", input);
+      expect(queued.status).toBe("queued");
+      expect(
+        (await service.submit("synthetic-desktop", input))
+          .requestedInformationId,
+      ).toBe(queued.requestedInformationId);
+      await expect(
+        service.submit("synthetic-desktop", { ...input, prompt: "different" }),
+      ).rejects.toThrow("gui-task-id-conflict");
+      await expect(
+        service.submit("synthetic-desktop", { ...input, nativeStep: {} }),
+      ).rejects.toThrow();
       await f.restart();
-      await expect(f.loop.execute({...f.request, selectionPolicy: {tier: "heavy", routeId: "another"}})).rejects.toThrow("native-origin-proof-missing");
+      service = await f.guiService();
+      await f.core.startReliableDelivery();
+      await vi.waitFor(
+        async () =>
+          expect(
+            (await service.read("synthetic-desktop", input.taskRequestId))
+              .status,
+          ).toBe("completed"),
+        { timeout: 8000, interval: 20 },
+      );
+      await f.core.stopReliableDelivery({ drain: true });
+      expect(f.providerCalls()).toBe(1);
+      expect(f.requests).toHaveLength(2);
+      const facts = (
+        await f.db.sql.query<any>(
+          "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested'",
+        )
+      ).rows;
+      expect(
+        facts.every(
+          (r) =>
+            r.payload.taskId === "agent.gui.execute" &&
+            r.payload.selectionPolicy.routeId === "gui.approved",
+        ),
+      ).toBe(true);
+      expect((await service.submit("synthetic-desktop", input)).status).toBe(
+        "completed",
+      );
+      await f.restart();
+      service = await f.guiService();
+      await f.core.startReliableDelivery();
+      await f.core.stopReliableDelivery({ drain: true });
+      expect(f.providerCalls()).toBe(1);
+      expect(f.requests).toHaveLength(2);
+    });
+    it("cancels an accepted GUI origin before any run and keeps it stopped after restart", async () => {
+      const f = await fixture(postgres, { guiImage: true });
+      let service = await f.guiService();
+      const input = {
+        taskRequestId: randomUUID(),
+        prompt: "cancel before start",
+      };
+      await service.submit("synthetic-desktop", input);
+      expect(
+        (await service.cancel("synthetic-desktop", input.taskRequestId)).status,
+      ).toBe("stopped");
+      await f.restart();
+      service = await f.guiService();
+      await f.core.startReliableDelivery();
+      await f.core.stopReliableDelivery({ drain: true });
+      expect(
+        (await service.read("synthetic-desktop", input.taskRequestId)).status,
+      ).toBe("stopped");
       expect(f.requests).toHaveLength(0);
-      expect(f.effects()).toBe(0);
-      expect((await f.db.sql.query("SELECT * FROM information_native_tool_runs")).rows).toHaveLength(1);
+      expect(f.providerCalls()).toBe(0);
+      expect(
+        (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
+          .rows,
+      ).toHaveLength(0);
     });
-    it.each([false, true])("derives legacy origin only from actual requested proof and preserves stopped facts: completed=%s", async completed => {
-      const f = await fixture(postgres);
-      let boundary: {mockRestore(): void} | undefined;
-      if (!completed) {
-        const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
-        boundary = vi.spyOn(f.db.nativeTools, "freeze").mockImplementation(async (...args) => {
-          if (args[0].stepIndex === 1) throw new Error("legacy boundary");
-          return freeze(...args);
+    it("cancels while the durable handler is about to create its run", async () => {
+      const f = await fixture(postgres, { guiImage: true });
+      const service = await f.guiService();
+      const input = { taskRequestId: randomUUID(), prompt: "cancel open race" };
+      const entered = Promise.withResolvers<void>(),
+        release = Promise.withResolvers<void>();
+      const open = f.db.nativeTools.open.bind(f.db.nativeTools);
+      const spy = vi
+        .spyOn(f.db.nativeTools, "open")
+        .mockImplementation(async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return open(...args);
         });
-        await expect(f.loop.execute(f.request)).rejects.toThrow("legacy boundary");
-      } else await f.loop.execute(f.request);
-      boundary?.mockRestore();
-      const before = (await f.db.sql.query<any>("SELECT * FROM information_native_tool_runs")).rows[0];
-      // 模拟迁移前行；不可变 information_atoms 保持原样，不从当下配置补写 binding。
-      await f.db.sql.query("UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'");
-      await f.restart();
-      const result = await f.loop.execute({...f.request, selectionPolicy: {tier: "heavy", routeId: "changed"}});
-      expect(result.status).toBe(completed ? "completed" : "failed");
-      const after = (await f.db.sql.query<any>("SELECT * FROM information_native_tool_runs")).rows;
-      expect(after).toHaveLength(1);
-      expect(after[0].run_key).toBe(before.run_key);
-      expect(after[0].origin_key).toBeTruthy();
-      expect(after[0].spec.modelBinding).toBeUndefined();
-      if (completed) expect(after[0].stopped_id).toBe(before.stopped_id);
-      else expect((await f.core.get(after[0].stopped_id))!.payload.reason).toBe("native-model-binding-missing");
-      expect(f.requests).toHaveLength(completed ? 2 : 1);
-      expect(f.effects()).toBe(1);
+      try {
+        await service.submit("synthetic-desktop", input);
+        await f.core.startReliableDelivery();
+        let reached = false;
+        void entered.promise.then(() => {
+          reached = true;
+        });
+        await vi.waitFor(() => expect(reached).toBe(true), {
+          timeout: 8000,
+          interval: 20,
+        });
+        expect(
+          (await service.cancel("synthetic-desktop", input.taskRequestId))
+            .status,
+        ).toBe("stopped");
+      } finally {
+        release.resolve();
+        await f.core.stopReliableDelivery({ drain: true });
+        spy.mockRestore();
+      }
+      expect(f.requests).toHaveLength(0);
+      expect(f.providerCalls()).toBe(0);
+      expect(
+        (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
+          .rows,
+      ).toHaveLength(0);
     });
-    it.each(["model", "configuration", "route", "native-off", "policy", "unchanged"])(
-      "freezes origin and model across restart after the committed receipt: %s", async (change) => {
+    it("stops an inflight GUI model and never executes its late tool calls", async () => {
+      const f = await fixture(postgres, { guiImage: true });
+      const service = await f.guiService();
+      const input = {
+        taskRequestId: randomUUID(),
+        prompt: "cancel running model",
+      };
+      const release = Promise.withResolvers<void>();
+      let entered = false;
+      f.generate(async () => {
+        entered = true;
+        await release.promise;
+        return [call("late", "gui.observe")];
+      });
+      try {
+        await service.submit("synthetic-desktop", input);
+        await f.core.startReliableDelivery();
+        await vi.waitFor(() => expect(entered).toBe(true), {
+          timeout: 8000,
+          interval: 20,
+        });
+        expect(
+          (await service.cancel("synthetic-desktop", input.taskRequestId))
+            .status,
+        ).toBe("stopped");
+      } finally {
+        release.resolve();
+        await f.core.stopReliableDelivery({ drain: true });
+      }
+      expect(f.requests).toHaveLength(1);
+      expect(f.providerCalls()).toBe(0);
+      await f.restart();
+      const restored = await f.guiService();
+      await f.core.startReliableDelivery();
+      await f.core.stopReliableDelivery({ drain: true });
+      expect(
+        (await restored.read("synthetic-desktop", input.taskRequestId)).status,
+      ).toBe("stopped");
+      expect(f.requests).toHaveLength(1);
+      expect(f.providerCalls()).toBe(0);
+    });
+    it.each(["human", "draining", "unknown"])(
+      "rejects GUI tasks in %s without taking control",
+      async (state) => {
+        const f = await fixture(postgres, { guiImage: true });
+        f.guiState(state);
+        const service = await f.guiService();
+        await expect(
+          service.submit("synthetic-desktop", {
+            taskRequestId: randomUUID(),
+            prompt: "no resume",
+          }),
+        ).rejects.toThrow("gui-environment-unavailable");
+        expect(f.requests).toHaveLength(0);
+        expect(f.providerCalls()).toBe(0);
+        expect(
+          (
+            await f.db.sql.query(
+              "SELECT * FROM information_atoms WHERE kind='agent.gui.task.requested.v1'",
+            )
+          ).rows,
+        ).toHaveLength(0);
+      },
+    );
+    it.each(["instanceId", "definitionId", "taskId", "sourceInformationId"])(
+      "rejects another requested origin at admission without spending the original budget: %s",
+      async (field) => {
         const f = await fixture(postgres);
         const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
-        const boundary = vi.spyOn(f.db.nativeTools, "freeze").mockImplementation(async (...args) => {
-          if (args[0].stepIndex === 1) throw new Error("synthetic restart after receipt");
+        const boundary = vi
+          .spyOn(f.db.nativeTools, "freeze")
+          .mockImplementationOnce(async (...args) => {
+            await freeze(...args);
+            throw new Error("frozen before request");
+          });
+        await expect(f.loop.execute(f.request)).rejects.toThrow(
+          "frozen before request",
+        );
+        boundary.mockRestore();
+        const row = (
+          await f.db.sql.query<any>(
+            "SELECT * FROM information_native_tool_runs",
+          )
+        ).rows[0];
+        let request = {
+          ...f.request,
+          nativeModelBinding: row.spec.modelBinding,
+          tools: row.spec.declarations,
+          nativeStep: {
+            runInformationId: row.run_id,
+            stepIndex: 0,
+            deadline: row.spec.deadline,
+            maxContextBytes: row.spec.budget.maxContextBytes,
+            maxOutputBytes: row.spec.budget.maxOutputBytes,
+          },
+        };
+        if (field === "instanceId" || field === "definitionId")
+          request = {
+            ...request,
+            activation: { ...request.activation, [field]: "other-origin" },
+          };
+        if (field === "taskId")
+          request = {
+            ...request,
+            task: { ...request.task, taskId: "other-task" },
+          };
+        if (field === "sourceInformationId") {
+          const source = await f.core.register(sourceKind, {
+            payload: { turn: { claimInformationId: f.actionRun } },
+            source: "test:native",
+            occurredAt: new Date().toISOString(),
+            references: [
+              {
+                relation: "core:context",
+                informationId: f.request.contextInformationId,
+              },
+            ],
+          });
+          request = {
+            ...request,
+            sourceInformationId: source.informationId,
+            contextAtoms: [source],
+          };
+        }
+        expect((await f.rawModel.execute(request)).status).toBe("failed");
+        expect(f.requests).toHaveLength(0);
+        expect(f.effects()).toBe(0);
+        expect((await f.db.nativeTools.read(row.run_id)).steps_count).toBe(0);
+        expect(
+          (
+            await f.db.sql.query(
+              "SELECT request_id,dispatched_id FROM information_native_tool_steps",
+            )
+          ).rows,
+        ).toEqual([{ request_id: null, dispatched_id: null }]);
+        expect(
+          (
+            await f.db.sql.query(
+              "SELECT information_id FROM information_atoms WHERE kind='core.model.task.dispatched.v1'",
+            )
+          ).rows,
+        ).toHaveLength(0);
+        expect((await f.loop.execute(f.request)).status).toBe("completed");
+        expect(f.requests).toHaveLength(2);
+        expect(f.effects()).toBe(1);
+      },
+    );
+    it("loads the persisted original GUI PNG after reconnect and through historical ModelTask assembly without another provider execution", async () => {
+      const f = await fixture(postgres, { guiImage: true });
+      const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
+      const boundary = vi
+        .spyOn(f.db.nativeTools, "freeze")
+        .mockImplementation(async (...args) => {
+          if (args[0].stepIndex === 1)
+            throw new Error("restart after image receipt");
           return freeze(...args);
         });
-        await expect(f.loop.execute(f.request)).rejects.toThrow("synthetic restart after receipt");
+      await expect(f.loop.execute(f.request)).rejects.toThrow(
+        "restart after image receipt",
+      );
+      expect(
+        f.archiveReads(),
+        JSON.stringify(
+          (
+            await f.db.sql.query(
+              "SELECT payload FROM information_atoms WHERE kind='agent.heavy.tool.result.v1'",
+            )
+          ).rows,
+        ),
+      ).toBe(1);
+      expect(f.requests).toHaveLength(1);
+      expect(f.providerCalls()).toBe(1);
+      boundary.mockRestore();
+      await f.restart();
+      expect((await f.loop.execute(f.request)).status).toBe("completed");
+      expect(f.archiveReads()).toBe(2);
+      const assertImagePair = (messages: any[]) => {
+        const imageIndex = messages.findIndex((m) => m.nativeToolResultGroup);
+        expect(imageIndex).toBeGreaterThan(0);
+        expect(messages[imageIndex].nativeToolResultGroup).toEqual(["call-1"]);
+        expect(messages[imageIndex - 1]).toMatchObject({
+          role: "tool",
+          content: [{ type: "tool-result", toolCallId: "call-1" }],
+        });
+        const image = messages[imageIndex].content.find(
+          (p: any) => p.type === "image",
+        );
+        expect(Buffer.from(image.image.split(",")[1], "base64")).toEqual(
+          f.originalPng,
+        );
+        const metadata = JSON.parse(messages[imageIndex].content[0].text);
+        expect(metadata.image).toMatchObject({
+          captureId: "original-capture",
+          width: 1,
+          height: 1,
+          origin: { x: 27, y: 41 },
+        });
+      };
+      assertImagePair(f.requests[1].messages);
+      f.generate(async () => "history complete");
+      expect((await f.loop.execute(await imageHistory(f))).status).toBe(
+        "completed",
+      );
+      assertImagePair(f.requests[2].messages);
+      expect(f.archiveReads()).toBe(3);
+      expect(f.providerCalls()).toBe(1);
+      expect(f.effects()).toBe(1);
+    });
+    it.each([false, true])(
+      "selects historical image groups before blob reads under a smaller budget: closed=%s",
+      async (closed) => {
+        const budget = { maxContextBytes: 128000 };
+        const f = await fixture(postgres, {
+          guiImage: true,
+          largeGuiImage: true,
+          budget,
+        });
+        expect((await f.loop.execute(f.request)).status).toBe("completed");
+        expect(f.originalPng.length).toBeGreaterThan(80000);
+        expect(f.archiveReads()).toBe(1);
+        budget.maxContextBytes = 64000;
+        f.generate(async () => "smaller history complete");
+        const result = await f.loop.execute(await imageHistory(f, closed));
+        expect(result.status).toBe(closed ? "completed" : "failed");
+        expect(f.archiveReads()).toBe(1);
+        expect(f.providerCalls()).toBe(1);
+        expect(f.requests).toHaveLength(closed ? 3 : 2);
+        if (closed)
+          expect(JSON.stringify(f.requests[2].messages)).not.toContain(
+            "data:image/png",
+          );
+        else
+          expect(result).toMatchObject({
+            status: "failed",
+            error: { stage: "context-budget" },
+          });
+      },
+    );
+    it.each(["matching", "other"] as const)(
+      "freezes the host explicit policy before the first model request: %s",
+      async (guiRoute) => {
+        const f = await fixture(postgres, { guiRoute });
+        await f.loop.execute(f.request);
+        const rows = (
+          await f.db.sql.query<any>(
+            "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' ORDER BY payload->'nativeStep'->>'stepIndex'",
+          )
+        ).rows;
+        expect(rows).toHaveLength(2);
+        for (const { payload } of rows) {
+          expect(payload.selectionPolicy).toEqual(
+            guiRoute === "matching"
+              ? { tier: "heavy", routeId: "gui.approved" }
+              : { tier: "heavy" },
+          );
+          expect(payload.nativeModelBinding.selectionPolicy).toEqual(
+            payload.selectionPolicy,
+          );
+        }
+      },
+    );
+    it("refuses a legacy source candidate without requested-origin proof before creating any replacement", async () => {
+      const f = await fixture(postgres);
+      const boundary = vi
+        .spyOn(f.db.nativeTools, "freeze")
+        .mockRejectedValueOnce(new Error("before first request"));
+      await expect(f.loop.execute(f.request)).rejects.toThrow(
+        "before first request",
+      );
+      boundary.mockRestore();
+      await f.db.sql.query(
+        "UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'",
+      );
+      await f.restart();
+      await expect(
+        f.loop.execute({
+          ...f.request,
+          selectionPolicy: { tier: "heavy", routeId: "another" },
+        }),
+      ).rejects.toThrow("native-origin-proof-missing");
+      expect(f.requests).toHaveLength(0);
+      expect(f.effects()).toBe(0);
+      expect(
+        (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
+          .rows,
+      ).toHaveLength(1);
+    });
+    it.each([false, true])(
+      "derives legacy origin only from actual requested proof and preserves stopped facts: completed=%s",
+      async (completed) => {
+        const f = await fixture(postgres);
+        let boundary: { mockRestore(): void } | undefined;
+        if (!completed) {
+          const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
+          boundary = vi
+            .spyOn(f.db.nativeTools, "freeze")
+            .mockImplementation(async (...args) => {
+              if (args[0].stepIndex === 1) throw new Error("legacy boundary");
+              return freeze(...args);
+            });
+          await expect(f.loop.execute(f.request)).rejects.toThrow(
+            "legacy boundary",
+          );
+        } else await f.loop.execute(f.request);
+        boundary?.mockRestore();
+        const before = (
+          await f.db.sql.query<any>(
+            "SELECT * FROM information_native_tool_runs",
+          )
+        ).rows[0];
+        // 模拟迁移前行；不可变 information_atoms 保持原样，不从当下配置补写 binding。
+        await f.db.sql.query(
+          "UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'",
+        );
+        await f.restart();
+        const result = await f.loop.execute({
+          ...f.request,
+          selectionPolicy: { tier: "heavy", routeId: "changed" },
+        });
+        expect(result.status).toBe(completed ? "completed" : "failed");
+        const after = (
+          await f.db.sql.query<any>(
+            "SELECT * FROM information_native_tool_runs",
+          )
+        ).rows;
+        expect(after).toHaveLength(1);
+        expect(after[0].run_key).toBe(before.run_key);
+        expect(after[0].origin_key).toBeTruthy();
+        expect(after[0].spec.modelBinding).toBeUndefined();
+        if (completed) expect(after[0].stopped_id).toBe(before.stopped_id);
+        else
+          expect((await f.core.get(after[0].stopped_id))!.payload.reason).toBe(
+            "native-model-binding-missing",
+          );
+        expect(f.requests).toHaveLength(completed ? 2 : 1);
+        expect(f.effects()).toBe(1);
+      },
+    );
+    it.each([
+      "model",
+      "configuration",
+      "route",
+      "native-off",
+      "policy",
+      "unchanged",
+    ])(
+      "freezes origin and model across restart after the committed receipt: %s",
+      async (change) => {
+        const f = await fixture(postgres);
+        const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
+        const boundary = vi
+          .spyOn(f.db.nativeTools, "freeze")
+          .mockImplementation(async (...args) => {
+            if (args[0].stepIndex === 1)
+              throw new Error("synthetic restart after receipt");
+            return freeze(...args);
+          });
+        await expect(f.loop.execute(f.request)).rejects.toThrow(
+          "synthetic restart after receipt",
+        );
         expect(f.effects()).toBe(1);
         expect(f.requests).toHaveLength(1);
-        expect((await f.db.sql.query("SELECT result_id FROM information_native_tool_calls")).rows[0]!.result_id).toBeTruthy();
+        expect(
+          (
+            await f.db.sql.query(
+              "SELECT result_id FROM information_native_tool_calls",
+            )
+          ).rows[0]!.result_id,
+        ).toBeTruthy();
         boundary.mockRestore();
-        if (change === "model") f.modelIdentity({modelId: "different"});
-        if (change === "configuration") f.modelIdentity({configurationDigest: "b".repeat(64)});
+        if (change === "model") f.modelIdentity({ modelId: "different" });
+        if (change === "configuration")
+          f.modelIdentity({ configurationDigest: "b".repeat(64) });
         if (change === "route") f.deleteRoute();
         if (change === "native-off") f.disableNative();
         await f.restart();
-        const request = change === "policy" ? {...f.request, selectionPolicy: {tier: "light" as const}} : f.request;
+        const request =
+          change === "policy"
+            ? { ...f.request, selectionPolicy: { tier: "light" as const } }
+            : f.request;
         const result = await f.loop.execute(request);
-        expect(result.status).toBe(change === "unchanged" ? "completed" : "failed");
+        expect(result.status).toBe(
+          change === "unchanged" ? "completed" : "failed",
+        );
         await f.restart();
         expect(await f.loop.execute(request)).toEqual(result);
         expect(f.requests).toHaveLength(change === "unchanged" ? 2 : 1);
         expect(f.effects()).toBe(1);
-        expect((await f.db.sql.query("SELECT * FROM information_native_tool_runs")).rows).toHaveLength(1);
-        expect((await f.db.sql.query("SELECT * FROM information_native_tool_steps")).rows).toHaveLength(change === "unchanged" ? 2 : 1);
+        expect(
+          (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
+            .rows,
+        ).toHaveLength(1);
+        expect(
+          (await f.db.sql.query("SELECT * FROM information_native_tool_steps"))
+            .rows,
+        ).toHaveLength(change === "unchanged" ? 2 : 1);
       },
     );
     it("runs a real model-task → W3 receipt → paired next step and replays without effects", async () => {

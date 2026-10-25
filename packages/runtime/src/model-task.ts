@@ -18,8 +18,12 @@
  * readFailureMetrics/readProviderFailure 对跨边界值再次校验，非法指标或诊断不会阻断失败终态提交。
  */
 import { createHash, randomUUID } from "node:crypto";
-import { projectNativeToolResults, type NativeArtifactReader } from "./native-tool-results.js";
-import { assembleNativeInput } from "./native-input.js";
+import {
+  planNativeToolResults,
+  type NativeToolResultPlan,
+  type NativeArtifactReader,
+} from "./native-tool-results.js";
+import { assembleNativeInputWithArtifacts } from "./native-input.js";
 import { InformationCore } from "@kaguya/engine";
 import { KaguyaLlmError, type KaguyaLlmClient } from "@kaguya/llm/client";
 import type { StructuredOutputPromptRenderer } from "@kaguya/llm";
@@ -246,7 +250,9 @@ export class ModelTaskClient implements ModelTaskCapability {
           ? { contextTrimming: request.contextTrimming }
           : {}),
         ...(request.nativeStep ? { nativeStep: request.nativeStep } : {}),
-        ...(request.nativeModelBinding ? { nativeModelBinding: request.nativeModelBinding } : {}),
+        ...(request.nativeModelBinding
+          ? { nativeModelBinding: request.nativeModelBinding }
+          : {}),
       });
     const selected = await this.#core.getMany(metadata.contextInformationIds);
     if (
@@ -307,31 +313,66 @@ export class ModelTaskClient implements ModelTaskCapability {
           "Explicit messages and continuation are mutually exclusive",
         );
       try {
-        const toolResults = new Map<string, NativeMessage[]>();
+        const toolPlans = new Map<string, NativeToolResultPlan>();
         for (const completed of selected) {
           const p = completed.payload as any;
-          if (completed.kind !== "core.model.task.completed" || p.taskId !== task.taskId ||
-            p.activation?.instanceId !== request.activation.instanceId || p.generationKind !== "tool-calls") continue;
+          if (
+            completed.kind !== "core.model.task.completed" ||
+            p.taskId !== task.taskId ||
+            p.activation?.instanceId !== request.activation.instanceId ||
+            p.generationKind !== "tool-calls"
+          )
+            continue;
           if (canonical(p.resolvedModel) !== canonical(resolvedModel)) continue;
-          const ordered = (p.toolCalls ?? []).map((c: any) => ({call: c, result: selected.find(a =>
-            a.kind === "agent.heavy.tool.result.v1" && a.payload.modelCompletedInformationId === completed.informationId && a.payload.toolCallId === c.toolCallId)}));
-          if (ordered.some((r: any) => !r.result) || !ordered.some((r: any) => r.result.payload.value?.result?.image)) continue;
-          const currentRun = request.nativeStep ? await this.#core.get(request.nativeStep.runInformationId) : undefined;
+          const ordered = (p.toolCalls ?? []).map((c: any) => ({
+            call: c,
+            result: selected.find(
+              (a) =>
+                a.kind === "agent.heavy.tool.result.v1" &&
+                a.payload.modelCompletedInformationId ===
+                  completed.informationId &&
+                a.payload.toolCallId === c.toolCallId,
+            ),
+          }));
+          if (
+            ordered.some((r: any) => !r.result) ||
+            !ordered.some((r: any) => r.result.payload.value?.result?.image)
+          )
+            continue;
+          const currentRun = request.nativeStep
+            ? await this.#core.get(request.nativeStep.runInformationId)
+            : undefined;
           const currentScope = (currentRun?.payload.spec as any)?.scope;
           if (!currentScope) throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
-          const entries = await Promise.all(ordered.map(async ({call, result}: any) => {
-            const run = await this.#core.get(result.payload.runInformationId);
-            const spec = run?.payload.spec as any;
-            if (spec?.scope !== currentScope) throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
-            return {toolCallId: call.toolCallId, toolName: call.toolName,
-              toolId: spec.declarations.find((d: any) => d.wireName === call.toolName)?.id ?? "",
-              intentId: result.payload.intentId, scope: spec.scope, value: result.payload.value};
-          }));
-          toolResults.set(completed.informationId, await projectNativeToolResults(entries, this.#readNativeArtifact,
-            request.nativeStep?.maxContextBytes ?? 128_000));
+          const entries = await Promise.all(
+            ordered.map(async ({ call, result }: any) => {
+              const run = await this.#core.get(result.payload.runInformationId);
+              const spec = run?.payload.spec as any;
+              if (spec?.scope !== currentScope)
+                throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
+              return {
+                toolCallId: call.toolCallId,
+                toolName: call.toolName,
+                toolId:
+                  spec.declarations.find(
+                    (d: any) => d.wireName === call.toolName,
+                  )?.id ?? "",
+                intentId: result.payload.intentId,
+                scope: spec.scope,
+                value: result.payload.value,
+              };
+            }),
+          );
+          toolPlans.set(
+            completed.informationId,
+            planNativeToolResults(entries),
+          );
         }
-        messages = assembleNativeInput({
-          toolResults,
+        messages = await assembleNativeInputWithArtifacts({
+          toolPlans,
+          ...(this.#readNativeArtifact
+            ? { readArtifact: this.#readNativeArtifact }
+            : {}),
           prompt: prompt.text,
           atoms: selected,
           taskId: task.taskId,
@@ -343,7 +384,10 @@ export class ModelTaskClient implements ModelTaskCapability {
         if (!(error instanceof Error)) throw error;
         if (error.message === "SITUATION_CONTEXT_BUDGET_EXCEEDED")
           inputBlocked = "context-budget";
-        else if (error.message === "NATIVE_TOOL_INTERACTION_OPEN" || error.message.startsWith("native-image-"))
+        else if (
+          error.message === "NATIVE_TOOL_INTERACTION_OPEN" ||
+          error.message.startsWith("native-image-")
+        )
           inputBlocked = "native-protocol";
         else throw error;
       }
@@ -418,11 +462,15 @@ export class ModelTaskClient implements ModelTaskCapability {
       const signal = executionSignal
         ? AbortSignal.any([executionSignal, controller.signal])
         : controller.signal;
-      if (request.nativeStep && (
-        !request.nativeModelBinding ||
-        canonical(request.nativeModelBinding.selectionPolicy) !== canonical(persisted.selectionPolicy) ||
-        canonical(request.nativeModelBinding.resolvedModel) !== canonical(persisted.resolvedModel)
-      )) throw new Error("Native model binding unavailable");
+      if (
+        request.nativeStep &&
+        (!request.nativeModelBinding ||
+          canonical(request.nativeModelBinding.selectionPolicy) !==
+            canonical(persisted.selectionPolicy) ||
+          canonical(request.nativeModelBinding.resolvedModel) !==
+            canonical(persisted.resolvedModel))
+      )
+        throw new Error("Native model binding unavailable");
       if (requested.payload.inputBlocked) {
         failureStage = requested.payload.inputBlocked;
         throw new Error("Native input blocked");

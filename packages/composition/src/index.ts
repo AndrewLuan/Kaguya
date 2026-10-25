@@ -101,7 +101,12 @@ export type RuntimeModelSelectionResolver = (
   readonly model: ReturnType<KaguyaLlmModelResolver>;
   readonly generationOptions?: KaguyaLlmGenerationOptions;
   /** 显式非秘密配置身份；不得包含凭据、SDK 对象或任意 provider settings。 */
-  readonly configuration?: { adapter: string; protocol: string; endpoint: string; revision: string };
+  readonly configuration?: {
+    adapter: string;
+    protocol: string;
+    endpoint: string;
+    revision: string;
+  };
 };
 export interface NativeTaskModelRoute {
   readonly definitionId: string;
@@ -137,7 +142,12 @@ export function createDeterministicModelSelectionResolver(): RuntimeModelSelecti
     providerId: "kaguya-deterministic",
     modelId: `deterministic-${modelTier}`,
     model: modelTier === "light" ? lightModel : heavyModel,
-    configuration: {adapter: "deterministic", protocol: "local", endpoint: "local", revision: "1"},
+    configuration: {
+      adapter: "deterministic",
+      protocol: "local",
+      endpoint: "local",
+      revision: "1",
+    },
   });
 }
 export function createMessageCatalog(
@@ -308,17 +318,41 @@ export function createMessageComposition(
       const resolved = route
         ? route.resolve()
         : resolveModelSelection({ modelTier: tier });
+      const options = resolved.generationOptions ?? {};
+      const generationOptions: KaguyaLlmGenerationOptions = Object.freeze({
+        ...(options.structuredOutputMode === undefined
+          ? {}
+          : { structuredOutputMode: options.structuredOutputMode }),
+        ...(options.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: options.timeoutMs }),
+        ...(options.reasoning === undefined
+          ? {}
+          : { reasoning: options.reasoning }),
+        ...(options.recommendedDurationMs === undefined
+          ? {}
+          : { recommendedDurationMs: options.recommendedDurationMs }),
+      });
       const identity = {
         providerId: resolved.providerId,
         modelId: resolved.modelId,
-        ...(resolved.configuration ? { configurationDigest: createHash("sha256").update(stableModelConfiguration({
-          configuration: resolved.configuration, generationOptions: resolved.generationOptions ?? {},
-        })).digest("hex") } : {}),
+        ...(resolved.configuration
+          ? {
+              configurationDigest: createHash("sha256")
+                .update(
+                  stableModelConfiguration({
+                    configuration: resolved.configuration,
+                    generationOptions,
+                  }),
+                )
+                .digest("hex"),
+            }
+          : {}),
       };
       activeModel.enterWith({
         identity,
         model: resolved.model,
-        generationOptions: resolved.generationOptions ?? {},
+        generationOptions,
       });
       return identity;
     },
@@ -361,9 +395,14 @@ export function createMessageComposition(
 
 /** 只序列化宿主声明的非秘密字段，使键顺序不影响冻结配置身份。 */
 function stableModelConfiguration(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableModelConfiguration).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.entries(value).filter(([,v]) => v !== undefined)
-    .sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => `${JSON.stringify(k)}:${stableModelConfiguration(v)}`).join(",")}}`;
+  if (Array.isArray(value))
+    return `[${value.map(stableModelConfiguration).join(",")}]`;
+  if (value && typeof value === "object")
+    return `{${Object.entries(value)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableModelConfiguration(v)}`)
+      .join(",")}}`;
   return JSON.stringify(value);
 }
 

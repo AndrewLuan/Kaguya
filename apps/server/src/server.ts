@@ -84,7 +84,10 @@ import {
 import { pathToFileURL } from "node:url";
 
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { boundedModelFetch, type KaguyaLlmGenerationOptions } from "@kaguya/llm/client";
+import {
+  boundedModelFetch,
+  type KaguyaLlmGenerationOptions,
+} from "@kaguya/llm/client";
 import {
   ConfigError,
   ConfigIncompleteError,
@@ -793,7 +796,10 @@ export async function startKaguyaServer(
               createMessageComposition(
                 createRuntimeModelSelectionResolver(snapshot.profile),
                 {
-                  nativeTaskModels: createGuiModelRoutes(nextMcp, snapshot.profile),
+                  nativeTaskModels: createGuiModelRoutes(
+                    nextMcp,
+                    snapshot.profile,
+                  ),
                   ...createMemoryCompositionOptions(
                     memoryConfigFromModules(snapshot.moduleConfigs),
                   ),
@@ -967,7 +973,12 @@ export async function startKaguyaServer(
         logger: httpLogger,
       }),
     );
-    registerMcpRoutes(app!, () => mcp, gatewayAuth);
+    registerMcpRoutes(
+      app!,
+      () => mcp,
+      gatewayAuth,
+      () => runtime?.guiTasks,
+    );
     await assembly.mount(
       "http",
       ["configuration", "logging"],
@@ -1061,13 +1072,22 @@ export function formatAccessUrl(
 
 /** linux-tools.json 的显式 GUI 目标只为对应任务创建路由，不更改普通 Heavy tier。 */
 function createGuiModelRoutes(host: McpHost, profile: UserConfigProfile) {
-  return serverGuiModelBindings(host).map(binding => {
+  return serverGuiModelBindings(host).map((binding) => {
     const gui = structuredClone(profile);
     if (!gui.ai.modelTiers) throw new Error("GUI model tiers unavailable");
-    gui.ai.modelTiers.heavy = {...gui.ai.modelTiers.heavy, providerId: binding.providerId, modelId: binding.modelId};
+    gui.ai.modelTiers.heavy = {
+      ...gui.ai.modelTiers.heavy,
+      providerId: binding.providerId,
+      modelId: binding.modelId,
+    };
     const resolve = createRuntimeModelSelectionResolver(gui);
-    return {definitionId: "agent.heavy", taskId: "agent.heavy.respond", routeId: binding.routeId,
-      tier: "heavy" as const, resolve: () => resolve({modelTier: "heavy"})};
+    return {
+      definitionId: "agent.heavy",
+      taskId: "agent.gui.execute",
+      routeId: binding.routeId,
+      tier: "heavy" as const,
+      resolve: () => resolve({ modelTier: "heavy" }),
+    };
   });
 }
 
@@ -1124,11 +1144,20 @@ export function createRuntimeModelSelectionResolver(
       modelId: target.modelId,
       model: client.chatModel(target.modelId),
       generationOptions: generationOptionsForTier(target, provider.settings),
-      ...(!new URL(provider.baseUrl).search && !new URL(provider.baseUrl).username && !new URL(provider.baseUrl).password ? {configuration: {
-        adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions",
-        endpoint: new URL(provider.baseUrl).origin + new URL(provider.baseUrl).pathname,
-        revision: "1",
-      }} : {}),
+      ...(!new URL(provider.baseUrl).search &&
+      !new URL(provider.baseUrl).username &&
+      !new URL(provider.baseUrl).password
+        ? {
+            configuration: {
+              adapter: "@ai-sdk/openai-compatible",
+              protocol: "chat-completions",
+              endpoint:
+                new URL(provider.baseUrl).origin +
+                new URL(provider.baseUrl).pathname,
+              revision: "1",
+            },
+          }
+        : {}),
     };
   };
 

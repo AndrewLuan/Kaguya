@@ -160,7 +160,13 @@ export function mcpRuntimeOptions(
 }
 /** 宿主批准的 GUI 模型声明，凭据仍由 selected Profile 的 resolver 提供。 */
 export function serverGuiModelBindings(host: McpHost) {
-  return linuxHosts.get(host)?.configuration.bindings.flatMap(b => b.guiModel ? [b.guiModel] : []) ?? [];
+  return (
+    linuxHosts
+      .get(host)
+      ?.configuration.bindings.flatMap((b) =>
+        b.guiModel ? [b.guiModel] : [],
+      ) ?? []
+  );
 }
 export function withServerMcp<
   T extends {
@@ -214,6 +220,7 @@ export function registerMcpRoutes(
   app: FastifyInstance,
   getHost: () => McpHost | undefined,
   auth: GatewayAuthenticator,
+  getGuiTasks?: () => import("@kaguya/runtime").GuiTaskService | undefined,
 ) {
   registerLinuxEnvironmentRoutes(
     app,
@@ -222,6 +229,7 @@ export function registerMcpRoutes(
       return host ? linuxHosts.get(host) : undefined;
     },
     auth,
+    getGuiTasks,
   );
   app.post(
     "/api/mcp/read",

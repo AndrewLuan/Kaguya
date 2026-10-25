@@ -1,4 +1,5 @@
 /**
+ * cancelOrigin 与 open/admission 共锁，持久取消未创建 run 的来源；admitModel 同时核对四项原点和冻结模型配置。
  * 稳定 origin_key 仅由 activation/task/source 决定；旧记录按 requested 事实回填索引，模型 admission 校验冻结配置绑定。
  * 功能概述：在同一持久事务内裁决工具 run/step、预算、模型 dispatch 和 call→intent 身份。
  * open/freeze 固定不可变上下文，admitModel 在有效 claim 下扣一次步骤预算，calls 固定模型调用顺序。
@@ -62,6 +63,8 @@ export async function prepareNativeToolSchema(db: SqlDatabase) {
       calls_count integer NOT NULL DEFAULT 0,output_bytes integer NOT NULL DEFAULT 0);
     ALTER TABLE information_native_tool_runs ADD COLUMN IF NOT EXISTS origin_key text;
     CREATE UNIQUE INDEX IF NOT EXISTS information_native_tool_origin ON information_native_tool_runs(origin_key);
+    CREATE INDEX IF NOT EXISTS information_native_origin_cancelled ON information_atoms((payload->>'originKey'))
+      WHERE kind='agent.heavy.tool.origin.cancelled.v1';
     CREATE TABLE IF NOT EXISTS information_native_tool_steps (
       run_id text NOT NULL REFERENCES information_native_tool_runs(run_id), step_index integer NOT NULL,
       frozen_id text NOT NULL REFERENCES information_atoms(information_id), request_id text,
@@ -149,10 +152,57 @@ export class PostgresNativeToolStore {
     ).rows[0];
     if (
       row.stopped_id ||
+      (row.origin_key && (await this.originCancelled(tx, row.origin_key))) ||
       action?.invalidated_id ||
       Date.parse(String(row.spec.deadline)) <= Date.now()
     )
       throw new Error("native-run-stopped");
+  }
+  private async originCancelled(tx: SqlTransaction, originKey: string) {
+    return (
+      await tx.query<{ information_id: string }>(
+        "SELECT information_id FROM information_atoms WHERE kind='agent.heavy.tool.origin.cancelled.v1' AND payload->>'originKey'=$1 LIMIT 1",
+        [originKey],
+      )
+    ).rows[0]?.information_id;
+  }
+  /** 与 open/admission 共用锁；先取消再开 run 也不会派发。停止事实不表示外部效果回滚。 */
+  async cancelOrigin(origin: NativeToolOrigin, context: string) {
+    return this.tx(async (tx) => {
+      const row = await this.findOrigin(tx, origin);
+      if (row?.stopped_id) return row;
+      const originKey = actionDigest(origin);
+      let cancelled = await this.originCancelled(tx, originKey);
+      if (!cancelled)
+        cancelled = (
+          await this.fact(
+            tx,
+            "agent.heavy.tool.origin.cancelled.v1",
+            { originKey },
+            context,
+            [origin.sourceInformationId],
+          )
+        ).informationId;
+      if (row) {
+        const terminal = await this.fact(
+          tx,
+          "agent.heavy.tool.terminal.v1",
+          {
+            runInformationId: row.run_id,
+            reason: "cancelled",
+            modelResult: null,
+          },
+          context,
+          [row.run_id, cancelled],
+        );
+        await tx.query(
+          "UPDATE information_native_tool_runs SET stopped_id=$2 WHERE run_id=$1",
+          [row.run_id, terminal.informationId],
+        );
+        return { ...row, stopped_id: terminal.informationId };
+      }
+      return undefined;
+    });
   }
   async open(
     key: string,
@@ -173,6 +223,8 @@ export class PostgresNativeToolStore {
       ).rows[0];
       if (old) return old;
       if (guard) await assertClaimInTransaction(tx, guard);
+      if (origin && (await this.originCancelled(tx, actionDigest(origin))))
+        throw new Error("native-run-stopped");
       const atom = await this.fact(
         tx,
         "agent.heavy.tool.run.v1",
@@ -182,7 +234,13 @@ export class PostgresNativeToolStore {
       );
       await tx.query(
         "INSERT INTO information_native_tool_runs(run_id,run_key,spec,context_id,origin_key) VALUES($1,$2,$3::jsonb,$4,$5)",
-        [atom.informationId, key, JSON.stringify(spec), context, origin ? actionDigest(origin) : null],
+        [
+          atom.informationId,
+          key,
+          JSON.stringify(spec),
+          context,
+          origin ? actionDigest(origin) : null,
+        ],
       );
       return this.row(tx, atom.informationId);
     });
@@ -190,39 +248,56 @@ export class PostgresNativeToolStore {
   /** 原点不包含路由。旧 run 仅按真实 requested 事实反查，不修改不可变 run key/spec。 */
   private async findOrigin(tx: SqlTransaction, origin: NativeToolOrigin) {
     const key = actionDigest(origin);
-    const current = (await tx.query<NativeToolRunRow & Record<string, unknown>>(
-      "SELECT * FROM information_native_tool_runs WHERE origin_key=$1", [key],
-    )).rows[0];
+    const current = (
+      await tx.query<NativeToolRunRow & Record<string, unknown>>(
+        "SELECT * FROM information_native_tool_runs WHERE origin_key=$1",
+        [key],
+      )
+    ).rows[0];
     if (current) return current;
-    const candidates = (await tx.query<NativeToolRunRow & Record<string, unknown>>(
-      `SELECT n.* FROM information_native_tool_runs n WHERE n.origin_key IS NULL AND EXISTS (
+    const candidates = (
+      await tx.query<NativeToolRunRow & Record<string, unknown>>(
+        `SELECT n.* FROM information_native_tool_runs n WHERE n.origin_key IS NULL AND EXISTS (
         SELECT 1 FROM information_references r WHERE r.information_id=n.run_id
-        AND r.relation='core:uses-context' AND r.target_information_id=$1)`, [origin.sourceInformationId],
-    )).rows;
+        AND r.relation='core:uses-context' AND r.target_information_id=$1)`,
+        [origin.sourceInformationId],
+      )
+    ).rows;
     const matches: NativeToolRunRow[] = [];
     for (const candidate of candidates) {
-      const facts = (await tx.query<{payload: any}>(
-        "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' AND payload->'nativeStep'->>'runInformationId'=$1",
-        [candidate.run_id],
-      )).rows;
+      const facts = (
+        await tx.query<{ payload: any }>(
+          "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' AND payload->'nativeStep'->>'runInformationId'=$1",
+          [candidate.run_id],
+        )
+      ).rows;
       if (!facts.length) throw new Error("native-origin-proof-missing");
-      const origins = new Set(facts.map(({payload: p}) => actionDigest({
-        instanceId: p.activation?.instanceId, definitionId: p.activation?.definitionId,
-        taskId: p.taskId, sourceInformationId: p.sourceInformationId,
-      })));
+      const origins = new Set(
+        facts.map(({ payload: p }) =>
+          actionDigest({
+            instanceId: p.activation?.instanceId,
+            definitionId: p.activation?.definitionId,
+            taskId: p.taskId,
+            sourceInformationId: p.sourceInformationId,
+          }),
+        ),
+      );
       if (origins.size !== 1) throw new Error("native-origin-proof-ambiguous");
       if (origins.has(key)) matches.push(candidate);
     }
     if (matches.length > 1) throw new Error("native-origin-proof-ambiguous");
     const match = matches[0];
     if (match) {
-      await tx.query("UPDATE information_native_tool_runs SET origin_key=$2 WHERE run_id=$1", [match.run_id, key]);
-      return {...match, origin_key: key};
+      await tx.query(
+        "UPDATE information_native_tool_runs SET origin_key=$2 WHERE run_id=$1",
+        [match.run_id, key],
+      );
+      return { ...match, origin_key: key };
     }
     return undefined;
   }
   async byOrigin(origin: NativeToolOrigin) {
-    return this.tx(tx => this.findOrigin(tx, origin));
+    return this.tx((tx) => this.findOrigin(tx, origin));
   }
   async read(id: string) {
     return this.tx((tx) => this.row(tx, id));
@@ -396,11 +471,29 @@ export class PostgresNativeToolStore {
           actionDigest(row.spec.declarations)
       )
         throw new Error("native-request-unproved");
+      const requestedOrigin: NativeToolOrigin = {
+        instanceId: request.payload.activation?.instanceId,
+        definitionId: request.payload.activation?.definitionId,
+        taskId: request.payload.taskId,
+        sourceInformationId: request.payload.sourceInformationId,
+      };
+      if (
+        !row.spec.origin ||
+        actionDigest(requestedOrigin) !== row.origin_key ||
+        actionDigest(requestedOrigin) !== actionDigest(row.spec.origin)
+      )
+        throw new Error("native-request-origin-mismatch");
       const binding = row.spec.modelBinding as any;
-      if (!binding || !binding.resolvedModel?.configurationDigest ||
-        actionDigest(request.payload.nativeModelBinding) !== actionDigest(binding) ||
-        actionDigest(request.payload.selectionPolicy) !== actionDigest(binding.selectionPolicy) ||
-        actionDigest(request.payload.resolvedModel) !== actionDigest(binding.resolvedModel))
+      if (
+        !binding ||
+        !binding.resolvedModel?.configurationDigest ||
+        actionDigest(request.payload.nativeModelBinding) !==
+          actionDigest(binding) ||
+        actionDigest(request.payload.selectionPolicy) !==
+          actionDigest(binding.selectionPolicy) ||
+        actionDigest(request.payload.resolvedModel) !==
+          actionDigest(binding.resolvedModel)
+      )
         throw new Error("native-model-binding-unproved");
       const budget = nativeToolBudgetSchema.parse(row.spec.budget);
       if (row.steps_count >= budget.maxSteps)

@@ -113,7 +113,17 @@ export const nativeToolTerminalInformationKind = defineInformationKind({
   references: refs,
   log: { enabled: false },
 });
+export const nativeToolOriginCancelledInformationKind = defineInformationKind({
+  kind: "agent.heavy.tool.origin.cancelled.v1",
+  displayName: "工具任务原点取消",
+  description:
+    "在 run 创建或模型派发之前持久取消宿主任务原点，不宣称外部效果已撤回。",
+  payloadSchema: z.object({ originKey: id }).strict(),
+  references: refs,
+  log: { enabled: false },
+});
 export const nativeToolInformationKinds = [
+  nativeToolOriginCancelledInformationKind,
   nativeToolRunInformationKind,
   nativeToolStepInformationKind,
   nativeToolResultInformationKind,

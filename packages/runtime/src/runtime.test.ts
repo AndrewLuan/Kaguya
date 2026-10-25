@@ -1,4 +1,5 @@
 /**
+ * 普通模块入口拒绝 nativeStep/nativeModelBinding，内部循环使用宿主私有调用路径。
  * 测试夹具显式装配 QQ 表情模板，验证新增模块契约与既有流程兼容。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
  * Light 普通日志仅保留元数据，不能泄漏 Prompt 预览或模型输出。
@@ -581,6 +582,10 @@ describe("KaguyaRuntime", () => {
         }),
       ).rejects.toThrow(/not approved/);
     }
+    for (const field of ["nativeStep", "nativeModelBinding"])
+      await expect(value!.execute({ [field]: {} } as any)).rejects.toThrow(
+        "reserved for the host",
+      );
   });
 
   it(

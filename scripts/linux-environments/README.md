@@ -20,7 +20,7 @@ sudo /usr/bin/python3 -I bootstrap.py apply --trusted-user andrew
 
 **代码与连接** — root 拥有 `/usr/local/lib/kaguya-tools/{server,broker,shell_jobs,job_runner}.py`、`/etc/kaguya-tools/config.json` 和 `storage.conf`。broker 以专用 UID 运行，socket 为 `/run/kaguya-tools/broker.sock`。目录 traverse ACL 与 socket ACL 仅授予安装时指定的宿主用户；每条连接另用内核 `SO_PEERCRED` 核对 UID，不接受请求中自报 UID。socket 不能访问 Podman API。
 
-**系统单元** — 安装两个存储 mount unit、`kaguya-tools-network.service`、仅针对专用 UID 的 `user@UID.service.d/kaguya-tools.conf`、`kaguya-tools-broker.service` 和 `/etc/tmpfiles.d/kaguya-tools.conf`。只给专用账户启用 linger。`kaguya.slice` 总上限为 1200 tasks、10 GiB；每个 environment 的父 slice 为 2 CPU、4 GiB、512 tasks，最多两个环境。桌面容器与全部 shell jobs 分别使用 1 CPU、2 GiB、256 tasks 的预算；全部 shell jobs 共用一个子 slice，不能逐个重复领取额度。每个容器的共享内存上限为 512 MiB。
+**系统单元** — 安装两个存储 mount unit、`kaguya-tools-network.service`、仅针对专用 UID 的 `user@UID.service.d/kaguya-tools.conf`、`kaguya-tools-broker.service` 和 `/etc/tmpfiles.d/kaguya-tools.conf`。只给专用账户启用 linger。`kaguya.slice` 总上限为 1200 tasks、10 GiB；每个 environment 的父 slice 为 2 CPU、4 GiB、512 tasks，最多两个环境。普通 tools 桌面容器与全部 shell jobs 分别使用 1 CPU、2 GiB、256 tasks 的预算；GUI 桌面为 384 tasks，全部 shell jobs 共用 112 tasks；全部 shell jobs 共用一个子 slice，不能逐个重复领取额度。每个容器的共享内存上限为 512 MiB。
 
 **网络** — 默认环境 `network=none`。显式 `public-web` 使用 pasta，宿主独立 nftables table 限制该专用 UID：只允许公共地址 TCP 80/443 和 DNS，拒绝本机地址、私网、链路本地、tailnet、IPv4 映射 IPv6 等特殊地址。仅对 systemd-resolved 的 `127.0.0.53:53` 提供本机 DNS 例外。它是 IP/端口边界，不是域名白名单；DNS 查询仍可能传出数据。安装只管理 `inet kaguya_tools`，不 flush 其他规则。W7/W8 验收还须实际检查 IPv4/IPv6、宿主地址及重定向路径。
 
@@ -40,9 +40,9 @@ HOME tmpfs 使用 Podman 支持的 `mode=0700,U`，按容器用户 1000:1000 设
 
 Chromium 桌面由宿主创建时显式设置 `sandboxPolicy="chromium-v1"`。broker 同时匹配实际 Podman 版本与系统默认 seccomp 文件 SHA-256，再校验所选固定 profile 的 hash；未知组合拒绝启动。每份候选相对自己的发行包基线，仅把 chroot 的 capability 条件 allow/deny 替换为无条件 allow，供 Chromium 在内层 user namespace 完成 sandbox chroot。外层仍为非 root、cap-drop ALL、no-new-privileges、只读 rootfs。shell job 保持默认 seccomp。
 
-| 运行环境 | 默认 profile SHA-256 | 固定候选文件与 SHA-256 |
-| --- | --- | --- |
-| CI Podman 4.9.3 / common v0.57.4 | `cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c` | `chromium-seccomp.json` / `8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f` |
+| 运行环境                                                   | 默认 profile SHA-256                                               | 固定候选文件与 SHA-256                                                                               |
+| ---------------------------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| CI Podman 4.9.3 / common v0.57.4                           | `cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c` | `chromium-seccomp.json` / `8ff973906fd10bbbe904f2b52e567ae9aec30d30af257c71ff4928098b44932f`         |
 | Ubuntu 26.04 Podman 5.7.0 / containers-common 0.66.0+ds2-3 | `886ae167646b7e5db381ecf7c31e6de720a8e8da15cf3202fe1f67f424af2b75` | `chromium-seccomp-podman5.json` / `4b6639b4c07a385384148acfbb74d950c69137075e10675092a3d689d93ce1c3` |
 
 CI 基线来自 [common v0.57.4](https://github.com/containers/common/blob/v0.57.4/pkg/seccomp/seccomp.json)。生产候选基线来自 [USTC Ubuntu 发行包](https://mirrors.ustc.edu.cn/ubuntu/pool/universe/g/golang-github-containers-common/golang-github-containers-common_0.66.0+ds2-3_all.deb)，包 SHA-256 为 `88ca25147d181b88b062e9344255ee9c2f800e3dc7e3d9c952909d93d07caaf8`，与 resolute/universe amd64 Packages 索引一致。bootstrap 固定该依赖并把两份候选安装为 root 拥有的只读文件。CI 记录实际默认 profile 与最终 OCI 策略；生产候选的实际系统验收另行记录。

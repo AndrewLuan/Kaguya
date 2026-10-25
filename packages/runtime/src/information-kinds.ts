@@ -58,6 +58,8 @@ import {
   type InformationKindDefinition,
 } from "@kaguya/sdk";
 
+import { guiTaskRequestedKind, guiTaskTerminalKind } from "./gui-task-kinds.js";
+
 const nonBlankString = z.string().trim().min(1);
 type InformationPromptVariable = JsonObject & {
   name: string;
@@ -274,7 +276,10 @@ export const modelTaskResolvedModelSchema = z
   .object({
     providerId: nonBlankString,
     modelId: nonBlankString,
-    configurationDigest: z.string().regex(/^[a-f0-9]{64}$/).exactOptional(),
+    configurationDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .exactOptional(),
   })
   .strict();
 const modelTaskProvenanceSchema = z.array(
@@ -296,12 +301,14 @@ export const modelTaskContextTrimmingSchema = z
     budgetBytes: z.number().int().positive(),
   })
   .strict();
-export const nativeModelBindingSchema = z.object({
-  selectionPolicy: modelTaskSelectionPolicySchema,
-  resolvedModel: modelTaskResolvedModelSchema.extend({
-    configurationDigest: z.string().regex(/^[a-f0-9]{64}$/),
-  }),
-}).strict();
+export const nativeModelBindingSchema = z
+  .object({
+    selectionPolicy: modelTaskSelectionPolicySchema,
+    resolvedModel: modelTaskResolvedModelSchema.extend({
+      configurationDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    }),
+  })
+  .strict();
 export const modelTaskMetadataSchema = z
   .object({
     taskId: nonBlankString,
@@ -709,6 +716,8 @@ export const modelTaskInformationKinds = Object.freeze([
 ] as const);
 
 export const builtInInformationKinds = Object.freeze([
+  guiTaskRequestedKind,
+  guiTaskTerminalKind,
   conversationContextInformationKind,
   targetAuthorizedInformationKind,
   messageConfirmedInformationKind,

@@ -1,6 +1,7 @@
 /**
  * 功能概述：把持久 GUI 工具回执投影为原生 JSON 结果和原始 PNG，实时循环与历史恢复共用。
- * projectNativeToolResults 保持 call 顺序，核对 scope、intent、generation、归档 metadata、哈希与原图尺寸。
+ * planNativeToolResults 先计算完整批次的序列化大小；只对被保留批次执行 materialize 读取和校验原始 blob。
+ * projectNativeToolResults 供实时循环使用；核对 scope、intent、generation、归档 metadata、哈希与原图尺寸。
  * 图像放在整批 tool 结果后的 user 消息，nativeToolResultGroup 将其与完整工具交互绑定供原子裁剪。
  * 宿主 readArtifact 只读不可变 blob；本模块没有观察、输入或重新截图入口，失配时拒绝模型续轮。
  */
@@ -40,12 +41,29 @@ const geometry = z
     driverInstanceId: z.string().min(1),
   })
   .strict();
-export async function projectNativeToolResults(
-  entries: readonly NativeResultProjection[],
-  readArtifact?: NativeArtifactReader,
-  maxBytes = 128_000,
-): Promise<NativeMessage[]> {
+export interface NativeToolResultPlan {
+  /** 仅供预算选择的占位消息；发送前必须 materialize。 */
+  readonly messages: NativeMessage[];
+  readonly byteLength: number;
+  materialize(
+    readArtifact?: NativeArtifactReader,
+    maxBytes?: number,
+  ): Promise<NativeMessage[]>;
+}
+/** 先按持久 metadata 计算完整批次字节数，不读取 blob，也不分配 base64 占位字符串。 */
+export function planNativeToolResults(
+  input: readonly NativeResultProjection[],
+): NativeToolResultPlan {
+  const entries: NativeResultProjection[] = JSON.parse(JSON.stringify(input));
   const content: any[] = [];
+  const attachments: {
+    artifact: any;
+    image: z.infer<typeof geometry>;
+    scope: string;
+    environmentId: string;
+    index: number;
+  }[] = [];
+  let extraBytes = 0;
   for (const entry of entries) {
     const value = entry.value as any;
     if (!["gui.observe", "gui.verify"].includes(entry.toolId)) continue;
@@ -57,10 +75,9 @@ export async function projectNativeToolResults(
     const parsed = geometry.safeParse(value.result.image);
     if (!parsed.success) throw new Error("native-image-geometry-invalid");
     const image = parsed.data,
-      observation = value.result.observation;
-    const artifact = value.artifacts?.[0];
+      observation = value.result.observation,
+      artifact = value.artifacts?.[0];
     if (
-      !readArtifact ||
       value.artifacts?.length !== 1 ||
       !artifact ||
       artifact.scope !== entry.scope ||
@@ -80,37 +97,17 @@ export async function projectNativeToolResults(
     if (
       !Number.isSafeInteger(artifact.size) ||
       artifact.size < 24 ||
-      (artifact.size * 4) / 3 > maxBytes
+      artifact.size > 16 * 1024 * 1024
     )
       throw new Error("native-image-budget");
-    let saved: any;
-    try {
-      saved = await readArtifact({
-        id: artifact.id,
-        scope: entry.scope,
-        environmentId: observation.environmentId,
-      });
-    } catch {
-      throw new Error("native-image-unavailable");
-    }
-    if (
-      !saved?.artifact ||
-      actionDigest(saved.artifact) !== actionDigest(artifact) ||
-      typeof saved?.dataBase64 !== "string" ||
-      saved.dataBase64.length > maxBytes
-    )
-      throw new Error("native-image-archive-mismatch");
-    const bytes = Buffer.from(saved.dataBase64, "base64");
-    if (
-      bytes.toString("base64") !== saved.dataBase64 ||
-      bytes.length !== artifact.size ||
-      createHash("sha256").update(bytes).digest("hex") !== artifact.hash ||
-      bytes.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a" ||
-      bytes.subarray(12, 16).toString() !== "IHDR" ||
-      bytes.readUInt32BE(16) !== image.width ||
-      bytes.readUInt32BE(20) !== image.height
-    )
-      throw new Error("native-image-integrity-failed");
+    attachments.push({
+      artifact,
+      image,
+      scope: entry.scope,
+      environmentId: observation.environmentId,
+      index: content.length + 1,
+    });
+    extraBytes += 4 * Math.ceil(artifact.size / 3);
     content.push(
       {
         type: "text",
@@ -124,7 +121,7 @@ export async function projectNativeToolResults(
       },
       {
         type: "image",
-        image: `data:image/png;base64,${saved.dataBase64}`,
+        image: "data:image/png;base64,",
         mediaType: "image/png",
       },
     );
@@ -149,7 +146,64 @@ export async function projectNativeToolResults(
         ]
       : []),
   ]);
-  if (Buffer.byteLength(JSON.stringify(messages)) > maxBytes)
-    throw new Error("native-image-budget");
-  return messages;
+  const byteLength = Buffer.byteLength(JSON.stringify(messages)) + extraBytes;
+  return {
+    messages,
+    byteLength,
+    async materialize(readArtifact, maxBytes = 128_000) {
+      if (byteLength > maxBytes) throw new Error("native-image-budget");
+      if (attachments.length && !readArtifact)
+        throw new Error("native-image-binding-invalid");
+      const materialized: NativeMessage[] = JSON.parse(
+        JSON.stringify(messages),
+      );
+      for (const {
+        artifact,
+        image,
+        scope,
+        environmentId,
+        index,
+      } of attachments) {
+        let saved: any;
+        try {
+          saved = await readArtifact!({
+            id: artifact.id,
+            scope,
+            environmentId,
+          });
+        } catch {
+          throw new Error("native-image-unavailable");
+        }
+        if (
+          !saved?.artifact ||
+          actionDigest(saved.artifact) !== actionDigest(artifact) ||
+          typeof saved.dataBase64 !== "string" ||
+          saved.dataBase64.length > maxBytes
+        )
+          throw new Error("native-image-archive-mismatch");
+        const bytes = Buffer.from(saved.dataBase64, "base64");
+        if (
+          bytes.toString("base64") !== saved.dataBase64 ||
+          bytes.length !== artifact.size ||
+          createHash("sha256").update(bytes).digest("hex") !== artifact.hash ||
+          bytes.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a" ||
+          bytes.subarray(12, 16).toString() !== "IHDR" ||
+          bytes.readUInt32BE(16) !== image.width ||
+          bytes.readUInt32BE(20) !== image.height
+        )
+          throw new Error("native-image-integrity-failed");
+        (materialized[1]!.content as any[])[index].image += saved.dataBase64;
+      }
+      if (Buffer.byteLength(JSON.stringify(materialized)) !== byteLength)
+        throw new Error("native-image-integrity-failed");
+      return materialized;
+    },
+  };
+}
+export async function projectNativeToolResults(
+  entries: readonly NativeResultProjection[],
+  readArtifact?: NativeArtifactReader,
+  maxBytes = 128_000,
+): Promise<NativeMessage[]> {
+  return planNativeToolResults(entries).materialize(readArtifact, maxBytes);
 }
