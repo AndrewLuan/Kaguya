@@ -1,4 +1,5 @@
 /**
+ * 模型绑定缺失与变化有独立停止原因；旧 run 保持终态而不重新派发。
  * 功能概述：定义原生工具循环的持久事实和有界预算，LLM 与外部行动各自保存真实结果。
  * run 固定宿主配置；step 保存后继冻结知识；result 保存 call/receipt 配对；terminal 表示停止推进。
  * Runtime 写入，database 从 step 与真实模型请求重验补充依据；声明不执行工具或授予权限。
@@ -102,6 +103,8 @@ export const nativeToolTerminalInformationKind = defineInformationKind({
         "unknown",
         "partial",
         "unavailable",
+        "native-model-binding-missing",
+        "native-model-binding-changed",
         "protocol",
       ]),
       modelResult: z.record(z.string(), z.json()).nullable(),
@@ -110,7 +113,27 @@ export const nativeToolTerminalInformationKind = defineInformationKind({
   references: refs,
   log: { enabled: false },
 });
+export const nativeToolOriginCancelledInformationKind = defineInformationKind({
+  kind: "agent.heavy.tool.origin.cancelled.v1",
+  displayName: "工具任务原点取消",
+  description:
+    "在 run 创建或模型派发之前持久取消宿主任务原点，不宣称外部效果已撤回。",
+  payloadSchema: z.object({ originKey: id }).strict(),
+  references: refs,
+  log: { enabled: false },
+});
+export const nativeToolCancellationForwardedInformationKind =
+  defineInformationKind({
+    kind: "agent.heavy.tool.cancel.forwarded.v1",
+    displayName: "工具取消已转发",
+    description: "下游取消请求已完成转发；这不证明外部物理效果被撤回。",
+    payloadSchema: z.object({ originKey: id }).strict(),
+    references: refs,
+    log: { enabled: false },
+  });
 export const nativeToolInformationKinds = [
+  nativeToolOriginCancelledInformationKind,
+  nativeToolCancellationForwardedInformationKind,
   nativeToolRunInformationKind,
   nativeToolStepInformationKind,
   nativeToolResultInformationKind,

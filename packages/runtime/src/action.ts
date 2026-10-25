@@ -280,7 +280,17 @@ export class ActionExecutor implements ActionAccess {
       return unknown("success-evidence-insufficient");
     return output;
   }
-  async cancel(input: ActionIntervention) {
+  cancel(input: ActionIntervention) {
+    return this.cancelWithForwarding(input, false);
+  }
+  /** 宿主持久取消队列使用：转发失败必须可重试；转发成功不表示物理效果已撤回。 */
+  cancelForwarded(input: ActionIntervention) {
+    return this.cancelWithForwarding(input, true);
+  }
+  private async cancelWithForwarding(
+    input: ActionIntervention,
+    requireForwarded: boolean,
+  ) {
     const view = await this.options.store.intervene(input);
     const provider = this.providers.get(view.intent.providerId);
     if (
@@ -300,6 +310,7 @@ export class ActionExecutor implements ActionAccess {
         controlAuthorizationId: input.controlAuthorizationId,
       };
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let forwarded = false;
       try {
         const work = (async () => {
           if (view.intent.environment && this.options.resolveLeaseCredential)
@@ -311,10 +322,14 @@ export class ActionExecutor implements ActionAccess {
           )
             return undefined;
           const result = await provider.cancel!(controlInput);
+          forwarded = true;
           return result === undefined
             ? undefined
             : this.acceptOutcome(result, controlInput, provider);
-        })().catch(() => undefined);
+        })().catch((error) => {
+          if (requireForwarded) throw error;
+          return undefined;
+        });
         const receipt = await Promise.race([
           work,
           new Promise<undefined>((resolve) => {
@@ -324,7 +339,14 @@ export class ActionExecutor implements ActionAccess {
             }, 10000);
           }),
         ]);
-        if (receipt)
+        if (requireForwarded && !forwarded)
+          throw new Error("action-cancel-forwarding-unconfirmed");
+        // broker 可返回原成功/拒绝回执，说明取消已送达；它不是取消证据。
+        // 原 unknown/partial 只由显式 reconciliation 升级，不在取消路径改写。
+        if (
+          receipt &&
+          ["cancelled", "partial", "unknown"].includes(receipt.status)
+        )
           return this.options.store.confirmCancellation(
             input,
             view.attemptId,
@@ -334,6 +356,13 @@ export class ActionExecutor implements ActionAccess {
         clearTimeout(timer);
       }
     }
+    if (
+      requireForwarded &&
+      view.attemptId &&
+      ["cancel_requested", "unknown", "partial"].includes(view.state) &&
+      (!provider?.cancel || provider.version !== view.intent.providerVersion)
+    )
+      throw new Error("action-cancel-forwarding-unavailable");
     return view;
   }
   async supersede(input: ActionIntervention & { replacementIntentId: string }) {

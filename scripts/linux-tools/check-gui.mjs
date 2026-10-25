@@ -1,0 +1,421 @@
+/**
+ * 功能概述：GUI provider 的许可、一次性观察及双向排空合同测试，不连接模型或真实桌面。
+ * 原子发布回归在 rename 前冻结写者，验证 ready 不提前出现、旧 ledger 完整且失败不覆盖。
+ * drain 总预算回归用可控时钟确认阶段共享剩余时间、过期不派发、晚到结果不通过。
+ * 主要职责：用显式 barrier 制造准备/发送/释放交错，核对零旧输入、未知结果不重放和 ACK 时点。
+ * 代码库关系：直接调用 gui.mjs；实际 Cua/X11 行为继续由 check-gui-container.py 验证。
+ * 输入输出与副作用：仅临时 HOME；测试结束等待收尾并删除，PNG 字节用于原尺寸/hash 配对断言。
+ */
+import test from "node:test";
+import { promises as fs } from "node:fs";
+import { publishFixtureJson } from "./gui-fixture-json.mjs";
+import { fixtureBudget } from "./gui-fixture-budget.mjs";
+import { setImmediate as nextTurn } from "node:timers/promises";
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { GuiComponent } from "./gui.mjs";
+
+test("drain stages share one absolute budget and refuse expired dispatch", async () => {
+  let now = 0;
+  const limits = [];
+  const stage = fixtureBudget(150000, {
+    now: () => now,
+    bound: (result, limit) => {
+      limits.push(limit);
+      return result;
+    },
+  });
+  await stage(() => "started", 60000, "start");
+  now = 140000;
+  await stage(() => "observed", 25000, "observe");
+  assert.deepEqual(limits, [60000, 10000]);
+  now = 150000;
+  let dispatched = false;
+  assert.throws(
+    () =>
+      stage(
+        () => {
+          dispatched = true;
+        },
+        15000,
+        "input",
+      ),
+    /total-deadline/,
+  );
+  assert.throws(stage.check, /total-deadline/);
+  assert.equal(dispatched, false);
+});
+
+test("drain cannot accept a stage result after its absolute deadline", async () => {
+  let now = 0;
+  const stage = fixtureBudget(150000, {
+    now: () => now,
+    bound: (result) => result,
+  });
+  await assert.rejects(
+    stage(
+      () => {
+        now = 150000;
+        return "late";
+      },
+      150000,
+      "late",
+    ),
+    /total-deadline/,
+  );
+});
+
+const barrier = () => {
+  let resolve, reject;
+  const promise = new Promise((a, b) => {
+    resolve = a;
+    reject = b;
+  });
+  return { promise, resolve, reject };
+};
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==",
+  "base64",
+);
+const baseline = { keys: [], buttons: [], mapping: [[0]], per: 1 };
+const target = { kind: "window", pid: 123, windowId: 456 };
+async function fixture(t) {
+  const home = await mkdtemp(join(tmpdir(), "kaguya-gui-"));
+  const service = {
+    home,
+    environmentId: "env",
+    generation: 0,
+    mode: "automation",
+    closed: false,
+    instanceId: "service",
+  };
+  const state = { now: 1000000, input: [], stops: 0, resets: 0, drivers: [] };
+  const component = new GuiComponent({
+    now: () => state.now,
+    keyboard: async (request) => {
+      if (request.mode === "snapshot") {
+        state.baselineStarted?.resolve();
+        await state.baselineWait?.promise;
+        return baseline;
+      }
+      state.resets++;
+      state.resetStarted?.resolve();
+      await state.resetWait?.promise;
+      if (state.failReset) throw new Error("release-unconfirmed");
+      state.resetFinished = true;
+      return { keys: [], buttons: [], restoredKeycodes: [], roundTrip: true };
+    },
+    driverFactory: () => {
+      const driver = {
+        start: async () => ({}),
+        identity: () => ({ pid: 10 }),
+        stop: async () => {
+          state.stops++;
+          state.pendingInput?.reject(new Error("driver-stopped"));
+        },
+        call: async (name, args, gate) => {
+          if (name === "get_window_state")
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: 'window_id=456 pid=123 snapshot_id=s00000001\n- [0] text "Input" value="original"',
+                },
+                {
+                  type: "image",
+                  mimeType: "image/png",
+                  data: png.toString("base64"),
+                },
+              ],
+              structuredContent: {
+                capture_id: "capture-1",
+                coordinate_frame: "window",
+                screenshot_frame_valid: true,
+                screenshot_width: 1,
+                screenshot_height: 1,
+                window_bounds: { x: 42, y: 43, width: 1, height: 1 },
+                pid: 123,
+                window_id: 456,
+                snapshot_id: "s00000001",
+              },
+            };
+          gate();
+          state.input.push({ name, args });
+          state.inputStarted?.resolve();
+          if (state.pendingInput) return state.pendingInput.promise;
+          return {
+            structuredContent: {
+              effect: state.effect ?? "confirmed",
+              route: "accessibility",
+            },
+            content: [{ type: "text", text: "input receipt" }],
+          };
+        },
+      };
+      state.drivers.push(driver);
+      return driver;
+    },
+  });
+  await component.ready(service);
+  t.after(async () => {
+    state.baselineWait?.resolve();
+    state.resetWait?.resolve();
+    try {
+      await component.close();
+    } catch (error) {
+      if (!state.failReset) throw error;
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  let sequence = 0;
+  const request = (toolName, args) => {
+    const operationId = `operation-${++sequence}`;
+    const environment = {
+      environmentId: "env",
+      generation: service.generation,
+      leaseId: "lease",
+      workflowId: "workflow",
+      fencing: 1,
+    };
+    return {
+      kind: service.mode === "human" ? "human-operation" : "operation",
+      toolName,
+      arguments: args,
+      scope: "scope",
+      environment,
+      operationId,
+      attemptId: "attempt",
+      digest: "digest",
+      permit: {
+        ...environment,
+        operationId,
+        attemptId: "attempt",
+        digest: "digest",
+        expiresAt: new Date(state.now + 60000).toISOString(),
+        ...(service.mode === "human"
+          ? { audience: "human", humanSessionId: service.humanSessionId }
+          : {}),
+      },
+    };
+  };
+  const observe = async () =>
+    (await component.execute(request("gui.observe", { target }))).result
+      .observation;
+  const click = (observation) =>
+    request("gui.act", {
+      action: "click",
+      observation,
+      selector: { kind: "pixel", x: 0, y: 0 },
+    });
+  return { component, service, state, request, observe, click };
+}
+
+test("PNG bytes and window coordinates remain paired; input consumes its observation", async (t) => {
+  const f = await fixture(t);
+  const observed = await f.component.execute(
+    f.request("gui.observe", { target }),
+  );
+  assert.deepEqual(
+    Buffer.from(observed.artifacts[0].dataBase64, "base64"),
+    png,
+  );
+  assert.equal(
+    observed.result.image.sha256,
+    createHash("sha256").update(png).digest("hex"),
+  );
+  assert.deepEqual(observed.result.image.origin, { x: 42, y: 43 });
+  assert.equal(observed.result.image.coordinateFrame, "window");
+  assert.equal(observed.result.image.scale, 1);
+  const result = await f.component.execute(
+    f.click(observed.result.observation),
+  );
+  assert.equal(result.status, "succeeded");
+  assert.equal(f.state.input.length, 1);
+  assert.equal(f.state.input[0].args.capture_id, "capture-1");
+  assert.equal(f.state.resets, 1);
+  await assert.rejects(
+    f.component.execute(f.click(observed.result.observation)),
+    /stale-gui-observation/,
+  );
+  assert.equal(f.state.input.length, 1);
+});
+
+test("expired capture, changed lease, wrong generation and unsupported actions send nothing", async (t) => {
+  for (const kind of ["expiry", "lease", "generation", "outside", "launch"]) {
+    const f = await fixture(t),
+      observation = await f.observe(),
+      request = f.click(observation);
+    if (kind === "expiry") f.state.now += 30001;
+    if (kind === "lease") {
+      request.permit.leaseId = "replacement";
+      request.environment.leaseId = "replacement";
+    }
+    if (kind === "generation") f.service.generation++;
+    if (kind === "outside") request.arguments.selector.x = 1;
+    if (kind === "launch")
+      request.arguments = {
+        observation,
+        action: "launch_app",
+        command: "ignored",
+      };
+    await assert.rejects(f.component.execute(request));
+    assert.equal(f.state.input.length, 0, kind);
+  }
+});
+
+test("handoff during baseline preparation fences the final stdin send", async (t) => {
+  const f = await fixture(t),
+    observation = await f.observe();
+  f.state.baselineStarted = barrier();
+  f.state.baselineWait = barrier();
+  const action = f.component.execute(f.click(observation));
+  await f.state.baselineStarted.promise;
+  f.service.mode = "draining";
+  const handoff = f.component.isolate();
+  f.state.baselineWait.resolve();
+  assert.equal((await action).status, "unknown");
+  assert.equal(await handoff, true);
+  assert.equal(f.state.input.length, 0);
+});
+
+test("both audiences wait for input release before handoff acknowledgement", async (t) => {
+  for (const audience of ["automation", "human"]) {
+    const f = await fixture(t);
+    f.service.mode = audience;
+    f.service.humanSessionId = "human-session";
+    const observation = await f.observe();
+    f.state.pendingInput = barrier();
+    f.state.inputStarted = barrier();
+    f.state.resetStarted = barrier();
+    f.state.resetWait = barrier();
+    const action = f.component.execute(f.click(observation));
+    await f.state.inputStarted.promise;
+    f.service.mode = "draining";
+    let acknowledged = false;
+    const handoff = f.component.isolate().then(() => {
+      assert.equal(
+        f.state.resetFinished,
+        true,
+        "ACK must follow reset completion",
+      );
+      acknowledged = true;
+    });
+    try {
+      await f.state.resetStarted.promise;
+      await nextTurn();
+      assert.equal(acknowledged, false);
+    } finally {
+      f.state.resetWait.resolve();
+    }
+    await handoff;
+    assert.equal((await action).status, "unknown");
+    assert.equal(f.state.input.length, 1);
+  }
+});
+
+test("unconfirmed release never acknowledges isolation or starts a new driver", async (t) => {
+  const f = await fixture(t),
+    observation = await f.observe();
+  f.state.failReset = true;
+  await assert.rejects(
+    f.component.execute(f.click(observation)),
+    /release-unconfirmed/,
+  );
+  await assert.rejects(f.component.isolate(), /release-unconfirmed/);
+  await assert.rejects(f.observe(), /gui-drain-unconfirmed/);
+  assert.equal(f.state.drivers.length, 1);
+});
+
+test("unverifiable Cua result stays unknown and is never resent", async (t) => {
+  const f = await fixture(t),
+    observation = await f.observe();
+  f.state.effect = "unverifiable";
+  assert.equal(
+    (await f.component.execute(f.click(observation))).status,
+    "unknown",
+  );
+  await assert.rejects(
+    f.component.execute(f.click(observation)),
+    /stale-gui-observation/,
+  );
+  assert.equal(f.state.input.length, 1);
+});
+
+test(
+  "fixture JSON becomes visible only at the publication barrier",
+  { timeout: 5000 },
+  async (t) => {
+    for (const previous of [undefined, { count: 0 }]) {
+      await t.test(
+        previous
+          ? "keeps the prior ledger"
+          : "does not publish empty readiness",
+        async (t) => {
+          const root = await mkdtemp(join(tmpdir(), "kaguya-gui-publication-"));
+          t.after(() => rm(root, { recursive: true, force: true }));
+          const path = join(root, "fixture.json");
+          if (previous) await publishFixtureJson(path, previous);
+          const entered = barrier(),
+            release = barrier();
+          const rename = fs.rename;
+          t.mock.method(fs, "rename", async (...args) => {
+            if (args[1] === path) {
+              entered.resolve();
+              await release.promise;
+            }
+            return rename(...args);
+          });
+          const current = { uid: 1001, pid: 42, count: 1 };
+          const pending = publishFixtureJson(path, current);
+          try {
+            await Promise.race([
+              entered.promise,
+              pending.then(() => {
+                throw new Error("publication bypassed barrier");
+              }),
+            ]);
+            assert.deepEqual(
+              JSON.parse(await fs.readFile(`${path}.pending`, "utf8")),
+              current,
+            );
+            if (previous)
+              assert.deepEqual(
+                JSON.parse(await fs.readFile(path, "utf8")),
+                previous,
+              );
+            else await assert.rejects(fs.readFile(path), { code: "ENOENT" });
+          } finally {
+            release.resolve();
+            await pending;
+          }
+          assert.deepEqual(
+            JSON.parse(await fs.readFile(path, "utf8")),
+            current,
+          );
+          await assert.rejects(fs.stat(`${path}.pending`), { code: "ENOENT" });
+        },
+      );
+    }
+  },
+);
+
+test("failed fixture publication preserves the complete previous ledger", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "kaguya-gui-publication-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "fixture.json");
+  await publishFixtureJson(path, { count: 0 });
+  const rename = fs.rename;
+  t.mock.method(fs, "rename", async (...args) => {
+    if (args[1] === path) throw new Error("synthetic publication failure");
+    return rename(...args);
+  });
+  await assert.rejects(
+    publishFixtureJson(path, { count: 1 }),
+    /synthetic publication failure/,
+  );
+  assert.deepEqual(JSON.parse(await fs.readFile(path, "utf8")), { count: 0 });
+});

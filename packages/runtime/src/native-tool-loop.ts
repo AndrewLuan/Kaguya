@@ -1,4 +1,6 @@
 /**
+ * 原点不含路由；首轮冻结模型绑定，重启后每步核验，关闭 native 或更改配置即停止原 run。
+ * projectNativeToolResults 只读原图，关联图片和完整工具批次共同裁剪，闭合旧图片不永久占用预算。
  * 功能概述：协调 Heavy 单步模型与 W3 行动，不把 provider execute 装进 LLM SDK。
  * NativeToolLoop 固定宿主目录/预算，按持久步骤恢复调用和实际回执；cancel 先停 run 再调用 W3。
  * nativeToolWireName 生成稳定无点号别名，fitToolTranscript 按完整交互裁剪，保留图像与开放配对。
@@ -37,9 +39,16 @@ import {
 } from "@kaguya/schema";
 import type {
   ModelTaskCapability,
+  ModelTaskClientOptions,
   ModelTaskRequest,
   ModelTaskResult,
 } from "./model-task.js";
+
+import {
+  projectNativeToolResults,
+  type NativeArtifactReader,
+} from "./native-tool-results.js";
+import { nativeModelBindingSchema } from "./information-kinds.js";
 
 export type NativeToolRegistration = {
   id: string;
@@ -81,8 +90,17 @@ export interface NativeToolLoopOptions {
   tasks: readonly NativeToolTaskRoute[];
   budget?: Partial<NativeToolBudget>;
   memory?: boolean;
+  readArtifact?: NativeArtifactReader;
+  guiTasks?: import("./gui-tasks.js").GuiTaskHost;
 }
 type Spec = {
+  guiEnvironment?: {
+    environmentId: string;
+    generation: number;
+    workflowId: string;
+  };
+  origin: ReturnType<typeof nativeToolOrigin>;
+  modelBinding: z.infer<typeof nativeModelBindingSchema>;
   actionRunInformationId: string;
   observationId: string;
   sceneId: string;
@@ -95,6 +113,14 @@ type Spec = {
   contextInformationIds: string[];
   memory: z.infer<typeof nativeMemorySnapshotSchema> | null;
 };
+export function nativeToolOrigin(request: ModelTaskRequest<unknown>) {
+  return {
+    instanceId: request.activation.instanceId,
+    definitionId: request.activation.definitionId,
+    taskId: request.task.taskId,
+    sourceInformationId: request.sourceInformationId,
+  };
+}
 const json = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 function toolSchema(tool: NativeToolRegistration) {
   return tool.jsonSchema ?? z.toJSONSchema(tool.inputSchema!, { io: "input" });
@@ -134,6 +160,30 @@ export function fitToolTranscriptWithMetadata(
     seen = new Set<string>();
   let image = false;
   for (const message of input) {
+    if (message.nativeToolResultGroup !== undefined) {
+      const previous = segments.at(-1);
+      const last = previous?.messages.at(-1);
+      const ids = Array.isArray(last?.content)
+        ? last.content.flatMap((p) =>
+            p &&
+            typeof p === "object" &&
+            !Array.isArray(p) &&
+            p.type === "tool-result"
+              ? [p.toolCallId]
+              : [],
+          )
+        : [];
+      if (
+        current.length ||
+        message.role !== "user" ||
+        last?.role !== "tool" ||
+        !ids.length ||
+        actionDigest(ids) !== actionDigest(message.nativeToolResultGroup)
+      )
+        throw new Error("native-orphan-image");
+      previous!.messages.push(message);
+      continue;
+    }
     current.push(message);
     if (Array.isArray(message.content))
       for (const raw of message.content) {
@@ -197,8 +247,11 @@ export class NativeToolLoop {
     private readonly deps: {
       db: KaguyaDatabase;
       core: InformationCore;
-      actions: ActionAccess;
+      actions: ActionAccess & { cancelForwarded?: ActionAccess["cancel"] };
       model: ModelTaskCapability;
+      resolveModel: (
+        request: ModelTaskRequest<unknown>,
+      ) => ReturnType<ModelTaskClientOptions["resolveModel"]>;
       options: NativeToolLoopOptions;
     },
   ) {
@@ -240,13 +293,17 @@ export class NativeToolLoop {
         t.routeId === request.selectionPolicy.routeId,
     );
   }
+  async existing(request: ModelTaskRequest<unknown>) {
+    return this.deps.db.nativeTools.byOrigin(nativeToolOrigin(request));
+  }
+  private modelBinding(request: ModelTaskRequest<unknown>) {
+    return nativeModelBindingSchema.parse({
+      selectionPolicy: request.selectionPolicy,
+      resolvedModel: this.deps.resolveModel(request),
+    });
+  }
   execute<T>(request: ModelTaskRequest<T>): Promise<ModelTaskResult<T>> {
-    const key = actionDigest([
-      request.activation,
-      request.task.taskId,
-      request.sourceInformationId,
-      request.selectionPolicy,
-    ]);
+    const key = actionDigest(nativeToolOrigin(request));
     const prior = this.inflight.get(key);
     if (prior) return prior as Promise<ModelTaskResult<T>>;
     const work = this.run(key, request).finally(() =>
@@ -256,7 +313,7 @@ export class NativeToolLoop {
     return work as Promise<ModelTaskResult<T>>;
   }
   private async open<T>(key: string, request: ModelTaskRequest<T>) {
-    const saved = await this.deps.db.nativeTools.byKey(key);
+    const saved = await this.existing(request);
     if (saved) return saved;
     const source = await this.deps.core.get(request.sourceInformationId);
     const turn = source?.payload.turn as
@@ -271,8 +328,13 @@ export class NativeToolLoop {
         manifest: any;
       }>(
         `SELECT o.observation_id,p.scene_id,p.contract,o.manifest FROM information_observations o JOIN information_observation_progress p USING(stream_id)
-      WHERE o.complete AND o.replacement_observation_id IS NULL AND o.manifest->>'runInformationId'=$1 AND p.consumer_id='agent.situation' ORDER BY o.through_position LIMIT 1`,
-        [turn.claimInformationId],
+      WHERE o.complete AND o.replacement_observation_id IS NULL AND o.manifest->>'runInformationId'=$1 AND p.consumer_id='agent.situation' AND ($2::text IS NULL OR o.observation_id=$2) ORDER BY o.through_position LIMIT 1`,
+        [
+          turn.claimInformationId,
+          source?.kind === "agent.gui.task.requested.v1"
+            ? source.payload.observationId
+            : null,
+        ],
       )
     ).rows[0];
     if (!row) throw new Error("native-tool-observation-required");
@@ -282,7 +344,8 @@ export class NativeToolLoop {
     const a = row.contract.address,
       d = a.destination;
     const budget = nativeToolBudgetSchema.parse(this.deps.options.budget ?? {});
-    const route = this.enabled(request)!;
+    const route = this.enabled(request);
+    if (!route) throw new Error("native-route-unavailable");
     const declarations = route.toolIds.map((id) => {
       const t = this.registrations.get(id)!;
       return nativeToolDeclarationSchema.parse({
@@ -293,16 +356,37 @@ export class NativeToolLoop {
         inputSchema: toolSchema(t),
       });
     });
+    const scope = JSON.stringify([
+      a.platform,
+      a.adapterId,
+      d.kind,
+      d.userId ?? d.groupId ?? d.conversationId ?? null,
+    ]);
+    const gui =
+      source?.kind === "agent.gui.task.requested.v1"
+        ? source.payload
+        : undefined;
+    if (
+      request.task.taskId === "agent.gui.execute" &&
+      (!gui || gui.scope !== scope || gui.observationId !== row.observation_id)
+    )
+      throw new Error("native-gui-source-invalid");
     const spec: Spec = {
+      ...(gui
+        ? {
+            guiEnvironment: {
+              environmentId: String(gui.environmentId),
+              generation: Number(gui.generation),
+              workflowId: String(gui.workflowId),
+            },
+          }
+        : {}),
+      origin: nativeToolOrigin(request),
+      modelBinding: this.modelBinding(request),
       actionRunInformationId: turn.claimInformationId,
       observationId: row.observation_id,
       sceneId: row.scene_id,
-      scope: JSON.stringify([
-        a.platform,
-        a.adapterId,
-        d.kind,
-        d.userId ?? d.groupId ?? d.conversationId ?? null,
-      ]),
+      scope,
       deadline: new Date(Date.now() + budget.maxDurationMs).toISOString(),
       budget,
       declarations,
@@ -385,6 +469,21 @@ export class NativeToolLoop {
     if (row.stopped_id) return this.terminal(row);
     const spec = json(row.spec) as unknown as Spec;
     const budget = nativeToolBudgetSchema.parse(spec.budget);
+    if (!nativeModelBindingSchema.safeParse(spec.modelBinding).success)
+      return this.finish(row, "native-model-binding-missing");
+    const bindingAvailable = () => {
+      try {
+        return (
+          Boolean(this.enabled(request)) &&
+          actionDigest(this.modelBinding(request)) ===
+            actionDigest(spec.modelBinding)
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!bindingAvailable())
+      return this.finish(row, "native-model-binding-changed");
     // 注册配置变化不得在恢复中悄悄改用另一工具或 schema。
     for (const d of spec.declarations) {
       const t = this.registrations.get(d.id);
@@ -427,6 +526,16 @@ export class NativeToolLoop {
         }
         if (Date.now() >= Date.parse(spec.deadline))
           return this.finish(row, "budget");
+        if (!bindingAvailable())
+          return this.finish(row, "native-model-binding-changed");
+        if (
+          spec.guiEnvironment &&
+          !(await this.deps.options.guiTasks?.validate({
+            ...spec.guiEnvironment,
+            scope: spec.scope,
+          }))
+        )
+          return this.finish(row, "unavailable");
         const step = await this.deps.db.nativeTools.freeze(
           {
             runInformationId: row.run_id,
@@ -465,6 +574,8 @@ export class NativeToolLoop {
           : undefined;
         const requestInput: ModelTaskRequest<T> = {
           ...request,
+          selectionPolicy: spec.modelBinding.selectionPolicy,
+          nativeModelBinding: spec.modelBinding,
           prompt,
           contextAtoms: atoms,
           tools: spec.declarations,
@@ -541,20 +652,20 @@ export class NativeToolLoop {
           saved.map((c) => c.result_id!),
         );
         transcript.push(
-          ...nativeMessagesSchema.parse([
-            {
-              role: "tool",
-              content: saved.map((c, i) => ({
-                type: "tool-result",
-                toolCallId: c.call_id,
-                toolName: c.call.toolName,
-                output: {
-                  type: "json",
-                  value: json(results[i]!.payload.value),
-                },
-              })),
-            },
-          ]),
+          ...(await projectNativeToolResults(
+            saved.map((c, i) => ({
+              toolCallId: c.call_id,
+              toolName: c.call.toolName,
+              toolId:
+                spec.declarations.find((d) => d.wireName === c.call.toolName)
+                  ?.id ?? "",
+              intentId: c.intent_id,
+              scope: spec.scope,
+              value: results[i]!.payload.value,
+            })),
+            this.deps.options.readArtifact,
+            budget.maxContextBytes,
+          )),
         );
         receipts = results.flatMap((a) =>
           a.payload.receiptId ? [String(a.payload.receiptId)] : [],
@@ -697,6 +808,15 @@ export class NativeToolLoop {
         stepInformationId: stepId,
         scope: spec.scope,
       });
+      if (
+        spec.guiEnvironment &&
+        (!binding.environment ||
+          binding.environment.environmentId !==
+            spec.guiEnvironment.environmentId ||
+          binding.environment.generation !== spec.guiEnvironment.generation ||
+          binding.environment.workflowId !== spec.guiEnvironment.workflowId)
+      )
+        throw new Error("native-gui-environment-changed");
       const operationId = `native:${row.run_id}:${call.step_index}:${call.call_index}:${actionDigest(call.call_id)}`;
       const intent: ActionIntent = {
         operationId,
@@ -797,6 +917,7 @@ export class NativeToolLoop {
     runInformationId: string,
     causeId: string,
     reason = "cancelled",
+    requireForwarded = false,
   ) {
     const row = await this.deps.db.nativeTools.read(runInformationId),
       spec = json(row.spec) as unknown as Spec;
@@ -810,12 +931,22 @@ export class NativeToolLoop {
       await this.deps.model.cancel({ requestedInformationId: id, reason });
     for (const id of await this.deps.db.nativeTools.intents(runInformationId)) {
       const view = await this.deps.actions.read(id, spec.scope);
+      if (
+        requireForwarded &&
+        ["succeeded", "rejected", "cancelled", "superseded"].includes(
+          view.state,
+        )
+      )
+        continue;
       const tool = this.registrations.get(view.intent.toolName);
       if (
         !tool ||
         !(await tool.authorize({ intent: view.intent, mode: "cancel" }))
-      )
+      ) {
+        if (requireForwarded)
+          throw new Error("native-cancel-forwarding-unavailable");
         continue;
+      }
       const control = {
         ...view.intent,
         authorizationId: `native-cancel:${stopped}:${id}:${randomUUID()}`,
@@ -837,7 +968,11 @@ export class NativeToolLoop {
         expiresAt: control.deadline,
         causeInformationId: causeId,
       });
-      await this.deps.actions.cancel({
+      const cancel = requireForwarded
+        ? this.deps.actions.cancelForwarded
+        : this.deps.actions.cancel;
+      if (!cancel) throw new Error("native-cancel-forwarding-unavailable");
+      await cancel.call(this.deps.actions, {
         intentId: id,
         scope: spec.scope,
         causeInformationId: causeId,

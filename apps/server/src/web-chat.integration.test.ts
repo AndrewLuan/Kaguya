@@ -1,4 +1,5 @@
 /**
+ * 原生 Memory fixture 显式声明合成模型配置身份，恢复与生产路径执行相同的冻结校验。
  * 功能概述：用真实 HTTP 路由、Runtime、正式模块组合和 PGlite 信息账本验证 WebUI 私聊闭环。
  * 主要职责：fixture 仅替换模型供应商 HTTP，保留 Light、Heavy、Web transport 与历史读取；
  * exchange 在同一个显式持久化等待预算内确认回复可读和订阅队列闭合，避免把 202 当成回复完成。
@@ -203,6 +204,12 @@ async function fixture(
           providerId: "web-test",
           modelId: `web-test-${modelTier}`,
           model: provider.chatModel(`web-test-${modelTier}`),
+          configuration: {
+            adapter: "synthetic-openai-compatible",
+            protocol: "chat-completions",
+            endpoint: "https://web-chat-provider.invalid/v1",
+            revision: "1",
+          },
         }),
         {
           ...(options.nativeMemoryTools

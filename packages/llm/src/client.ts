@@ -1,4 +1,5 @@
 /**
+ * boundedModelFetch 在 provider SDK 完成序列化后核对原生请求字节预算，AsyncLocalStorage 隔离并发请求；超额时网络调用为零。
  * 功能概述：提供无持久化副作用的结构化 LLM 调用边界，只负责模型解析、调用、输出校验、
  * usage 累加、耗时计算和 provider 错误分类。JSON mode 最多两次，Schema mode 单次。
  * 工具模式只生成一步，冻结原始参数并返回调用；没有 execute、自动修复或正文重试。
@@ -15,6 +16,7 @@
  * normalizeError 还从直接或包装的 APICallError 提取有界状态与固定词表诊断；原始错误、
  * 响应正文和请求数据仍只留在私有字段，供 Runtime 写入的字段不包含上游自由文本。
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   nativeResponseSchema,
   type NativeToolDeclaration,
@@ -41,6 +43,17 @@ import {
   RetryError,
 } from "ai";
 
+const nativeWireBudget = new AsyncLocalStorage<number | undefined>();
+/** 宿主 SDK fetch 包装器在最终 HTTP JSON 已序列化后计费；拒绝超额请求，不触发网络。 */
+export function boundedModelFetch(send: typeof globalThis.fetch = globalThis.fetch): typeof globalThis.fetch {
+  return async (input, init) => {
+    const limit = nativeWireBudget.getStore();
+    if (limit !== undefined && (typeof init?.body !== "string" || Buffer.byteLength(init.body) > limit))
+      throw new Error("Native wire input budget exhausted");
+    return send(input, init);
+  };
+}
+
 export type KaguyaLlmRequest<TOutput = unknown> = {
   readonly modelId: string;
   readonly outputMode: "text" | "object";
@@ -48,6 +61,7 @@ export type KaguyaLlmRequest<TOutput = unknown> = {
   readonly signal?: AbortSignal;
   readonly tools?: readonly NativeToolDeclaration[];
   readonly timeoutMs?: number;
+  readonly maxInputBytes?: number;
 } & (
   | { readonly prompt: CompiledPrompt; readonly messages?: never }
   | { readonly messages: NativeMessage[]; readonly prompt?: never }
@@ -301,13 +315,15 @@ export class KaguyaLlmClient {
           ]),
         );
         attemptCount = 1;
-        const result = await generateText({
+        if (request.maxInputBytes !== undefined && (!Number.isSafeInteger(request.maxInputBytes) || request.maxInputBytes < 1))
+          throw new Error("Invalid native input budget");
+        const result = await nativeWireBudget.run(request.maxInputBytes, () => generateText({
           ...common,
           tools,
           toolChoice: "auto",
           stopWhen: isStepCount(1),
           output: Output.text(),
-        });
+        }));
         usage = addUsage(usage, result.usage);
         attemptCount = 1;
         signal.throwIfAborted();

@@ -1,9 +1,11 @@
 /**
+ * serverGuiModelBindings 仅返回 linux-tools.json 的非秘密目标声明，供 Server 构建明确批准的 GUI 模型路由。
  * 功能概述：在 Server 生命周期中打开 MCP，合并已有 Memory 工具路由并提供管理端按需读取入口。
  * openServerMcp 缺省关闭；mcpRuntimeOptions 复用 W4 注册/W3 provider，不创建第二个执行循环。
  * registerMcpRoutes 每个请求验证 Gateway management token；prompt 展开仅由明确用户 POST 创建选择。
  * 连接目标和凭据引用来自敏感 mcp.json，HTTP 请求只能给出已配置连接、scope、资源 URI 或 prompt 参数。
  * 返回值保留不可信来源；Linux shell 从独立敏感配置显式启用，合并 providers 并共用关闭顺序。
+ * Linux GUI 管理路由复用当前 host 与 management 认证，人工会话秘密保留在宿主 client。
  */
 import { isDeepStrictEqual } from "node:util";
 import { createRuntimeKindRegistry } from "@kaguya/runtime";
@@ -35,6 +37,7 @@ import { openLinuxTools, mergeLinuxTools } from "./linux-tools-host.js";
 import type { LinuxToolsHost } from "@kaguya/runtime";
 import type { ActionProvider } from "@kaguya/sdk";
 import type { ModuleCapabilityImplementation } from "@kaguya/sdk";
+import { registerLinuxEnvironmentRoutes } from "./linux-environment-routes.js";
 const linuxHosts = new Map<McpHost, LinuxToolsHost>();
 
 export function createMcpLateResultRecorder(database: KaguyaDatabase) {
@@ -155,6 +158,16 @@ export function mcpRuntimeOptions(
     },
   };
 }
+/** 宿主批准的 GUI 模型声明，凭据仍由 selected Profile 的 resolver 提供。 */
+export function serverGuiModelBindings(host: McpHost) {
+  return (
+    linuxHosts
+      .get(host)
+      ?.configuration.bindings.flatMap((b) =>
+        b.guiModel ? [b.guiModel] : [],
+      ) ?? []
+  );
+}
 export function withServerMcp<
   T extends {
     nativeTools?: NativeToolLoopOptions;
@@ -207,7 +220,17 @@ export function registerMcpRoutes(
   app: FastifyInstance,
   getHost: () => McpHost | undefined,
   auth: GatewayAuthenticator,
+  getGuiTasks?: () => import("@kaguya/runtime").GuiTaskService | undefined,
 ) {
+  registerLinuxEnvironmentRoutes(
+    app,
+    () => {
+      const host = getHost();
+      return host ? linuxHosts.get(host) : undefined;
+    },
+    auth,
+    getGuiTasks,
+  );
   app.post(
     "/api/mcp/read",
     {

@@ -1,6 +1,7 @@
 """功能概述：Linux 工具环境的唯一租约/代次权威，持久保存操作事实而不重试未知副作用。
 主要职责：Journal 原子追加 fsync 事件；Broker 管理 acquire/renew/release/takeover、
 实际入口 fencing、取消 tombstone、历史核对及内容寻址产物；PodmanBackend 固定容器参数。
+人工会话凭证仅存摘要；handoff/resume 等待双向输入排空，关闭或到期后保持人工模式。
 可信 Chromium 桌面可显式选择固定 seccomp profile，仅调整内层 sandbox 所需 chroot。
 代码库关系：server.py 验 SO_PEERCRED 后调用；TypeScript provider 消费 ActionExecution。
 shell_jobs/job_runner 在宿主监督独立命令容器；GUI/browser helper 从不执行任意 shell。
@@ -236,7 +237,7 @@ class Broker:
         except Exception:
             failures.append("isolation")
         try:
-            self._save_env({**env, "state": "quarantined" if isolated else "isolation_failed", "lease": None})
+            self._save_env({**env, "state": "quarantined" if isolated else "isolation_failed", "lease": None, "humanSession": None})
         except Exception:
             failures.append("journal")
         if failures:
@@ -251,7 +252,17 @@ class Broker:
         return env
 
     def public(self, env):
-        return {k: v for k, v in env.items() if k not in ("lease", "container", "releaseReceipt")}
+        result = {k: v for k, v in env.items() if k not in ("lease", "container", "releaseReceipt", "humanSession", "pendingHuman", "controlReceipt", "pendingControl", "closedHuman", "pendingHumanClose")}
+        session = env.get("humanSession")
+        if session:
+            result["human"] = {"sessionId": session["id"], "expiresAt": datetime.fromtimestamp(session["expires"], timezone.utc).isoformat().replace("+00:00", "Z")}
+        if env.get("pendingControl"):
+            result["pendingControl"] = {k: env["pendingControl"][k] for k in ("mode", "generation")}
+        return result
+
+    def inspect(self, req):
+        with self._lock(req["environmentId"]):
+            return self.public(self._env(req["environmentId"], req["scope"]))
 
     def create(self, req):
         env_id = identifier(req["environmentId"])
@@ -262,6 +273,10 @@ class Broker:
             raise BrokerError("network-policy-not-allowed")
         if req.get("sandboxPolicy", "default") not in ("default", "chromium-v1"):
             raise BrokerError("sandbox-policy-not-allowed")
+        if req.get("desktopKind", "tools") not in ("tools", "gui"):
+            raise BrokerError("desktop-kind-not-allowed")
+        if req.get("desktopKind") == "gui" and req.get("sandboxPolicy") != "chromium-v1":
+            raise BrokerError("gui-sandbox-policy-required")
         resources = req["resourceIds"]
         if not isinstance(resources, list) or not 0 < len(resources) <= 16 or len(set(resources)) != len(resources):
             raise BrokerError("invalid-resources")
@@ -282,6 +297,7 @@ class Broker:
                 env = {"environmentId": env_id, "scope": text(req["scope"]), "workspaceId": workspace,
                        "resourceIds": resources, "image": image, "network": req.get("network", "none"),
                        "sandboxPolicy": req.get("sandboxPolicy", "default"),
+                       "desktopKind": req.get("desktopKind", "tools"),
                        "generation": 0, "fencing": "0", "lease": None, "state": "preparing",
                        "container": "kaguya-" + digest(env_id)[:20] + "-0"}
                 self._save_env(env)
@@ -412,32 +428,127 @@ class Broker:
 
     def _change_control(self, req, mode):
         env_id = identifier(req["environmentId"])
-        text(req["controlAuthorizationId"])
+        authorization = text(req["controlAuthorizationId"])
+        session = None
+        session_proof = None
+        if mode == "human" and req.get("humanSession") is not None:
+            value = req["humanSession"]
+            if (not isinstance(value, dict) or set(value) != {"id", "token", "ttlSeconds"} or
+                    not isinstance(value["id"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["id"]) or
+                    not isinstance(value["token"], str) or not 32 <= len(value["token"]) <= 256 or
+                    type(value["ttlSeconds"]) is not int or not 1 <= value["ttlSeconds"] <= 300):
+                raise BrokerError("invalid-human-session")
+            session_proof = {"id": value["id"], "tokenHash": digest(value["token"]), "ttlSeconds": value["ttlSeconds"]}
+            session = {"id": value["id"], "tokenHash": session_proof["tokenHash"], "expires": self.clock() + value["ttlSeconds"]}
+        proof = {"authorizationId": authorization, "generation": req["generation"], "mode": mode, "human": session_proof}
         with self._lock(env_id):
             env = self._env(env_id, req["scope"])
+            if env.get("controlReceipt") == proof and env["generation"] == req["generation"] + 1:
+                return self.public(env)
             if env["generation"] != req["generation"]:
                 raise BrokerError("stale-environment")
             pending = env.get("pendingControl")
-            retry = env["state"] == "draining" and pending == {"mode": mode, "generation": env["generation"] + 1}
+            desired = {"mode": mode, "generation": env["generation"] + 1, "proof": proof}
+            retry = env["state"] == "draining" and pending == desired
             if mode == "automation" and env["state"] != "human" and not retry:
                 raise BrokerError("human-handoff-required")
-            if mode == "human" and env["state"] != "ready" and not retry:
+            if mode == "human" and env["state"] not in ("ready", "human") and not retry:
                 raise BrokerError("environment-not-ready-for-handoff")
             next_generation = env["generation"] + 1
-            self._save_env({**env, "state": "draining", "lease": None,
-                            "pendingControl": {"mode": mode, "generation": next_generation}})
+            if retry:
+                session = env.get("pendingHuman")
+            self._save_env({**env, "state": "draining", "lease": None, "humanSession": None,
+                            "pendingControl": desired, "pendingHuman": session})
             # 此操作保留桌面；backend 必须确认旧自动化通道隔离，不能通过杀桌面冒充。
-            ack = self.backend.handoff(env, next_generation, mode)
+            transition = {**env, "pendingHuman": session}
+            ack = self.backend.handoff(transition, next_generation, mode)
             if (ack.get("helperProtocolVersion") != 1 or ack.get("automationIsolated") is not True or
+                    ack.get("humanInputsIsolated") is not True or
+                    ack.get("humanSessionId") != (session["id"] if session else None) or
                     ack.get("generation") != next_generation or ack.get("mode") != mode):
                 raise BrokerError("handoff-unconfirmed")
             new = {**env, "generation": next_generation, "lease": None,
+                   "humanSession": session, "controlReceipt": proof,
                    "state": "human" if mode == "human" else "ready"}
             new.pop("pendingControl", None)
+            new.pop("pendingHuman", None)
             self._save_env(new)
             return self.public(new)
 
-    def _operation(self, req):
+    def human_reference(self, env):
+        session = env["humanSession"]
+        return {**{k: env[k] for k in ("environmentId", "generation", "workspaceId", "resourceIds", "fencing")},
+                "workflowId": "human:" + session["id"], "leaseId": session["id"],
+                "expiresAt": datetime.fromtimestamp(session["expires"], timezone.utc).isoformat().replace("+00:00", "Z")}
+
+    def _validate_human(self, req, allow_expired=False):
+        env = self._env(req["environmentId"], req["scope"])
+        session = env.get("humanSession")
+        if (env["state"] != "human" or not session or req.get("generation") != env["generation"] or
+                req.get("sessionId") != session["id"] or not isinstance(req.get("token"), str) or
+                not hmac.compare_digest(digest(req["token"]), session["tokenHash"]) or
+                (not allow_expired and session["expires"] <= self.clock())):
+            raise BrokerError("human-session-not-authorized")
+        return env
+
+    def human_renew(self, req):
+        with self._lock(req["environmentId"]):
+            env = self._validate_human(req)
+            ttl = req.get("ttlSeconds", 60)
+            if type(ttl) is not int or not 1 <= ttl <= 300:
+                raise BrokerError("invalid-human-session-ttl")
+            env = {**env, "humanSession": {**env["humanSession"], "expires": self.clock() + ttl}}
+            self._save_env(env)
+            return self.public(env)
+
+    def human_close(self, req):
+        with self._lock(req["environmentId"]):
+            env = self._env(req["environmentId"], req["scope"])
+            receipt = env.get("closedHuman")
+            proof = {"sessionId": req["sessionId"], "generation": req["generation"], "tokenHash": digest(req["token"])}
+            if receipt == proof and env["generation"] == req["generation"] + 1 and env["state"] == "human":
+                return self.public(env)
+            pending = env.get("pendingHumanClose")
+            if not (env["state"] == "draining" and pending == proof):
+                self._validate_human(req, allow_expired=True)
+            return self._end_human(env, proof)
+
+    def _end_human(self, env, proof):
+        generation = env["generation"] + 1
+        pending = {"mode": "human", "generation": generation}
+        self._save_env({**env, "state": "draining", "lease": None, "humanSession": None,
+                        "pendingControl": pending, "pendingHumanClose": proof})
+        ack = self.backend.handoff({**env, "pendingHuman": None}, generation, "human")
+        if (ack.get("helperProtocolVersion") != 1 or ack.get("humanInputsIsolated") is not True or
+                ack.get("automationIsolated") is not True or ack.get("humanSessionId") is not None or
+                ack.get("generation") != generation or ack.get("mode") != "human"):
+            raise BrokerError("human-input-isolation-unconfirmed")
+        new = {**env, "state": "human", "generation": generation, "lease": None, "humanSession": None, "closedHuman": proof}
+        for field in ("pendingControl", "pendingHumanClose", "pendingHuman", "controlReceipt"):
+            new.pop(field, None)
+        self._save_env(new)
+        return self.public(new)
+
+    def expire_humans(self):
+        with self.guard:
+            identities = list(self.environments)
+        for env_id in identities:
+            with self._lock(env_id):
+                env = self.environments[env_id]
+                session = env.get("humanSession")
+                if env["state"] == "human" and session and session["expires"] <= self.clock():
+                    proof = {"sessionId": session["id"], "generation": env["generation"], "tokenHash": session["tokenHash"]}
+                elif env["state"] == "draining" and env.get("pendingHumanClose"):
+                    proof = env["pendingHumanClose"]
+                else:
+                    continue
+                try:
+                    self._end_human(env, proof)
+                except Exception:
+                    # 状态已保持 draining，下一轮只重试同一幂等隔离，不派发输入。
+                    pass
+
+    def _operation(self, req, audience="automation"):
         for field in ("intentId", "attemptId", "operationId", "digest", "toolName"):
             text(req[field])
         text(req["scope"])
@@ -451,6 +562,8 @@ class Broker:
         body = {k: req[k] for k in ("intentId", "attemptId", "operationId", "digest", "scope",
                                     "toolName", "arguments", "target", "deadline")}
         body["environment"] = {k: v for k, v in original.items() if k != "expiresAt"}
+        if audience == "human":
+            body["audience"] = "human"
         if req["token"] in canonical(body):
             raise BrokerError("credential-in-operation")
         key = digest([env["environmentId"], req["operationId"]])
@@ -460,13 +573,38 @@ class Broker:
         return key, old, body
 
     def execute(self, req):
+        return self._execute(req)
+
+    def human_execute(self, req):
+        with self._lock(req["environmentId"]):
+            env = self._validate_human(req)
+            request = {**req, "environment": self.human_reference(env)}
+        return self._execute(request, human=True)
+
+    def human_query(self, req):
+        with self._lock(req["environmentId"]):
+            self._env(req["environmentId"], req["scope"])
+            old = self.operations.get(digest([req["environmentId"], text(req["operationId"])]))
+            if not old or old["body"].get("audience") != "human" or old["body"]["scope"] != req["scope"]:
+                raise BrokerError("human-operation-not-authorized")
+            return {"operationId": old["operationId"], "attemptId": old["body"]["attemptId"], "outcome": old.get("outcome", outcome(reason="operation-in-flight"))}
+
+    def _stop_operation_inputs(self, env, human):
+        if not human:
+            return self._quarantine(env)
+        session = env.get("humanSession")
+        if session:
+            return self._end_human(env, {"sessionId": session["id"], "generation": env["generation"],
+                                         "tokenHash": session["tokenHash"]})
+
+    def _execute(self, req, human=False):
         env_id = req["environment"]["environmentId"]
         with self._lock(env_id):
-            env = self._validate(req["environment"], req["token"], req["scope"])
-            key, old, body = self._operation(req)
+            env = self._validate_human(req) if human else self._validate(req["environment"], req["token"], req["scope"])
+            key, old, body = self._operation(req, "human" if human else "automation")
             if old:
                 return old.get("outcome", outcome())
-            if (req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify") or req["toolName"] == "browser.verify":
+            if (req["toolName"] == "shell.exec" and req["arguments"].get("mode") == "verify") or req["toolName"] in ("browser.verify", "gui.verify"):
                 original = req["arguments"].get("original")
                 if not isinstance(original, dict):
                     raise BrokerError("original-operation-required")
@@ -476,6 +614,8 @@ class Broker:
                     raise BrokerError("original-operation-not-found")
                 source = previous["body"]
                 if req["toolName"] == "browser.verify" and source["toolName"] != "browser.act":
+                    raise BrokerError("original-operation-mismatch")
+                if req["toolName"] == "gui.verify" and source["toolName"] != "gui.act":
                     raise BrokerError("original-operation-mismatch")
                 if (source["scope"] != req["scope"] or source["attemptId"] != attempt or
                         source["environment"]["environmentId"] != env_id or
@@ -494,30 +634,35 @@ class Broker:
             if req["toolName"] not in ("shell.exec", "browser.observe", "browser.act", "browser.verify",
                                        "gui.observe", "gui.act", "gui.verify"):
                 raise BrokerError("operation-not-allowed")
+            if human and req["toolName"] not in ("gui.observe", "gui.act", "gui.verify"):
+                raise BrokerError("human-tool-not-allowed")
+            reference = self.human_reference(env) if human else self.reference(env)
             # observe/act/verify 引用必须来自当前 workflow/generation；helper 负责更细的 DOM freshness。
             source = req.get("arguments", {}).get("observation")
             if source is not None and (source.get("generation") != env["generation"] or
                                       source.get("environmentId") != env_id or
-                                      source.get("workflowId") != env["lease"]["workflowId"]):
+                                      source.get("workflowId") != reference["workflowId"]):
                 raise BrokerError("stale-observation")
             op = {"operationId": req["operationId"], "body": body, "bodyHash": digest(body), "phase": "prepared"}
-            permit_deadline = min(deadline, env["lease"]["expires"])
+            permit_deadline = min(deadline, (env["humanSession"] if human else env["lease"])["expires"])
             permit = {"expiresAt": datetime.fromtimestamp(permit_deadline, timezone.utc).isoformat().replace("+00:00", "Z"),
                       "environmentId": env_id, "generation": env["generation"], "fencing": env["fencing"],
-                      "leaseId": env["lease"]["leaseId"], "workflowId": env["lease"]["workflowId"],
+                      "leaseId": reference["leaseId"], "workflowId": reference["workflowId"],
                       "operationId": req["operationId"], "attemptId": req["attemptId"], "digest": req["digest"]}
+            if human:
+                permit.update(audience="human", humanSessionId=env["humanSession"]["id"])
             op["permit"] = permit
             self._save_op(key, op)
             handle = None
             try:
                 # 锁覆盖最后一次 fencing 与实际子进程创建，接管不能越过这个间隙。
-                handle = self.backend.launch(env, {**body, "helperProtocolVersion": 1, "kind": "operation", "permit": permit})
+                handle = self.backend.launch(env, {**body, "helperProtocolVersion": 1, "kind": "human-operation" if human else "operation", "permit": permit})
                 op = {**op, "phase": "dispatched"}
                 self._save_op(key, op)
             except Exception:
                 result = outcome(reason="dispatch-unconfirmed")
                 try:
-                    self._quarantine(env)
+                    self._stop_operation_inputs(env, human)
                 except Exception:
                     pass
                 if handle is not None:
@@ -536,7 +681,7 @@ class Broker:
                 current_env = self.environments[env_id]
                 if not self.closed and current_env["generation"] == env["generation"]:
                     try:
-                        self._quarantine(current_env)
+                        self._stop_operation_inputs(current_env, human)
                     except Exception:
                         pass
         with self._lock(env_id):
@@ -635,7 +780,8 @@ class Broker:
 
     def read_artifact(self, req):
         record = self.artifacts.get(req["id"])
-        if record is None or record["metadata"]["scope"] != req["scope"]:
+        if (record is None or record["metadata"]["scope"] != req["scope"] or
+                (req.get("environmentId") is not None and record["environmentId"] != req["environmentId"])):
             raise BrokerError("artifact-not-authorized")
         artifact = record["metadata"]
         fd = os.open(self.blobs / artifact["hash"], os.O_RDONLY | os.O_NOFOLLOW)
@@ -720,35 +866,77 @@ class PodmanBackend:
         volume = "kaguya-workspace-" + digest(env["workspaceId"])[:24]
         network = "none" if env["network"] == "none" else "pasta:--no-map-gw"
         member_args = []
+        gui = env.get("desktopKind") == "gui"
+        if gui and self.shell is None:
+            raise BrokerError("gui-managed-resource-slice-required")
         if env.get("sandboxPolicy") == "chromium-v1":
             profile = self.chromium_profile()
-            member_args += ["--security-opt=seccomp=" + str(profile), "--env=KAGUYA_BROWSER_ENABLED=1"]
+            member_args += ["--security-opt=seccomp=" + str(profile)]
+            if not gui:
+                member_args += ["--env=KAGUYA_BROWSER_ENABLED=1"]
         if self.shell is not None:
+            if gui:
+                self.prepare_gui_home(env)
             member_args += ["--cgroup-parent=" + self.shell.configure_environment(env),
                            "--label=kaguya.role=desktop", "--volume",
                            "kaguya-private-" + digest(env["environmentId"])[:24] + ":/private:rw"]
+        if gui:
+            member_args += ["--tmpfs=/run/kaguya-app:rw,nosuid,nodev,size=32m,mode=1777",
+                            "--tmpfs=/home/app:rw,nosuid,nodev,size=256m,mode=1777"]
+        entry = ["--entrypoint=/usr/local/bin/node", env["image"], "/opt/kaguya-tools/gui-init.mjs"] if gui else ["--entrypoint=/opt/kaguya-tools/init", env["image"]]
         self.command("run", "--detach", "--pull=never", "--name", env["container"],
                      *member_args,
                      "--label", "kaguya.environment=" + env["environmentId"],
                      "--userns=keep-id:uid=1000,gid=1000", "--user=1000:1000", "--cap-drop=ALL",
                      "--security-opt=no-new-privileges", "--read-only", "--network=" + network,
                      "--ipc=private", "--pid=private", "--cgroupns=private", "--cpus=1", "--memory=2g",
-                     "--memory-swap=2g", "--pids-limit=256", "--shm-size=512m", "--init",
+                     "--memory-swap=2g", "--pids-limit=" + ("384" if gui else "256"), "--shm-size=512m", "--init",
                      "--tmpfs=/tmp:rw,nosuid,nodev,size=512m", "--tmpfs=/run:rw,nosuid,nodev,size=64m",
                      "--tmpfs=/home/tool:rw,nosuid,nodev,size=256m,mode=0700,U",
                      "--volume", volume + ":/workspace:rw", "--env=HOME=/home/tool",
                      "--env=KAGUYA_HELPER_PROTOCOL_VERSION=1", "--env=KAGUYA_ENVIRONMENT_ID=" + env["environmentId"],
                      "--env=KAGUYA_ENVIRONMENT_GENERATION=" + str(env["generation"]),
                      "--env=CUA_DRIVER_RS_TELEMETRY_ENABLED=false", "--env=DO_NOT_TRACK=1", "--env=CUA_TELEMETRY=0",
-                     "--entrypoint=/opt/kaguya-tools/init", env["image"], timeout=60)
+                     *entry, timeout=60)
         info = json.loads(self.command("inspect", env["container"]))[0]
         if not info["State"]["Running"]:
             raise BrokerError("environment-not-running")
+        if gui:
+            self.command("exec", "--detach", "--user=1001:1001", env["container"],
+                         "/usr/bin/python3", "/opt/kaguya-tools/gui-app-session.py")
+            self.command("exec", "--user=1001:1001", env["container"], "/usr/bin/python3", "-I", "-c",
+                         "import pathlib,time; p=pathlib.Path('/run/kaguya-app/session/ready'); "
+                         "deadline=time.monotonic()+15\n"
+                         "while not p.is_file():\n"
+                         " if time.monotonic()>=deadline: raise RuntimeError('gui-session-not-ready')\n"
+                         " time.sleep(.02)\n", timeout=20)
         # init 必须先就绪固定内部服务，再让 helper 的 health 返回；running 不是能力就绪证明。
         ready = self.collect(self.launch(env, {"helperProtocolVersion": 1, "kind": "health"}), 15)
         if (ready.get("helperProtocolVersion") != 1 or ready.get("ready") is not True or
                 ready.get("generation") != env["generation"]):
             raise BrokerError("helper-not-ready")
+        if gui and not {"gui.observe", "gui.act", "gui.verify"}.issubset(ready.get("capabilities", [])):
+            raise BrokerError("gui-helper-capabilities-required")
+
+    def prepare_gui_home(self, env):
+        """在 rootless 用户 namespace 初始化固定命名卷；不提升容器 capability，也不递归 chown 用户内容。"""
+        volume = "kaguya-private-" + digest(env["environmentId"])[:24]
+        self.command("volume", "create", "--ignore", volume)
+        info = json.loads(self.command("volume", "inspect", volume))[0]
+        if info.get("Name") != volume or not isinstance(info.get("Mountpoint"), str):
+            raise BrokerError("gui-private-volume-unconfirmed")
+        self.command("unshare", "/usr/bin/python3", "-I", "-c",
+                     "import os,pathlib,stat,sys; p=pathlib.Path(sys.argv[1]); "
+                     "assert p.is_absolute() and p.resolve()==p; "
+                     "root=os.open(p,os.O_DIRECTORY|os.O_NOFOLLOW); "
+                     "assert os.fstat(root).st_uid in (0,1000); "
+                     "os.fchown(root,1000,1000); os.fchmod(root,0o711)\n"
+                     "try: os.mkdir('app',0o700,dir_fd=root)\n"
+                     "except FileExistsError: pass\n"
+                     "app=os.open('app',os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root); "
+                     "assert os.fstat(app).st_uid in (0,1001); "
+                     "os.fchown(app,1001,1001); os.fchmod(app,0o700); os.close(app); os.close(root)",
+                     info["Mountpoint"])
 
     def chromium_profile(self):
         info = json.loads(self.command("info", "--format=json"))
@@ -765,6 +953,10 @@ class PodmanBackend:
                    "environmentId": env["environmentId"], "expectedGeneration": env["generation"],
                    "generation": generation, "mode": mode,
                    "controlOperationId": digest([env["environmentId"], env["generation"], generation, mode])}
+        session = env.get("pendingHuman") if mode == "human" else None
+        if session:
+            request["humanSessionId"] = session["id"]
+            request["controlOperationId"] = digest([env["environmentId"], env["generation"], generation, mode, session["id"]])
         return self.collect(self.launch(env, request), 15)
 
     def isolate(self, env):

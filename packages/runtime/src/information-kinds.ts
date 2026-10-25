@@ -1,4 +1,5 @@
 /**
+ * 原生模型绑定保存首次批准的 policy 与非秘密配置摘要；可选字段保留旧任务事实的可读性。
  * 工具单步声明和原始调用随 requested/completed 保存，dispatched 为不自动重发的持久请求凭据。
  * conversationContextInformationKind 注册宿主冻结的背景与目标解析投影，内容日志仅输出目录状态。
  * 出站策略拒绝使用不含 target ID 的失败分支；消费者通过请求引用关联 turn，日志只投影安全字段。
@@ -56,6 +57,8 @@ import {
   defineInformationKind,
   type InformationKindDefinition,
 } from "@kaguya/sdk";
+
+import { guiTaskRequestedKind, guiTaskTerminalKind } from "./gui-task-kinds.js";
 
 const nonBlankString = z.string().trim().min(1);
 type InformationPromptVariable = JsonObject & {
@@ -273,6 +276,10 @@ export const modelTaskResolvedModelSchema = z
   .object({
     providerId: nonBlankString,
     modelId: nonBlankString,
+    configurationDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .exactOptional(),
   })
   .strict();
 const modelTaskProvenanceSchema = z.array(
@@ -294,6 +301,14 @@ export const modelTaskContextTrimmingSchema = z
     budgetBytes: z.number().int().positive(),
   })
   .strict();
+export const nativeModelBindingSchema = z
+  .object({
+    selectionPolicy: modelTaskSelectionPolicySchema,
+    resolvedModel: modelTaskResolvedModelSchema.extend({
+      configurationDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    }),
+  })
+  .strict();
 export const modelTaskMetadataSchema = z
   .object({
     taskId: nonBlankString,
@@ -308,6 +323,7 @@ export const modelTaskMetadataSchema = z
     messagesDigest: nonBlankString.nullable().default(null),
     tools: z.array(nativeToolDeclarationSchema).max(64).exactOptional(),
     contextTrimming: modelTaskContextTrimmingSchema.exactOptional(),
+    nativeModelBinding: nativeModelBindingSchema.exactOptional(),
     nativeStep: z
       .object({
         runInformationId: informationIdSchema,
@@ -700,6 +716,8 @@ export const modelTaskInformationKinds = Object.freeze([
 ] as const);
 
 export const builtInInformationKinds = Object.freeze([
+  guiTaskRequestedKind,
+  guiTaskTerminalKind,
   conversationContextInformationKind,
   targetAuthorizedInformationKind,
   messageConfirmedInformationKind,

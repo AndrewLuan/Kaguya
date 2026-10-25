@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from broker import BrokerError
 from shell_jobs import ShellJobs, LOG_RESERVATION, file_result, open_beneath, read_json, write_json
+from job_runner import container_command
 
 
 class Backend:
@@ -57,6 +58,21 @@ class ShellJobsTest(unittest.TestCase):
 
     def prepare(self, req):
         return self.jobs.prepare(self.env, req, self.jobs.check(self.env, req))
+
+    def test_gui_budget_preserves_aggregate_and_limits_all_jobs(self):
+        for kind, limit in (("tools", "256"), ("gui", "112")):
+            self.env["desktopKind"] = kind
+            with patch.object(self.jobs, "system") as system:
+                self.jobs.configure_environment(self.env)
+            calls = [call.args for call in system.call_args_list]
+            aggregate = next(call for call in calls if self.jobs.slice(self.env) in call and "set-property" in call)
+            jobs = next(call for call in calls if self.jobs.job_slice(self.env) in call and "set-property" in call)
+            self.assertIn("TasksMax=512", aggregate)
+            self.assertIn("MemoryMax=4G", aggregate)
+            self.assertIn("TasksMax=" + limit, jobs)
+            _, record, _ = self.prepare(self.request(kind))
+            self.assertEqual(record["desktopKind"], kind)
+            self.assertIn("--pids-limit=" + limit, container_command(record))
 
     def test_same_operation_returns_one_immutable_identity_without_extending_deadline(self):
         req = self.request()

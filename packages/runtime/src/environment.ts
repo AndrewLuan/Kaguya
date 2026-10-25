@@ -7,8 +7,10 @@
  * 输入输出与副作用：token 仅留宿主内存及 socket 请求；控制调用用新 lease 核对原 attempt。
  * 传输中断不是取消证明；返回已有成功证据时保留 succeeded，不改写成 cancelled。
  * release 仅在确认响应后移除秘密绑定；响应丢失可用同身份读取 broker 幂等释放回执。
+ * 人工会话保留独立秘密绑定；接管重试复用同一凭证，输入回执丢失后只查询原 operation。
  */
 import { createConnection } from "node:net";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { z } from "@kaguya/schema";
 import {
   actionEnvironmentSchema,
@@ -17,6 +19,11 @@ import {
   type ActionProvider,
 } from "@kaguya/sdk";
 import type { ActionExecutorOptions } from "./action.js";
+import {
+  linuxGuiActSchema,
+  linuxGuiObserveSchema,
+  linuxGuiVerifySchema,
+} from "./linux-gui.js";
 
 export type ActionEnvironment = z.infer<typeof actionEnvironmentSchema>;
 export type BrokerTransport = (
@@ -103,6 +110,66 @@ interface Binding {
   token: string;
 }
 
+export const environmentControlSchema = z.object({
+  environmentId: z.string(),
+  scope: z.string(),
+  generation: z.number().int().nonnegative(),
+  state: z.enum([
+    "preparing",
+    "ready",
+    "human",
+    "draining",
+    "quarantined",
+    "isolation_failed",
+  ]),
+  human: z
+    .object({
+      sessionId: z.string().regex(/^[a-f0-9]{64}$/),
+      expiresAt: z.iso.datetime(),
+    })
+    .optional(),
+  pendingControl: z
+    .object({
+      mode: z.enum(["human", "automation"]),
+      generation: z.number().int(),
+    })
+    .optional(),
+});
+export type EnvironmentControl = z.infer<typeof environmentControlSchema>;
+interface HumanBinding {
+  environmentId: string;
+  scope: string;
+  generation: number;
+  sessionId: string;
+  token: string;
+}
+const humanReceiptSchema = z.object({
+  operationId: z.string(),
+  attemptId: z.string(),
+  outcome: actionOutcomeSchema,
+});
+interface HumanControl {
+  fingerprint: string;
+  session: { id: string; token: string; ttlSeconds: number };
+  input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    controlAuthorizationId: string;
+  };
+  confirmed: boolean;
+}
+export type HumanReceipt = z.infer<typeof humanReceiptSchema>;
+export type HumanOperation = {
+  environmentId: string;
+  scope: string;
+  generation: number;
+  sessionId: string;
+  operationId: string;
+  toolName: "gui.observe" | "gui.act" | "gui.verify";
+  arguments: unknown;
+};
+
 function sameReference(a: ActionEnvironment, b: ActionEnvironment) {
   return (
     a.environmentId === b.environmentId &&
@@ -117,6 +184,15 @@ function sameReference(a: ActionEnvironment, b: ActionEnvironment) {
 
 export class LinuxEnvironmentClient {
   readonly #bindings = new Map<string, Binding>();
+  readonly #humans = new Map<string, HumanBinding>();
+  // 可执行绑定可立即撤销；清理 owner 必须保留到 broker 确认排空或后继代次已提交。
+  readonly #cleanupBindings = new Map<string, Binding>();
+  readonly #cleanupHumans = new Map<string, HumanBinding>();
+  readonly #humanControls = new Map<string, HumanControl>();
+  readonly #humanOperations = new Map<
+    string,
+    { fingerprint: string; promise: Promise<HumanReceipt> }
+  >();
   readonly #transport: BrokerTransport;
 
   constructor(transport: BrokerTransport = createUnixBrokerTransport()) {
@@ -139,6 +215,7 @@ export class LinuxEnvironmentClient {
     image: string;
     network?: "none" | "public-web";
     sandboxPolicy?: "default" | "chromium-v1";
+    desktopKind?: "tools" | "gui";
   }) {
     return this.#transport("environment.create", input);
   }
@@ -153,6 +230,10 @@ export class LinuxEnvironmentClient {
       await this.#transport("lease.acquire", input),
     );
     this.#bindings.set(input.environmentId, {
+      ...response,
+      scope: input.scope,
+    });
+    this.#cleanupBindings.set(this.#leaseKey(response.environment), {
       ...response,
       scope: input.scope,
     });
@@ -181,6 +262,7 @@ export class LinuxEnvironmentClient {
       scope,
     });
     this.#bindings.delete(environmentId);
+    this.#cleanupBindings.delete(this.#leaseKey(binding.environment));
     return result;
   }
 
@@ -191,9 +273,21 @@ export class LinuxEnvironmentClient {
     controlAuthorizationId: string;
   }) {
     try {
-      return await this.#transport("environment.recover", input);
+      const result = environmentControlSchema.parse(
+        await this.#transport("environment.recover", input),
+      );
+      if (
+        result.environmentId !== input.environmentId ||
+        result.scope !== input.scope ||
+        result.generation <= input.generation ||
+        result.state !== "ready"
+      )
+        throw new Error("environment-recovery-unconfirmed");
+      this.#forgetBefore(input.environmentId, result.generation);
+      return result;
     } finally {
       this.#bindings.delete(input.environmentId);
+      this.#humans.delete(input.environmentId);
     }
   }
 
@@ -204,7 +298,18 @@ export class LinuxEnvironmentClient {
     controlAuthorizationId: string;
   }) {
     try {
-      return await this.#transport("environment.handoff", input);
+      const result = environmentControlSchema.parse(
+        await this.#transport("environment.handoff", input),
+      );
+      if (
+        result.environmentId !== input.environmentId ||
+        result.scope !== input.scope ||
+        result.generation !== input.generation + 1 ||
+        result.state !== "human"
+      )
+        throw new Error("environment-handoff-unconfirmed");
+      this.#forgetBefore(input.environmentId, input.generation + 1);
+      return result;
     } finally {
       this.#bindings.delete(input.environmentId);
     }
@@ -216,11 +321,419 @@ export class LinuxEnvironmentClient {
     generation: number;
     controlAuthorizationId: string;
   }) {
-    return this.#transport("environment.resume", input);
+    this.#bindings.delete(input.environmentId);
+    this.#humans.delete(input.environmentId);
+    const result = environmentControlSchema.parse(
+      await this.#transport("environment.resume", input),
+    );
+    if (
+      result.environmentId !== input.environmentId ||
+      result.scope !== input.scope ||
+      result.generation !== input.generation + 1 ||
+      result.state !== "ready"
+    )
+      throw new Error("environment-resume-unconfirmed");
+    this.#forgetBefore(input.environmentId, input.generation + 1);
+    return result;
   }
 
-  readArtifact(id: string, scope: string) {
-    return this.#transport("artifact.read", { id, scope });
+  async inspect(
+    environmentId: string,
+    scope: string,
+  ): Promise<EnvironmentControl> {
+    const result = environmentControlSchema.parse(
+      await this.#transport("environment.inspect", { environmentId, scope }),
+    );
+    if (result.environmentId !== environmentId || result.scope !== scope)
+      throw new Error("environment-control-identity-mismatch");
+    return result;
+  }
+
+  async openHuman(input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    controlAuthorizationId: string;
+    ttlSeconds?: number;
+  }): Promise<EnvironmentControl> {
+    const ttlSeconds = z
+      .number()
+      .int()
+      .min(1)
+      .max(300)
+      .parse(input.ttlSeconds ?? 60);
+    const fingerprint = JSON.stringify({ ...input, ttlSeconds });
+    const key = JSON.stringify([
+      input.environmentId,
+      input.controlAuthorizationId,
+    ]);
+    let pending = this.#humanControls.get(key);
+    if (pending && pending.fingerprint !== fingerprint)
+      throw new Error("human-control-conflict");
+    this.#bindings.delete(input.environmentId);
+    this.#humans.delete(input.environmentId);
+    if (!pending) {
+      if (this.#humanControls.size >= 1024)
+        throw new Error("human-control-capacity");
+      const current = await this.inspect(input.environmentId, input.scope);
+      if (current.generation !== input.generation)
+        throw new Error("human-control-stale-generation");
+      pending = {
+        fingerprint,
+        input: {
+          environmentId: input.environmentId,
+          scope: input.scope,
+          generation: input.generation,
+          controlAuthorizationId: input.controlAuthorizationId,
+        },
+        confirmed: false,
+        session: {
+          id: randomBytes(32).toString("hex"),
+          token: randomBytes(32).toString("hex"),
+          ttlSeconds,
+        },
+      };
+      this.#humanControls.set(key, pending);
+      const candidate = {
+        environmentId: input.environmentId,
+        scope: input.scope,
+        generation: input.generation + 1,
+        sessionId: pending.session.id,
+        token: pending.session.token,
+      };
+      this.#cleanupHumans.set(this.#humanKey(candidate), candidate);
+    }
+    const result = environmentControlSchema.parse(
+      await this.#transport("environment.handoff", {
+        environmentId: input.environmentId,
+        scope: input.scope,
+        generation: input.generation,
+        controlAuthorizationId: input.controlAuthorizationId,
+        humanSession: pending.session,
+      }),
+    );
+    if (
+      result.environmentId !== input.environmentId ||
+      result.scope !== input.scope ||
+      result.generation !== input.generation + 1 ||
+      result.state !== "human" ||
+      result.human?.sessionId !== pending.session.id
+    )
+      throw new Error("human-handoff-unconfirmed");
+    this.#humans.set(input.environmentId, {
+      environmentId: input.environmentId,
+      scope: input.scope,
+      generation: result.generation,
+      sessionId: pending.session.id,
+      token: pending.session.token,
+    });
+    pending.confirmed = true;
+    this.#forgetBefore(input.environmentId, result.generation);
+    return result;
+  }
+
+  #human(input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    sessionId: string;
+  }) {
+    const binding = this.#humans.get(input.environmentId);
+    if (
+      !binding ||
+      binding.scope !== input.scope ||
+      binding.generation !== input.generation ||
+      binding.sessionId !== input.sessionId
+    )
+      throw new Error("human-session-unavailable");
+    return binding;
+  }
+
+  async renewHuman(input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    sessionId: string;
+    ttlSeconds?: number;
+  }) {
+    const binding = this.#human(input);
+    return environmentControlSchema.parse(
+      await this.#transport("human.renew", {
+        ...binding,
+        ttlSeconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(300)
+          .parse(input.ttlSeconds ?? 60),
+      }),
+    );
+  }
+
+  async closeHuman(input: {
+    environmentId: string;
+    scope: string;
+    generation: number;
+    sessionId: string;
+  }) {
+    const binding = this.#cleanupHumans.get(this.#humanKey(input));
+    if (!binding || binding.scope !== input.scope)
+      throw new Error("human-session-unavailable");
+    this.#humans.delete(input.environmentId);
+    const result = environmentControlSchema.parse(
+      await this.#transport("human.close", { ...binding }),
+    );
+    if (
+      result.environmentId !== binding.environmentId ||
+      result.scope !== binding.scope ||
+      result.state !== "human" ||
+      result.human ||
+      result.generation !== binding.generation + 1
+    )
+      throw new Error("human-close-unconfirmed");
+    this.#humans.delete(input.environmentId);
+    this.#cleanupHumans.delete(this.#humanKey(binding));
+    return result;
+  }
+
+  async queryHuman(
+    environmentId: string,
+    scope: string,
+    operationId: string,
+  ): Promise<HumanReceipt> {
+    const result = humanReceiptSchema.parse(
+      await this.#transport("human.query", {
+        environmentId,
+        scope,
+        operationId,
+      }),
+    );
+    if (result.operationId !== operationId)
+      throw new Error("human-operation-mismatch");
+    return result;
+  }
+
+  async closeHumans() {
+    const results = await Promise.allSettled(
+      [...this.#humans.values()].map((binding) => this.closeHuman(binding)),
+    );
+    if (results.some((result) => result.status === "rejected"))
+      throw new Error("human-cleanup-unconfirmed");
+  }
+
+  #leaseKey(environment: ActionEnvironment) {
+    return JSON.stringify([
+      environment.environmentId,
+      environment.generation,
+      environment.leaseId,
+    ]);
+  }
+  #forgetBefore(environmentId: string, generation: number) {
+    for (const [key, binding] of this.#cleanupBindings)
+      if (
+        binding.environment.environmentId === environmentId &&
+        binding.environment.generation < generation
+      )
+        this.#cleanupBindings.delete(key);
+    for (const [key, binding] of this.#cleanupHumans)
+      if (
+        binding.environmentId === environmentId &&
+        binding.generation < generation
+      )
+        this.#cleanupHumans.delete(key);
+  }
+  #humanKey(
+    binding: Pick<HumanBinding, "environmentId" | "generation" | "sessionId">,
+  ) {
+    return JSON.stringify([
+      binding.environmentId,
+      binding.generation,
+      binding.sessionId,
+    ]);
+  }
+
+  async closeOwnedInputs() {
+    this.#bindings.clear();
+    this.#humans.clear();
+    const pending = () =>
+      [...this.#humanControls.values()].filter((value) => !value.confirmed);
+    const resolvePending = async (value: HumanControl) => {
+      const { input } = value;
+      const current = await this.inspect(input.environmentId, input.scope);
+      if (
+        current.generation > input.generation ||
+        (current.generation === input.generation &&
+          current.state === "quarantined")
+      ) {
+        value.confirmed = true;
+        return;
+      }
+      const ack = environmentControlSchema.parse(
+        await this.#transport("environment.handoff", {
+          ...input,
+          humanSession: value.session,
+        }),
+      );
+      if (
+        ack.environmentId !== input.environmentId ||
+        ack.scope !== input.scope ||
+        ack.generation !== input.generation + 1 ||
+        ack.state !== "human" ||
+        ack.human?.sessionId !== value.session.id
+      )
+        throw new Error("human-cleanup-control-unconfirmed");
+      value.confirmed = true;
+    };
+    // 不重发输入。控制只以原 control ID 重试；一次未送达的 handoff 也须先确定其候选会话去向。
+    await Promise.allSettled(pending().map(resolvePending));
+    for (const [key, binding] of this.#cleanupBindings) {
+      try {
+        try {
+          const ack = environmentControlSchema.parse(
+            await this.#transport("lease.release", {
+              environment: binding.environment,
+              token: binding.token,
+              scope: binding.scope,
+            }),
+          );
+          if (
+            ack.environmentId !== binding.environment.environmentId ||
+            ack.scope !== binding.scope ||
+            ack.state !== "quarantined" ||
+            ack.generation !== binding.environment.generation
+          )
+            throw new Error("lease-cleanup-unconfirmed");
+        } catch {
+          const current = await this.inspect(
+            binding.environment.environmentId,
+            binding.scope,
+          );
+          if (!(
+            current.generation > binding.environment.generation &&
+            ["ready", "human", "quarantined"].includes(current.state)
+          ))
+            throw new Error("lease-cleanup-unconfirmed");
+        }
+        this.#cleanupBindings.delete(key);
+      } catch {
+        /* 保留 owner；其余会话仍独立尝试清理。 */
+      }
+    }
+    for (const [key, binding] of this.#cleanupHumans) {
+      try {
+        try {
+          const ack = environmentControlSchema.parse(
+            await this.#transport("human.close", { ...binding }),
+          );
+          if (
+            ack.environmentId !== binding.environmentId ||
+            ack.scope !== binding.scope ||
+            ack.state !== "human" ||
+            ack.human ||
+            ack.generation !== binding.generation + 1
+          )
+            throw new Error("human-close-unconfirmed");
+        } catch {
+          const current = await this.inspect(
+            binding.environmentId,
+            binding.scope,
+          );
+          const neverAdmitted =
+            current.state === "quarantined" &&
+            current.generation === binding.generation - 1 &&
+            [...this.#humanControls.values()].some(
+              (value) =>
+                value.session.id === binding.sessionId &&
+                value.input.generation === current.generation,
+            );
+          if (
+            !neverAdmitted &&
+            !(
+              current.generation >= binding.generation &&
+              ["ready", "human", "quarantined"].includes(current.state) &&
+              (current.generation > binding.generation ||
+                current.human?.sessionId !== binding.sessionId)
+            )
+          )
+            throw new Error("human-cleanup-unconfirmed");
+        }
+        this.#cleanupHumans.delete(key);
+      } catch {
+        /* 保留 owner；关闭失败不得表现成已清理。 */
+      }
+    }
+    await Promise.allSettled(pending().map(resolvePending));
+    if (
+      this.#cleanupBindings.size ||
+      this.#cleanupHumans.size ||
+      pending().length
+    )
+      throw new Error("environment-owned-input-cleanup-unconfirmed");
+  }
+
+  operateHuman(input: HumanOperation): Promise<HumanReceipt> {
+    const binding = this.#human(input);
+    const args = (
+      input.toolName === "gui.observe"
+        ? linuxGuiObserveSchema
+        : input.toolName === "gui.act"
+          ? linuxGuiActSchema
+          : linuxGuiVerifySchema
+    ).parse(input.arguments);
+    z.string().min(1).max(200).parse(input.operationId);
+    const fingerprint = JSON.stringify({ ...input, arguments: args });
+    const key = JSON.stringify([input.environmentId, input.operationId]);
+    const previous = this.#humanOperations.get(key);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new Error("human-operation-conflict");
+      // 不重发动作；并发调用共用原 Promise，后续状态由 queryHuman 单独核对。
+      return previous.promise;
+    }
+    if (this.#humanOperations.size >= 1024)
+      throw new Error("human-operation-capacity");
+    const attemptId = randomUUID();
+    const request = {
+      ...binding,
+      operationId: input.operationId,
+      attemptId,
+      intentId: randomUUID(),
+      toolName: input.toolName,
+      arguments: args,
+      target: {},
+      deadline: new Date(Date.now() + 60_000).toISOString(),
+      digest: createHash("sha256").update(fingerprint).digest("hex"),
+    };
+    const promise = Promise.resolve().then(async (): Promise<HumanReceipt> => {
+      try {
+        const outcome = actionOutcomeSchema.parse(
+          await this.#transport("human.execute", request),
+        );
+        return { operationId: input.operationId, attemptId, outcome };
+      } catch {
+        return {
+          operationId: input.operationId,
+          attemptId,
+          outcome: {
+            status: "unknown",
+            evidence: "unconfirmed",
+            result: { reason: "human-result-unconfirmed" },
+            artifacts: [],
+            truncated: false,
+          },
+        };
+      }
+    });
+    this.#humanOperations.set(key, { fingerprint, promise });
+    return promise;
+  }
+
+  readArtifact(id: string, scope: string, environmentId?: string) {
+    return this.#transport("artifact.read", {
+      id,
+      scope,
+      ...(environmentId ? { environmentId } : {}),
+    });
   }
 
   #binding(environmentId: string, scope: string) {

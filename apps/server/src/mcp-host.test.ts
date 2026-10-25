@@ -2,9 +2,12 @@
  * 功能概述：验证真实 Server 装配、Web→Heavy→W3→MCP→后继模型回复及管理端显式资源/prompt。
  * 只替换模型 HTTP 和数据库连接工厂；MCP 为真实独立 stdio/回环 HTTP 合成服务。
  * 使用临时配置、真实 PGlite 或显式 PostgreSQL schema；等待持久回执及队列收敛，精确核对副作用。
+ * Router 首轮排程与 provider 开始使用独立的 8 秒阶段，避免把上游排程耗时算入副作用等待。
+ * 管理 GUI 测试仅替换 broker RPC，保留真实 Host/W3/SDK 原图链路；不产生外部模型请求。
  * 正式链路按 MCP 回执、匹配 run 的模型/assistant 持久化、Web 交付与队列收敛分阶段等待。
  * fixture 在 setup 失败和 shutdown 异常时也尝试释放所有资源；记录子进程 PID，验证关闭后不残留。
  */
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, writeFile, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +15,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { afterEach, expect, it, vi } from "vitest";
-import { KaguyaRuntime } from "@kaguya/runtime";
+import {
+  KaguyaRuntime,
+  LinuxToolsHost,
+  LinuxEnvironmentClient,
+  nativeToolWireName,
+} from "@kaguya/runtime";
 import { KaguyaDatabase } from "@kaguya/database";
 import {
   createTestingDatabase,
@@ -34,7 +42,7 @@ import {
   expectPersistenceSettled,
 } from "./test-support/persistence.js";
 
-const models = vi.hoisted(() => ({ heavy: 0, requests: [] as any[] }));
+const models = vi.hoisted(() => ({ heavy: 0, gui: 0, requests: [] as any[] }));
 vi.mock("@ai-sdk/openai-compatible", async (original) => {
   const actual = await original<typeof import("@ai-sdk/openai-compatible")>();
   return {
@@ -47,18 +55,26 @@ vi.mock("@ai-sdk/openai-compatible", async (original) => {
           models.requests.push(body);
           const heavy = body.model === "heavy";
           if (heavy) models.heavy++;
-          const tools = heavy && models.heavy === 1 && body.tools?.length;
+          const gui = body.model === "vision";
+          if (gui) models.gui++;
+          const tools =
+            ((heavy && models.heavy === 1) || (gui && models.gui === 1)) &&
+            body.tools?.length;
           const message = tools
             ? {
                 role: "assistant",
                 content: null,
                 tool_calls: [
                   {
-                    id: "mcp-model-original",
+                    id: gui ? "gui-model-original" : "mcp-model-original",
                     type: "function",
                     function: {
-                      name: body.tools[0].function.name,
-                      arguments: '{"value":7}',
+                      name: gui
+                        ? nativeToolWireName("gui.observe", "1")
+                        : body.tools[0].function.name,
+                      arguments: gui
+                        ? '{"target":{"kind":"desktop"}}'
+                        : '{"value":7}',
                     },
                   },
                 ],
@@ -107,6 +123,7 @@ afterEach(async () => {
     }
   vi.restoreAllMocks();
   models.heavy = 0;
+  models.gui = 0;
   models.requests = [];
   if (errors.length)
     throw new AggregateError(errors, "Server MCP cleanup failed");
@@ -196,7 +213,7 @@ async function fixture(
           enabled: true,
           baseUrl: "https://synthetic.invalid/v1",
           apiKey: "synthetic",
-          models: ["light", "heavy"],
+          models: ["light", "heavy", "vision"],
           settings: {},
         },
       ],
@@ -323,6 +340,14 @@ it.each(["stdio", "http"] as const)(
     const wait = createPersistenceWait(f.db, () => ({ heavy: models.heavy }));
     let runInformationId: unknown;
     let assistantInformationId: string;
+    await wait("Router scheduled Heavy", async () => {
+      expect(
+        await f.db.information.find({
+          kinds: ["agent.router.message.intent.requested"],
+          limit: 10,
+        }),
+      ).toHaveLength(1);
+    });
     await wait(
       "MCP receipt persisted and follow-up Heavy started",
       async () => {
@@ -475,8 +500,243 @@ it.each(["stdio", "http"] as const)(
     f.clearServer();
     if (mode === "stdio") expect(() => process.kill(pid, 0)).toThrow();
   },
-  40000, // 三段各 8 秒；其余预算用于真实 Server/DB 初始化、MCP 管理读取与清理。
+  40000, // 四段各 8 秒；其余预算用于真实 Server/DB 初始化、MCP 管理读取与清理。
 );
+it("keeps same-scope chat on Heavy and runs an idempotent management GUI task with original image continuation", async () => {
+  const f = await fixture("stdio");
+  const config = {
+    version: 1 as const,
+    revision: "gui-test",
+    bindings: [
+      {
+        scope: f.scope,
+        environmentId: "desktop",
+        workflowId: "gui-flow",
+        gui: true,
+        guiModel: {
+          routeId: "gui.explicit",
+          providerId: "synthetic",
+          modelId: "vision",
+        },
+      },
+    ],
+  };
+  await writeSensitiveJson(join(f.root, "linux-tools.json"), config);
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const hash = createHash("sha256").update(png).digest("hex");
+  let artifact: any,
+    executions = 0;
+  const control = (state = "ready") => ({
+    environmentId: "desktop",
+    scope: f.scope,
+    generation: 1,
+    state,
+  });
+  const environment = () => ({
+    environmentId: "desktop",
+    generation: 1,
+    workspaceId: "workspace",
+    workflowId: "gui-flow",
+    resourceIds: [],
+    leaseId: "lease",
+    fencing: "1",
+    expiresAt: new Date(Date.now() + 120000).toISOString(),
+  });
+  // 只替换 broker RPC；Host 目录/绑定、W3、持久原图装配和最终 SDK wire 均走生产实现。
+  const linux = new LinuxToolsHost(
+    config,
+    new LinuxEnvironmentClient(async (method, params) => {
+      if (method === "environment.inspect") return control();
+      if (method === "lease.acquire")
+        return {
+          environment: environment(),
+          token: "synthetic-private-lease-secret-123456",
+        };
+      if (method === "lease.renew") return environment();
+      if (method === "lease.validate") return { valid: true };
+      if (method === "lease.release") return control("quarantined");
+      if (method === "artifact.read")
+        return { artifact, dataBase64: png.toString("base64") };
+      if (method === "operation.execute") {
+        executions++;
+        expect(params.toolName).toBe("gui.observe");
+        artifact = {
+          id: "gui-original",
+          hash,
+          mime: "image/png",
+          size: png.length,
+          scope: f.scope,
+          actionId: params.intentId,
+          generation: 1,
+          observedAt: "2026-10-25T00:00:00.000Z",
+          source: "environment-helper",
+          retention: "explicit-delete-only",
+        };
+        return {
+          status: "succeeded",
+          evidence: "returned",
+          artifacts: [artifact],
+          truncated: false,
+          result: {
+            observation: {
+              id: "a".repeat(64),
+              environmentId: "desktop",
+              workflowId: "gui-flow",
+              generation: 1,
+            },
+            image: {
+              captureId: "original",
+              coordinateFrame: "desktop",
+              width: 1,
+              height: 1,
+              originalWidth: 1,
+              originalHeight: 1,
+              scale: 1,
+              origin: { x: 0, y: 0 },
+              target: { kind: "desktop" },
+              sha256: hash,
+              mime: "image/png",
+              capturedAt: "2026-10-25T00:00:00.000Z",
+              serviceInstanceId: "service",
+              driverInstanceId: "driver",
+            },
+          },
+        };
+      }
+      throw new Error("unexpected synthetic broker method " + method);
+    }),
+  );
+  cleanups.push(() => linux.close());
+  const snapshot = LinuxToolsHost.prototype.snapshot;
+  vi.spyOn(LinuxToolsHost.prototype, "snapshot").mockImplementation(() =>
+    snapshot.call(linux),
+  );
+  const server = await f.start();
+  const headers = { authorization: "Bearer synthetic-gateway" };
+  expect(
+    (
+      await server.app.inject({
+        method: "POST",
+        url: "/api/v1/messages",
+        headers,
+        payload: {
+          text: "ordinary chat",
+          conversationId: "47d34f33-c005-45e1-bae4-06df09bd9dc1",
+        },
+      })
+    ).statusCode,
+  ).toBe(202);
+  const wait = createPersistenceWait(f.db, () => ({
+    heavy: models.heavy,
+    gui: models.gui,
+    executions,
+  }));
+  await wait("Router scheduled same-scope Heavy", async () => {
+    expect(
+      await f.db.information.find({
+        kinds: ["agent.router.message.intent.requested"],
+        limit: 10,
+      }),
+    ).toHaveLength(1);
+  });
+  await wait("same-scope ordinary chat delivered", async () => {
+    expect(
+      await f.db.information.find({
+        kinds: ["core.delivery.delivered"],
+        limit: 10,
+      }),
+    ).toHaveLength(1);
+  });
+  const chatRequests = models.requests.filter((r) => r.model === "heavy");
+  expect(chatRequests).toHaveLength(2);
+  expect(models.gui).toBe(0);
+  expect(
+    chatRequests.every((r) =>
+      r.tools.every(
+        (t: any) =>
+          !["gui.observe", "gui.act", "gui.verify"].some(
+            (id) => nativeToolWireName(id, "1") === t.function.name,
+          ),
+      ),
+    ),
+  ).toBe(true);
+  const url = "/api/v1/environments/desktop/tasks",
+    input = { taskRequestId: randomUUID(), prompt: "inspect the desktop" };
+  expect(
+    (await server.app.inject({ method: "POST", url, payload: input }))
+      .statusCode,
+  ).toBe(401);
+  expect(
+    (
+      await server.app.inject({
+        method: "POST",
+        url,
+        headers,
+        payload: { ...input, nativeStep: {} },
+      })
+    ).statusCode,
+  ).toBe(400);
+  const accepted = await server.app.inject({
+    method: "POST",
+    url,
+    headers,
+    payload: input,
+  });
+  expect(accepted.statusCode).toBe(202);
+  expect(accepted.headers["cache-control"]).toBe("no-store");
+  expect(
+    (
+      await server.app.inject({ method: "POST", url, headers, payload: input })
+    ).json().requestedInformationId,
+  ).toBe(accepted.json().requestedInformationId);
+  expect(
+    (
+      await server.app.inject({
+        method: "POST",
+        url,
+        headers,
+        payload: { ...input, prompt: "different" },
+      })
+    ).statusCode,
+  ).toBe(409);
+  await wait(
+    "GUI result and original image continuation persisted",
+    async () => {
+      const state = await server.app.inject({
+        method: "GET",
+        url: url + "/" + input.taskRequestId,
+        headers,
+      });
+      expect(state.json().status).toBe("completed");
+    },
+  );
+  expect(executions).toBe(1);
+  expect(models.gui).toBe(2);
+  expect(models.heavy).toBe(2);
+  const vision = models.requests.filter((r) => r.model === "vision");
+  expect(JSON.stringify(vision[1].messages)).toContain(
+    "data:image/png;base64," + png.toString("base64"),
+  );
+  expect(
+    vision[1].messages.some(
+      (m: any) => m.role === "tool" && m.tool_call_id === "gui-model-original",
+    ),
+  ).toBe(true);
+  expect(
+    (
+      await server.app.inject({ method: "POST", url, headers, payload: input })
+    ).json().status,
+  ).toBe("completed");
+  await wait("management task queue settled", () =>
+    expectPersistenceSettled(f.db),
+  );
+  await server.close();
+  f.clearServer();
+}, 40000);
+
 it("still closes MCP when the Runtime cleanup reports a failure", async () => {
   const f = await fixture("stdio");
   const server = await f.start();
@@ -577,7 +837,7 @@ it("keeps a candidate MCP owner when Runtime rebuild and candidate cleanup both 
   f.clearServer();
   expect(calls.get(failed!)).toBe(2);
   for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
-});
+}, 40000); // 两轮 Server/stdio 启动、配置排空与失败所有者再次关闭，继承完整链路的 40 秒外层预算。
 
 it.each(["before-unknown", "after-unknown"] as const)(
   "persists a scoped late observation %s without changing the W3 head or repeating the effect",
@@ -633,6 +893,14 @@ it.each(["before-unknown", "after-unknown"] as const)(
       ).toBe(202);
       const wait = createPersistenceWait(f.db, () => ({ heavy: models.heavy }));
       let action!: Awaited<ReturnType<typeof f.db.actions.read>>;
+      await wait("Router scheduled Heavy", async () => {
+        expect(
+          await f.db.information.find({
+            kinds: ["agent.router.message.intent.requested"],
+            limit: 10,
+          }),
+        ).toHaveLength(1);
+      });
       await wait("MCP side effect has started", async () => {
         expect(
           (await f.logs()).filter((row) => row.kind === "effect"),
@@ -724,5 +992,5 @@ it.each(["before-unknown", "after-unknown"] as const)(
       await f.update({ release: true });
     }
   },
-  30000,
+  55000, // Router 前置、MCP 开始、unknown 前置、迟到事实、最终收敛最多五段各 8 秒；另留 15 秒供真实初始化、取消和清理。
 );

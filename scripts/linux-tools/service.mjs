@@ -1,7 +1,8 @@
 /**
  * 功能概述：可信桌面容器的协议入口，分派已就绪组件并控制自动化隔离，不执行任意 shell。
  * 主要职责：ToolService 串行控制 generation/mode；每个 component.isolate 必须停止并
- * 排空自己的输入通道后返回 true，才允许 handoff ACK。startService 提供私有 Unix socket。
+ * 排空自动与人工输入通道后返回 true，才允许 handoff ACK；人工操作还须组件支持和会话许可。
+ * startService 提供私有 Unix socket，resume 的回执显式包含 humanInputsIsolated。
  * 代码库关系：宿主 PodmanBackend 先清空独立 shell job，再调用此服务；W8 在 components
  * 注册浏览器/GUI 输入执行者，持久 profile 使用 /private，不能放入共享 /workspace。
  * 输入输出与副作用：控制回执支持同进程幂等重试，handoff 保留页面/桌面进程；隔离失败拒绝 ACK。
@@ -60,6 +61,7 @@ export class ToolService {
         ready: !this.closed,
         generation: this.generation,
         mode: this.mode,
+        humanSessionId: this.humanSessionId,
         serviceInstanceId: this.instanceId,
         executors: this.components.map(
           (component) => component.identity?.() ?? { kind: "component" },
@@ -68,11 +70,17 @@ export class ToolService {
           (component) => component.capabilities ?? [],
         ),
       };
-    if (req.kind === "operation") {
+    if (req.kind === "operation" || req.kind === "human-operation") {
       const component = this.components.find((candidate) =>
         candidate.capabilities?.includes(req.toolName),
       );
-      if (!component || this.closed || this.mode !== "automation")
+      const human = req.kind === "human-operation";
+      if (
+        !component ||
+        this.closed ||
+        this.mode !== (human ? "human" : "automation") ||
+        (human && component.supportsHuman !== true)
+      )
         throw new Error("tool-not-supported");
       return component.execute(req);
     }
@@ -98,6 +106,11 @@ export class ToolService {
     )
       throw new Error("invalid-control");
     if (
+      req.humanSessionId !== undefined &&
+      (req.mode !== "human" || !/^[a-f0-9]{64}$/.test(req.humanSessionId))
+    )
+      throw new Error("invalid-human-session");
+    if (
       req.action === "handoff" &&
       (req.generation !== this.generation + 1 ||
         !["human", "automation"].includes(req.mode))
@@ -116,6 +129,8 @@ export class ToolService {
     if (req.action === "handoff") {
       this.generation = req.generation;
       this.mode = req.mode;
+      this.humanSessionId =
+        req.mode === "human" ? req.humanSessionId : undefined;
     }
     const response = {
       helperProtocolVersion: 1,
@@ -126,8 +141,10 @@ export class ToolService {
         (component) => component.identity?.() ?? { kind: "component" },
       ),
       automationIsolated: true,
+      humanInputsIsolated: true,
       generation: this.generation,
       mode: this.mode,
+      humanSessionId: this.humanSessionId,
     };
     this.controls.set(req.controlOperationId, {
       request: canonical(req),
