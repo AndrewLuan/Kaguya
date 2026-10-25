@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import package_bundle
 import install_bundle as bundle
 
 
@@ -72,6 +74,44 @@ class BundleTest(unittest.TestCase):
         path.symlink_to(self.root / "broker.py")
         with self.assertRaisesRegex(RuntimeError, "nonregular-file"):
             bundle.verify_manifest(self.root)
+
+    def test_package_requires_same_successful_sha_and_emits_verifiable_sources_and_images(self):
+        source = self.root / "scripts/linux-environments"
+        source.mkdir(parents=True)
+        tools = self.root / "scripts/linux-tools"
+        tools.mkdir()
+        for name in bundle.SOURCE_FILES:
+            (source / name).write_bytes((self.root / name).read_bytes())
+        (source / "BUNDLE.md").write_text("instructions")
+        (source / "README.md").write_text("host details")
+        (tools / "README.md").write_text("tool details")
+        artifacts = self.root / "artifacts"
+        artifacts.mkdir()
+        sha = "a" * 40
+        run = {"head_sha": sha, "conclusion": "success", "status": "completed", "html_url": "https://example.invalid/run"}
+        (artifacts / "workflow-run.json").write_text(json.dumps(run))
+        evidence = artifacts / ("gui-evidence-" + sha)
+        evidence.mkdir()
+        (evidence / "gui-provider-receipt.json").write_text(json.dumps({"passed": True, "existingHomeRecovered": True}))
+        for role in bundle.IMAGE_ROLES:
+            directory = artifacts / (role + "-tools-" + sha)
+            directory.mkdir()
+            image = self.manifest["images"][role]
+            (directory / image["file"]).write_bytes((self.root / image["file"]).read_bytes())
+            (directory / (image["file"] + ".sha256")).write_text(image["archiveSha256"] + "  " + image["file"])
+            (directory / (role + "-image.digest")).write_text("sha256:" + "b" * 64)
+        output = self.root / "bundle"
+        with patch.object(package_bundle.subprocess, "check_output", side_effect=[sha, ""]):
+            package_bundle.package(self.root, artifacts, output, sha)
+        result = bundle.verify_manifest(output)
+        self.assertEqual(result["commit"], sha)
+        self.assertEqual(set(result["images"]), set(bundle.IMAGE_ROLES))
+        run["head_sha"] = "c" * 40
+        (artifacts / "workflow-run.json").write_text(json.dumps(run))
+        with patch.object(package_bundle.subprocess, "check_output", side_effect=[sha, ""]):
+            with self.assertRaisesRegex(RuntimeError, "ci-not-passed"):
+                package_bundle.package(self.root, artifacts, self.root / "wrong", sha)
+        self.assertFalse((self.root / "wrong").exists())
 
 
 if __name__ == "__main__":

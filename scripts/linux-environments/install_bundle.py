@@ -124,7 +124,10 @@ def main():
     receipts = []
     for role in IMAGE_ROLES:
         image = manifest["images"][role]
-        stage_image(root, image, Path("/var/lib/kaguya-tools-storage/containers/inbox"))
+        inbox = Path("/var/lib/kaguya-tools-storage/containers/inbox")
+        stage_image(root, image, inbox)
+        # 文件归受信用户所有且初始 0600；只给 broker 专用账户读权限，不开放其他用户。
+        subprocess.run(["setfacl", "-m", "u:kaguya-tools:r--", str(inbox / (image["archiveSha256"] + ".oci"))], check=True)
         result = rpc("image.import", {"sha256": image["archiveSha256"]})
         if result != {"imported": True, "archiveSha256": image["archiveSha256"]}:
             raise RuntimeError("image-import-unconfirmed")
