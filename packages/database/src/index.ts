@@ -1,4 +1,5 @@
 /**
+ * inspection-reader 提供跨领域只读快照查询，不调用运行或恢复端口。
  * nativeTools 保存工具循环预算、dispatch 和调用映射；迁移在行动表之后初始化。
  * memoryGraph 暴露三字段节点与有向类型边的独立 PostgreSQL 存储。
  * 功能概述：提供 Kaguya 唯一的 PostgreSQL 信息账本入口，组合驱动、schema 准备与
@@ -167,3 +168,5 @@ export { ModelRequestMetricsRepository } from "./model-request-metrics.js";
 export { PostgresNativeVectorRetriever } from "./native-memory-vector.js";
 
 export { PostgresObservationStore } from "./observation-store.js";
+
+export * from "./inspection-reader.js";

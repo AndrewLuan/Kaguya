@@ -37,6 +37,7 @@ const repositoryRoot = resolve(serverRoot, "../..");
 const pnpmExecutable = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 export const POSTGRES_TEST_FILES = [
   "apps/server/src/mcp-host.test.ts",
+  "apps/server/src/inspection-domain.test.ts",
   "packages/database/src/observation-store.test.ts",
   "packages/runtime/src/action.test.ts",
   "packages/runtime/src/native-tool-loop.test.ts",

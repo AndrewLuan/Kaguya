@@ -1,4 +1,5 @@
 /**
+ * inspectionEnvironmentSource 只返回当前宿主公开状态与操作查询，不暴露控制/秘密端口。
  * serverGuiModelBindings 仅返回 linux-tools.json 的非秘密目标声明，供 Server 构建明确批准的 GUI 模型路由。
  * 功能概述：在 Server 生命周期中打开 MCP，合并已有 Memory 工具路由并提供管理端按需读取入口。
  * openServerMcp 缺省关闭；mcpRuntimeOptions 复用 W4 注册/W3 provider，不创建第二个执行循环。
@@ -302,4 +303,16 @@ export function withMcpKindRegistry<
       mcpLateResultInformationKind,
     ]),
   };
+}
+
+/** Inspection 通过动态闭包读取重挂载后的 host，仅暴露两个只读方法。 */
+export function inspectionEnvironmentSource(host: McpHost | undefined) {
+  const linux = host ? linuxHosts.get(host) : undefined;
+  return linux
+    ? {
+        inspect: (id: string) => linux.inspect(id),
+        queryHuman: (id: string, operationId: string) =>
+          linux.queryHuman(id, operationId),
+      }
+    : undefined;
 }

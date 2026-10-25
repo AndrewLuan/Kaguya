@@ -1,4 +1,5 @@
 /**
+ * Inspection 导出 GUI 结果的纯 metadata 校验计划，无 blob 读取或工具执行。
  * native-tool-loop 导出宿主工具注册、任务路由和持久协调器，不在导入时执行工具。
  * linux-gui 导出桌面/窗口观察与一次性输入 schema，运行时许可仍由 LinuxEnvironmentClient 和 broker 校验。
  * 功能概述：汇总 Runtime 的最终信息原子 API，导出 kind 与
@@ -59,3 +60,5 @@ export {
   guiTaskInputSchema,
   type GuiTaskHost,
 } from "./gui-tasks.js";
+
+export { planNativeToolResults } from "./native-tool-results.js";
