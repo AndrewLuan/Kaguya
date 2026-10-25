@@ -119,3 +119,19 @@ cleanup按fixture owner关联。hook独立上限130秒：gate release/observer s
 受控清理探针使Server.close等待gate，同时注入辅助清理错误；它确认stdio owner独立退出后释放gate，等待原close完成，验证两类错误均保留且真实资源已关闭。其正文预算为setup98秒+一次观察8秒+两次有界cleanup结果等待各130秒+两次原close settlement各16秒+I/O5秒=403秒。另一探针用两个未启动Server的独立DB/file fixture验证保留边界，预算为两轮文件/DB各15秒、DB close各10秒、file close各5秒、辅助5秒和I/O5秒=70秒。正常body和hook预算不互相借用。
 
 Light gate只阻塞合成模型响应。held时独立读取共享readiness predicate，确认同turn的requested=1而completion/decision/intent=0且Heavy/effect仍0；释放后才启动独立8秒完成等待。release与observer settlement在正文finally和清理兜底中分别处理。该检查不使用固定sleep。历史首轮失败与避开lint的对照分别保留；一次通过不作为唯一资源根因的证明。
+
+## stdio进程组退出与清理诊断
+
+POSIX进程组身份核验返回`gone`、`owned`或`unconfirmed`。只有当前组探测返回`ESRCH`才确认gone；`pgrep`空结果、`EPERM`或身份不可读均不能充当退出证据。每轮按指定PGID读取成员S1、读取这些成员的PID/PGID及owner标记，再读取全组S2。S1/S2变化时丢弃该轮所有身份结果，在同一5秒close deadline内重新全验。`ps`非零也继续取得S2和组状态，因为已退出成员可以使查询失败；稳定存活而身份不可读或owner不匹配时拒绝发信号并保留ownership record。
+
+SIGTERM与SIGKILL分别核验当前全组。核验后signal返回ESRCH时再次确认整组消失，并等待直接子进程被reap。signal后的drain先在原阶段预算内等待根exit，再观察剩余组；该顺序不将EPERM视为gone。已发送合法信号后的drain遇到EPERM时只在原阶段预算内继续只读观察，随后必须明确得到ESRCH才确认退出；持续EPERM拒绝升级信号并保留记录。每次查询和信号前检查剩余预算，耗尽后不再发命令。S1/S2与信号并非原子操作；此机制处理可观察的成员变化与已退出状态，稳定未知身份仍拒绝回收。
+
+清理错误保留connection ID、固定内部错误码和阶段cause，以及单调时间上的EOF、wait250是否已观察到根exit、根exit时间/信号、成员数量变化、查询退出码、signal errno及record保留状态。命令全文、环境、owner token和外部Error原文不进入cause。`wait250Exited=true`表明该次核验前根已被Node回收，不能据此解释为根在随后S1→ps之间退出。MCP fixture在首次close失败时保存`first-cleanup-failure.json`；后续清理重试成功仍保留该目录中的首错证据。
+
+真实进程回归用回环ACK和exit barrier固定以下顺序：S1后根退出而worker留存、S1后最后成员退出导致ps失败、核验后最后成员退出导致signal ESRCH；另检查稳定wrong-owner、身份查询权限失败、signal EPERM、TERM-resistant树再次验证后KILL，以及期限在ps或signal之前耗尽。断言同时覆盖实际信号、退出和record删除/保留。回归body采用45秒预算：文件5秒、start/ready各8秒、最多两轮close各5秒、首错写入5秒及检查余量9秒；关闭中的barrier共享close剩余期限。
+
+普通MCP用例按握手/发现、请求、观察、显式close逐项设置正文预算。独立afterEach上限65秒覆盖控制发布/ACK7秒、请求/host close/首错写入26秒、HTTP child8秒、journal/worker退出13秒、文件5秒和余量6秒。受控树清理先通过独立控制端点退出，再由当前实例的真实owner执行有界兜底及退出观察；未知释放或首错均保留诊断目录。
+
+该修复针对源码中可达的成员快照与退出竞态。历史e31组合CI的335ms失败只有外层清理码，不能从该日志确定具体内部失败分支；先前64983提交的完整CI通过与该组合失败分别记录。
+
+已spawn但ownership写入未完成时，close先回收真实child和进程组，再用同一5秒总预算等待写入结算。未知写入返回明确失败并保留状态；写入稍后完成后可再次close移除记录。已确认回收的实例不会在重试时再次向历史PGID发信号。尚未spawn的初始化由closeRequested阻止晚启动。两个独立barrier回归分别覆盖spawn前等待和spawn后持久化等待，正文上限分别为38秒与60秒，包含独立释放、settlement、真实根退出兜底和文件清理。

@@ -3,7 +3,7 @@
  * mcpConfigurationSchema 固定三个协议 profile、工具白名单、scope 和预算；
  * loadMcpConfiguration 从敏感配置目录按需读取，缺省关闭且不创建文件。
  * connectionRevision 对完整可信配置生成摘要；凭据只以环境变量引用表示，执行时解析。
- * Server 和 McpHost 共用此边界；错误仅返回稳定代码，不包含命令、URL 或凭据。
+ * Server 和 McpHost 共用此边界；cleanupCause仅保留内部代码及脱敏阶段，不保留命令、环境或凭据。
  */
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -106,10 +106,57 @@ export const mcpConfigurationSchema = z
 export type McpConnectionConfig = z.infer<typeof mcpConnectionSchema>;
 export type McpConfiguration = z.infer<typeof mcpConfigurationSchema>;
 export class McpError extends Error {
-  constructor(readonly code: string) {
-    super(code);
+  readonly details:
+    Readonly<Record<string, string | number | boolean | null>> | undefined;
+  constructor(
+    readonly code: string,
+    options: {
+      cause?: unknown;
+      details?: Readonly<Record<string, string | number | boolean | null>>;
+    } = {},
+  ) {
+    super(
+      code,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
+    if (options.details) this.details = options.details;
     this.name = "McpError";
   }
+}
+/** 只传播可信内部错误的结构；execFile等外部Error的message/stdout/stderr/stack不进入cause。 */
+export function cleanupCause(error: unknown, depth = 0): Error {
+  if (depth >= 12) return new McpError("mcp-cleanup-cause-truncated");
+  if (error instanceof AggregateError)
+    return new AggregateError(
+      error.errors.slice(0, 65).map((value) => cleanupCause(value, depth + 1)),
+      "mcp-cleanup-causes",
+    );
+  if (error instanceof McpError && /^mcp-[a-z0-9-]+$/.test(error.code))
+    return new McpError(error.code, {
+      ...(error.details ? { details: error.details } : {}),
+      ...(error.cause === undefined
+        ? {}
+        : { cause: cleanupCause(error.cause, depth + 1) }),
+    });
+  const errno =
+    error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : "";
+  return new McpError("mcp-cleanup-system-error", {
+    details: {
+      errno: [
+        "ESRCH",
+        "EPERM",
+        "EACCES",
+        "EIO",
+        "ENOENT",
+        "ETIMEDOUT",
+        "ENOBUFS",
+      ].includes(errno)
+        ? errno
+        : "UNKNOWN",
+    },
+  });
 }
 export function digest(value: unknown): string {
   const canonical = (v: unknown): unknown =>

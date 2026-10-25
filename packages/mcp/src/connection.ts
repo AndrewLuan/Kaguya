@@ -2,7 +2,7 @@
  * 功能概述：维护显式协议的 MCP 连接，原子发布有界目录并保留请求来源。
  * connect/reconnect 只恢复连接和目录，不重放行动；request 分开记录 JSON-RPC 与模型 call ID。
  * tools 使用冻结的原始 schema；结果保留 scope、时间、定义摘要和不可信来源标记。
- * close 中断请求并回收进程；凭据只在宿主闭包解析，HTTP 禁止重定向、OAuth 和自动重连。
+ * close独立保留transport回收和late持久化错误的脱敏cause；中断请求并回收进程；凭据只在宿主闭包解析，HTTP 禁止重定向、OAuth 和自动重连。
  */
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -20,6 +20,7 @@ import {
 } from "@modelcontextprotocol/client";
 import {
   McpError,
+  cleanupCause,
   connectionRevision,
   digest,
   type McpConnectionConfig,
@@ -585,7 +586,16 @@ export class McpConnection {
       this.reconnecting,
       ...this.work,
     ]);
-    await this.flushLate();
-    if (cleanup[0]?.status === "rejected") throw cleanup[0].reason;
+    const late = await Promise.allSettled([this.flushLate()]);
+    const failures = [...cleanup, ...late].filter(
+      (result) => result.status === "rejected",
+    );
+    if (failures.length)
+      throw new McpError("mcp-connection-cleanup-failed", {
+        cause: new AggregateError(
+          failures.map((result) => cleanupCause(result.reason)),
+          "mcp-cleanup-causes",
+        ),
+      });
   }
 }
