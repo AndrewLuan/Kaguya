@@ -9,6 +9,7 @@
  * 不停止/删除容器和数据卷；开发准备失败提示启动 Docker Desktop 并运行 docker info 确认。
  * 使用独立临时 schema；验证清单包含 Memory 节点／边存储契约。
  * 真实 PostgreSQL 清单覆盖 observation-store 与 observation-runtime，验证跨事务冻结、确认和重连。
+ * Lifecycle 超页 fixture 验证批量 owner 的完整关联、分页顺序及重启后的原定时恢复。
  */
 import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
@@ -40,6 +41,7 @@ export const POSTGRES_TEST_FILES = [
   "packages/runtime/src/action.test.ts",
   "packages/runtime/src/native-tool-loop.test.ts",
   "packages/runtime/src/observation-runtime.test.ts",
+  "packages/modules/src/first-party/lifecycle/index.test.ts",
   "packages/database/src/postgres-information-ledger.test.ts",
   "packages/database/src/postgres-index.test.ts",
   "packages/database/src/postgres-reliable.test.ts",

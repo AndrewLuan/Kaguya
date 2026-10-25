@@ -3,14 +3,20 @@
  * 主要职责：fixture 提供合成时钟、入站与手动 due；settle 等待持久队列并报告处理错误。
  * restart 关闭原 core/runner 后重建宿主和绑定能力，保留数据库、订阅 ID、时钟与 ID 序列。
  * 代码库关系：直接运行 createLifecycleModule，覆盖离线期间多人消息及无新入站的启动恢复。
- * 超页回归登记 1002 个开放调度，验证重启保持原 deadline；30 秒仅覆盖该例批量设置，收敛仍用 8 秒预算。
+ * seedOpenOwners 在同一事务写入 1000 条无关调度的完整关联，两端真实调度验证分页及原 deadline。
+ * 超页单例按设置、启动、重启和两次 due 合计正文预算；阶段耗时和最后队列状态只在失败时输出。
+ * 默认完整文件使用 PGlite；提供测试 PostgreSQL URL 时另运行同一超页场景，验证批量 SQL 与恢复路径。
  * 资源取得后立即登记清理；启动拒绝或 stop 失败时仍顺序释放全部资源并汇总错误。
  * 输入输出与副作用：每例独立数据库，8 秒/20 毫秒条件等待；结束关闭 host/core/数据库，不请求外部服务。
  */
 import { closeTestResources } from "../test-support/cleanup.js";
 import { observationCapability } from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
-import { createTestingDatabase } from "@kaguya/database/testing";
+import type { KaguyaDatabase } from "@kaguya/database";
+import {
+  createTestingDatabase,
+  createPostgresTestingDatabase,
+} from "@kaguya/database/testing";
 import {
   InformationCore,
   InformationKindRegistry,
@@ -21,10 +27,11 @@ import {
   defineInformationKind,
   defineInformationModuleCatalog,
 } from "@kaguya/sdk";
-import { z } from "@kaguya/schema";
+import { informationAtomSchema, z } from "@kaguya/schema";
 import {
   OneShotScheduleClient,
   oneShotDueInformationKind,
+  oneShotRequestedInformationKind,
   oneShotScheduleCapability,
 } from "@kaguya/scheduler";
 import { createLifecycleModule, lifecycleSettingsSchema } from "./index.js";
@@ -38,6 +45,17 @@ import {
 } from "../information-kinds.js";
 
 const clean: Array<() => Promise<void>> = [];
+const persistenceWait = { timeout: 8000, interval: 20 } as const;
+// 外层正文预算的分项，不是各阶段新增 deadline；afterEach 使用独立 hook 预算。
+const paginationBudget = {
+  schema: 10_000, // PGlite/PG 连接、schema 和 Core 初始化
+  seed: 5_000, // 批量事务、两端真实调度及 1000+2 分页断言
+  start: 2_000 + persistenceWait.timeout,
+  restart: 5_000 + persistenceWait.timeout, // 包含旧 Host/Core 关闭和重新装配
+  due1: 2_000 + persistenceWait.timeout,
+  due2: 2_000 + persistenceWait.timeout,
+  assertions: 2_000,
+} as const;
 afterEach(async () => {
   await closeTestResources(clean);
 });
@@ -67,6 +85,7 @@ const taskCompleted = defineInformationKind({
 });
 async function fixture(
   beforeStart?: (seed: {
+    db: KaguyaDatabase;
     core: InformationCore;
     scheduler: OneShotScheduleClient;
     inbound: (
@@ -76,8 +95,14 @@ async function fixture(
     ) => Promise<{ informationId: string }>;
     now: () => Date;
   }) => Promise<void>,
+  options: {
+    createDatabase?: () => Promise<KaguyaDatabase>;
+    phase?: (name: keyof typeof paginationBudget) => void;
+    health?: (value: unknown) => void;
+  } = {},
 ) {
-  const db = await createTestingDatabase();
+  options.phase?.("schema");
+  const db = await (options.createDatabase ?? createTestingDatabase)();
   clean.push(() => db.close());
   await db.prepareSchema();
   const failures: unknown[] = [];
@@ -149,15 +174,13 @@ async function fixture(
   await core.start();
 
   const settle = () =>
-    vi.waitFor(
-      async () => {
-        const health = await db.information.reliable.health();
-        if (failures.length) throw failures[0];
-        expect(health.pending).toBe(0);
-        expect(health.exhausted).toBe(0);
-      },
-      { timeout: 8000, interval: 20 },
-    );
+    vi.waitFor(async () => {
+      const health = await db.information.reliable.health();
+      options.health?.(health);
+      if (failures.length) throw failures[0];
+      expect(health.pending).toBe(0);
+      expect(health.exhausted).toBe(0);
+    }, persistenceWait);
   const all = (kind: string) =>
     db.information.find({
       kinds: [kind],
@@ -223,7 +246,9 @@ async function fixture(
     if (wait) await settle();
     return atom;
   };
-  await beforeStart?.({ core, scheduler, inbound, now });
+  options.phase?.("seed");
+  await beforeStart?.({ db, core, scheduler, inbound, now });
+  options.phase?.("start");
   await host.start([
     {
       instanceId: "lifecycle.default",
@@ -235,6 +260,7 @@ async function fixture(
   return {
     db,
     restart: async () => {
+      options.phase?.("restart");
       await closeTestResources([() => core.close(), () => host.stop()]);
       core = makeCore();
       scheduler = new OneShotScheduleClient(core);
@@ -423,88 +449,239 @@ it("recovers every sender and message in the same scene after downtime without a
   expect(await f.all("agent.heartbeat.candidate")).toHaveLength(1);
 });
 
-it("preserves a deferred scene behind more than one page of open owners until its deadline", async () => {
-  let targetTimer!: string;
-  let tailTimer!: string;
-  const f = await fixture(async ({ core, scheduler, inbound, now }) => {
-    const source = await inbound(false, "alice", false);
-    const dueAt = new Date(now().getTime() + 300000).toISOString();
-    targetTimer = (
-      await scheduler.schedule({
-        operationKey: "target-defer",
-        sourceInformationId: source.informationId,
-        dueAt,
-        input: {
-          purpose: "observation-recheck",
-          scopeKey: "qq:qq.main:group:g",
-        },
-        activation: {
-          definitionId: "agent.lifecycle",
-          instanceId: "lifecycle.default",
-        },
-      })
-    ).scheduleInformationId;
-    // 原选择器默认倒序只取 1000 条；较早的 targetTimer 将被这些独立场景挤出。
-    for (let i = 0; i < 1000; i++)
-      await scheduler.schedule({
+async function seedOpenOwners(db: KaguyaDatabase, templateId: string) {
+  const template = (await db.information.get(templateId))!;
+  expect(template.kind).toBe(oneShotRequestedInformationKind.kind);
+  // 独立 ID 空间，不消耗或碰撞 fixture 的 lifecycle-N 序列。
+  const atoms = Array.from({ length: 1000 }, (_, i) =>
+    informationAtomSchema.parse({
+      ...template,
+      informationId: `pagination-owner-${String(i).padStart(4, "0")}`,
+      payload: oneShotRequestedInformationKind.payloadSchema.parse({
+        ...template.payload,
         operationKey: `other-scene:${i}`,
-        sourceInformationId: source.informationId,
-        dueAt,
         input: { purpose: "other", scopeKey: `qq:qq.main:group:other-${i}` },
-        activation: {
-          definitionId: "agent.lifecycle",
-          instanceId: "lifecycle.default",
-        },
-      });
-    // 另一个有输入的场景放在尾页，同时验证正序和倒序都不能只读取首 1000 条。
-    const first = (await core.store.get(source.informationId))!;
-    const tail = await core.register(inboundTextInformationKind, {
-      occurredAt: now().toISOString(),
-      source: "adapter:test",
-      payload: {
-        text: "tail scene input",
-        source: {
-          platform: "qq",
-          adapterId: "qq.main",
-          destination: { kind: "group", groupId: "tail" },
-          senderId: "bob",
-          selfId: "bot",
-          platformMessageId: "tail-input",
-        },
-      },
-      references: [...first.references],
-    });
-    tailTimer = (
-      await scheduler.schedule({
-        operationKey: "tail-defer",
-        sourceInformationId: tail.informationId,
-        dueAt,
-        input: {
-          purpose: "observation-recheck",
-          scopeKey: "qq:qq.main:group:tail",
-        },
-        activation: {
-          definitionId: "agent.lifecycle",
-          instanceId: "lifecycle.default",
-        },
-      })
-    ).scheduleInformationId;
-  });
-  expect(await f.all("agent.heartbeat.candidate")).toHaveLength(0);
-  await f.restart();
-  expect(await f.all("agent.heartbeat.candidate")).toHaveLength(0);
-  for (const timerId of [targetTimer, tailTimer])
-    expect((await f.db.information.get(timerId))?.payload.dueAt).toBe(
-      new Date(Date.UTC(2026, 9, 22) + 300000).toISOString(),
-    );
-  // 到期交付只恢复原输入；整个场景没有后续入站。
-  await f.fire("observation-recheck", 300000);
-  expect(await f.all("agent.heartbeat.candidate")).toHaveLength(1);
-  await f.fire("observation-recheck", 300000);
-  const candidates = await f.all("agent.heartbeat.candidate");
-  expect(candidates).toHaveLength(2);
-  expect(new Set(candidates.map((c) => c.payload.scopeKey))).toEqual(
-    new Set(["qq:qq.main:group:g", "qq:qq.main:group:tail"]),
+      }),
+    }),
   );
-  expect(await f.all(inboundTextInformationKind.kind)).toHaveLength(2);
-}, 30000);
+  const ids = atoms.map((a) => a.informationId);
+  const serialized = JSON.stringify(atoms);
+  await db.sql.transaction(async (tx) => {
+    // Host 尚未安装订阅；真实 schedule 在此阶段也不产生 durable delivery 或 log outbox。
+    expect(
+      (await tx.query("SELECT 1 FROM information_subscriptions")).rows,
+    ).toHaveLength(0);
+    await tx.query(
+      `INSERT INTO information_atoms(information_id,kind,occurred_at,source,payload)
+       SELECT a->>'informationId',a->>'kind',a->>'occurredAt',a->>'source',a->'payload'
+       FROM jsonb_array_elements($1::jsonb) a ORDER BY a->>'informationId'`,
+      [serialized],
+    );
+    await tx.query(
+      `INSERT INTO information_lifecycle(information_id,kind,scope_key,occurred_at,is_open)
+       SELECT information_id,kind,payload->'input'->>'scopeKey',occurred_at::timestamptz,true
+       FROM information_atoms WHERE information_id=ANY($1::text[]) ORDER BY information_id`,
+      [ids],
+    );
+    await tx.query(
+      `INSERT INTO information_references(information_id,ordinal,relation,target_information_id)
+       SELECT a->>'informationId',r.ordinality-1,r.value->>'relation',r.value->>'informationId'
+       FROM jsonb_array_elements($1::jsonb) a,
+       LATERAL jsonb_array_elements(a->'references') WITH ORDINALITY r(value,ordinality)`,
+      [serialized],
+    );
+    await tx.query(
+      `INSERT INTO information_commit_slots(slot_type,namespace,key,information_id)
+       SELECT 'operation','kaguya.schedule.one-shot.schedule.v1',payload->>'operationKey',information_id
+       FROM information_atoms WHERE information_id=ANY($1::text[])`,
+      [ids],
+    );
+    await tx.query(
+      `INSERT INTO information_schedule_arms(schedule_information_id,due_at,state)
+       SELECT information_id,(payload->>'dueAt')::timestamptz,'open'
+       FROM information_atoms WHERE information_id=ANY($1::text[])`,
+      [ids],
+    );
+    const integrity = await tx.query<{ owners: number; positions: number }>(
+      `SELECT count(*)::int owners,count(DISTINCT l.position)::int positions
+       FROM information_atoms a JOIN information_lifecycle l USING(information_id)
+       JOIN information_references r ON r.information_id=a.information_id AND r.ordinal=0
+         AND r.relation='core:caused-by' AND r.target_information_id=$2
+       JOIN information_commit_slots c ON c.information_id=a.information_id AND c.slot_type='operation'
+         AND c.namespace='kaguya.schedule.one-shot.schedule.v1' AND c.key=a.payload->>'operationKey'
+       JOIN information_schedule_arms arm ON arm.schedule_information_id=a.information_id
+         AND arm.state='open' AND arm.due_at=(a.payload->>'dueAt')::timestamptz
+       WHERE a.information_id=ANY($1::text[]) AND l.is_open AND l.kind=a.kind
+         AND l.scope_key=a.payload->'input'->>'scopeKey' AND l.occurred_at=a.occurred_at::timestamptz`,
+      [ids, template.references[0]!.informationId],
+    );
+    expect(integrity.rows).toEqual([{ owners: 1000, positions: 1000 }]);
+  });
+  return ids;
+}
+
+const postgresUrl = process.env.KAGUYA_TEST_DATABASE_URL;
+const paginationDatabases = [
+  { name: "PGlite", create: () => createTestingDatabase() },
+  ...(postgresUrl
+    ? [
+        {
+          name: "PostgreSQL",
+          create: () => createPostgresTestingDatabase(postgresUrl),
+        },
+      ]
+    : []),
+];
+it.for(paginationDatabases)(
+  "preserves a deferred scene behind more than one page of open owners until its deadline ($name)",
+  {
+    timeout: Object.values(paginationBudget).reduce(
+      (total, ms) => total + ms,
+      0,
+    ),
+  },
+  async ({ name, create }, { onTestFailed, signal }) => {
+    const started = performance.now();
+    const phases: { name: string; atMs: number }[] = [];
+    let lastHealth: unknown;
+    let bodyElapsedMs: number | undefined;
+    const finishBody = () => {
+      bodyElapsedMs ??= Math.round(performance.now() - started);
+    };
+    signal.addEventListener("abort", finishBody, { once: true });
+    const phase = (name: keyof typeof paginationBudget) => {
+      if (bodyElapsedMs !== undefined) return;
+      phases.push({ name, atMs: Math.round(performance.now() - started) });
+    };
+    onTestFailed(() => {
+      console.error(
+        "Lifecycle pagination diagnostics",
+        JSON.stringify({
+          backend: name,
+          bodyElapsedMs,
+          phases,
+          lastHealth,
+          bodyBudgetMs: paginationBudget,
+        }),
+      );
+    });
+    try {
+      let targetTimer!: string;
+      let tailTimer!: string;
+      const f = await fixture(
+        async ({ db, core, scheduler, inbound, now }) => {
+          const source = await inbound(false, "alice", false);
+          const dueAt = new Date(now().getTime() + 300000).toISOString();
+          targetTimer = (
+            await scheduler.schedule({
+              operationKey: "target-defer",
+              sourceInformationId: source.informationId,
+              dueAt,
+              input: {
+                purpose: "observation-recheck",
+                scopeKey: "qq:qq.main:group:g",
+              },
+              activation: {
+                definitionId: "agent.lifecycle",
+                instanceId: "lifecycle.default",
+              },
+            })
+          ).scheduleInformationId;
+          // 原选择器默认倒序只取 1000 条；较早的 targetTimer 将被这些独立场景挤出。
+          const fillers = await seedOpenOwners(db, targetTimer);
+          // 另一个有输入的场景放在尾页，同时验证正序和倒序都不能只读取首 1000 条。
+          const first = (await core.store.get(source.informationId))!;
+          const tail = await core.register(inboundTextInformationKind, {
+            occurredAt: now().toISOString(),
+            source: "adapter:test",
+            payload: {
+              text: "tail scene input",
+              source: {
+                platform: "qq",
+                adapterId: "qq.main",
+                destination: { kind: "group", groupId: "tail" },
+                senderId: "bob",
+                selfId: "bot",
+                platformMessageId: "tail-input",
+              },
+            },
+            references: [...first.references],
+          });
+          tailTimer = (
+            await scheduler.schedule({
+              operationKey: "tail-defer",
+              sourceInformationId: tail.informationId,
+              dueAt,
+              input: {
+                purpose: "observation-recheck",
+                scopeKey: "qq:qq.main:group:tail",
+              },
+              activation: {
+                definitionId: "agent.lifecycle",
+                instanceId: "lifecycle.default",
+              },
+            })
+          ).scheduleInformationId;
+          // 启动前只有这 1002 个 owner；启动后 Lifecycle 还会新增自己的 pulse。
+          const query = {
+            kinds: [oneShotRequestedInformationKind.kind],
+            openOnly: true,
+            registrationOrder: true,
+            order: "asc" as const,
+            limit: 1000,
+          };
+          const firstPage = await core.find(query);
+          expect(firstPage).toHaveLength(1000);
+          const secondPage = await core.find({
+            ...query,
+            afterInformationId: firstPage.at(-1)!.informationId,
+          });
+          expect(secondPage).toHaveLength(2);
+          expect(
+            await core.find({
+              ...query,
+              afterInformationId: secondPage.at(-1)!.informationId,
+            }),
+          ).toHaveLength(0);
+          const owners = [...firstPage, ...secondPage];
+          expect(owners).toHaveLength(1002);
+          expect(owners.map((a) => a.informationId)).toEqual([
+            targetTimer,
+            ...fillers,
+            tailTimer,
+          ]);
+        },
+        {
+          createDatabase: create,
+          phase,
+          health: (health) => {
+            if (bodyElapsedMs === undefined) lastHealth = health;
+          },
+        },
+      );
+      expect(await f.all("agent.heartbeat.candidate")).toHaveLength(0);
+      await f.restart();
+      expect(await f.all("agent.heartbeat.candidate")).toHaveLength(0);
+      for (const timerId of [targetTimer, tailTimer])
+        expect((await f.db.information.get(timerId))?.payload.dueAt).toBe(
+          new Date(Date.UTC(2026, 9, 22) + 300000).toISOString(),
+        );
+      // 到期交付只恢复原输入；整个场景没有后续入站。
+      phase("due1");
+      await f.fire("observation-recheck", 300000);
+      expect(await f.all("agent.heartbeat.candidate")).toHaveLength(1);
+      phase("due2");
+      await f.fire("observation-recheck", 300000);
+      phase("assertions");
+      const candidates = await f.all("agent.heartbeat.candidate");
+      expect(candidates).toHaveLength(2);
+      expect(new Set(candidates.map((c) => c.payload.scopeKey))).toEqual(
+        new Set(["qq:qq.main:group:g", "qq:qq.main:group:tail"]),
+      );
+      expect(await f.all(inboundTextInformationKind.kind)).toHaveLength(2);
+    } finally {
+      finishBody();
+      signal.removeEventListener("abort", finishBody);
+    }
+  },
+);
