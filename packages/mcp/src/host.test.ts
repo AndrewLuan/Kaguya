@@ -651,7 +651,7 @@ it("does not admit an old provider during delayed reconnect discovery", async ()
   expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
     0,
   );
-}, 65000); // ready8s + handshake16s + directory16s + reconnect16s + cleanup5s；hold观察8s + ACK2s 留6s发现余量。
+}, 80000); // ready8s + 初始/重连的握手、发现共4×16s + hold配置ACK2s=74s，余6s供文件I/O；hook清理另有20s。
 it.each(["2025-11-25", "2026-07-28"])(
   "aborts actual hanging HTTP I/O at the %s operation deadline",
   async (protocol) => {
@@ -1102,4 +1102,4 @@ it("settles actual held discovery and preserves both errors when an inspection f
     0,
   );
   await f.update({ release: true, dropControlAck: false });
-}, 65000);
+}, 80000);
