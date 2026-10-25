@@ -83,6 +83,22 @@ describe("GUI 管理 wire", () => {
       expect.objectContaining({ type: GATEWAY_UNAUTHORIZED_EVENT }),
     );
   });
+  it("ignores a late 401 after the caller has cancelled its authenticated image read", async () => {
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    const controller = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        controller.abort();
+        return new Response("", { status: 401 });
+      }),
+    );
+    await expect(
+      readEnvironmentImage("old-session", "env", "image", controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(dispatchEvent).not.toHaveBeenCalled();
+  });
   it("实际终态与取消转发分开解析，尚无 run 的失败终态保持 null", () => {
     const value = guiTaskSchema.parse({
       ...task,

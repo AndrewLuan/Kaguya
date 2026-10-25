@@ -107,6 +107,7 @@ async function authenticated(
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+  if (signal.aborted) throw new DOMException("Request aborted", "AbortError");
   if (response.status === 401) {
     window.dispatchEvent(new Event(GATEWAY_UNAUTHORIZED_EVENT));
     throw new GatewayRequestError(

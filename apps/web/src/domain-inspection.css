@@ -239,8 +239,14 @@
   min-width: 0;
 }
 .situation-domain[open] {
-  max-height: 65dvh;
-  overflow: auto;
+  overflow: visible;
+}
+.wb-shell-situation:has(.situation-domain[open]) {
+  height: auto;
+}
+.situation-page:has(.situation-domain[open]) .situation-workspace {
+  flex: none;
+  min-height: 640px;
 }
 .situation-domain > summary {
   cursor: pointer;

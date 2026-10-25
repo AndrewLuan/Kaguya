@@ -195,7 +195,22 @@ export function DomainFields({ value }: { value: Record<string, unknown> }) {
             {raw === null || raw === undefined ? (
               "未记录"
             ) : typeof raw === "string" ? (
-              domainLabel(raw)
+              [
+                "state",
+                "status",
+                "availability",
+                "evidence",
+                "reason",
+                "reasonCode",
+                "terminalReason",
+                "pairing",
+                "validation",
+                "environmentValidation",
+              ].includes(key) ? (
+                domainLabel(raw)
+              ) : (
+                raw
+              )
             ) : (
               <ReadableValue value={raw as JsonValue} />
             )}

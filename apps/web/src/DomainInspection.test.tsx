@@ -11,7 +11,7 @@ import {
   inspectionMemoryHistorySchema,
 } from "@kaguya/schema";
 import { AppShell } from "./components/AppShell.js";
-import { DomainInspection } from "./DomainInspection.js";
+import { DomainInspection, DomainFields } from "./DomainInspection.js";
 const responses = vi.hoisted(() => new Map<string, unknown>());
 vi.mock("./use-inspection.js", () => ({
   useInspection: (_token: string, path: string | undefined) =>
@@ -35,6 +35,21 @@ const html = (location: string) =>
       <DomainInspection token="synthetic" location={location} />
     </AppShell>,
   );
+it("keeps stable IDs verbatim even when they match status words", () => {
+  const result = renderToStaticMarkup(
+    <DomainFields
+      value={{
+        runInformationId: "native-run",
+        environmentId: "human",
+        status: "unknown",
+      }}
+    />,
+  );
+  expect(result).toContain("native-run");
+  expect(result).toContain("human");
+  expect(result).toContain("结果未知");
+  expect(result).not.toContain("模型运行投影");
+});
 it("shows independently readable detail when the directory cursor returns 409, hiding invalid paired body", () => {
   responses.set("runs?scope=scope&limit=20&cursor=stale", {
     error: "directory changed",

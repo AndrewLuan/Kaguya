@@ -162,10 +162,12 @@ function ManagedDesktop({
   const imageUrl = useRef<string | undefined>(undefined);
   const [receipt, setReceipt] = useState<HumanReceipt>();
   const [point, setPoint] = useState({ x: 0, y: 0 });
-  const operationId = new URLSearchParams(location.split("?")[1]).get("operation") ?? "";
+  const operationId =
+    new URLSearchParams(location.split("?")[1]).get("operation") ?? "";
   const expectedOperation = useRef(operationId);
   const controlRequest = useRef<
-    { action: string; generation: number; id: string } | undefined
+    | { action: string; generation: number; id: string; confirmed?: boolean }
+    | undefined
   >(undefined);
   const clearImage = () => {
     if (imageUrl.current) URL.revokeObjectURL(imageUrl.current);
@@ -179,7 +181,9 @@ function ManagedDesktop({
   };
   useEffect(() => {
     if (expectedOperation.current !== operationId) {
-      disarm(); setReceipt(undefined); expectedOperation.current = operationId;
+      disarm();
+      setReceipt(undefined);
+      expectedOperation.current = operationId;
     }
   }, [operationId]);
   const acceptControl = (value: Control) => {
@@ -312,19 +316,23 @@ function ManagedDesktop({
         !controlRequest.current &&
         saved?.environmentId === c.environmentId &&
         saved?.action === action &&
-        saved?.generation === c.generation &&
+        (saved?.generation === c.generation ||
+          saved?.generation + 1 === c.generation) &&
         typeof saved.id === "string"
       )
         controlRequest.current = saved;
       if (
         !controlRequest.current ||
         controlRequest.current.action !== action ||
-        controlRequest.current.generation !== c.generation
+        (controlRequest.current.generation !== c.generation &&
+          (controlRequest.current.confirmed ||
+            controlRequest.current.generation + 1 !== c.generation))
       )
         controlRequest.current = {
           action,
           generation: c.generation,
           id: crypto.randomUUID(),
+          confirmed: false,
         };
       window.history.replaceState(
         {
@@ -339,7 +347,7 @@ function ManagedDesktop({
       const body =
         action === "handoff" || action === "resume"
           ? {
-              generation: c.generation,
+              generation: controlRequest.current.generation,
               controlAuthorizationId: controlRequest.current.id,
             }
           : session();
@@ -367,6 +375,17 @@ function ManagedDesktop({
       )
         return;
       acceptControl(confirmed);
+      controlRequest.current.confirmed = true;
+      window.history.replaceState(
+        {
+          ...window.history.state,
+          kaguyaControlRequest: {
+            ...controlRequest.current,
+            environmentId: c.environmentId,
+          },
+        },
+        "",
+      );
       if (
         (action === "handoff" || action === "human/renew") &&
         value.state === "human" &&
@@ -383,7 +402,8 @@ function ManagedDesktop({
       if (!armed) throw new Error("请先明确接管或续期人工控制。");
       const human = session();
       const id = crypto.randomUUID();
-      setReceipt(undefined); expectedOperation.current = id;
+      setReceipt(undefined);
+      expectedOperation.current = id;
       const params = new URLSearchParams(window.location.search);
       params.set("operation", id);
       if (!(await navigate(`${window.location.pathname}?${params}`))) return;
@@ -395,7 +415,12 @@ function ManagedDesktop({
         signal,
         { ...human, operationId: id, arguments: args },
       );
-      if (!valid(signal, ticket) || new URLSearchParams(window.location.search).get("operation") !== id || value.operationId !== id) return;
+      if (
+        !valid(signal, ticket) ||
+        new URLSearchParams(window.location.search).get("operation") !== id ||
+        value.operationId !== id
+      )
+        return;
       setReceipt(value);
       if (action === "human/observe" && value.outcome.status === "succeeded") {
         const data = desktopCaptureSchema.parse(value.outcome.result);
@@ -449,6 +474,21 @@ function ManagedDesktop({
     !busy &&
     !!image &&
     Date.parse(image.data.expiresAt) > Date.now();
+  const pendingControlRequest =
+    controlRequest.current ??
+    (typeof window !== "undefined"
+      ? window.history.state?.kaguyaControlRequest
+      : undefined);
+  const canRetryHandoff =
+    !pendingControlRequest?.confirmed &&
+    pendingControlRequest?.action === "handoff" &&
+    (pendingControlRequest?.generation === control.generation ||
+      pendingControlRequest?.generation + 1 === control.generation);
+  const canRetryResume =
+    !pendingControlRequest?.confirmed &&
+    pendingControlRequest?.action === "resume" &&
+    (pendingControlRequest?.generation === control.generation ||
+      pendingControlRequest?.generation + 1 === control.generation);
   const input = (args: Record<string, unknown>) => {
     if (!canInput || !image) return;
     humanOperation("human/input", {
@@ -464,18 +504,23 @@ function ManagedDesktop({
         {control.pendingControl && (
           <p>
             控制切换待确认：
-            {control.pendingControl.mode === "human" ? "人工" : "自动"}，代际{" "}
-            {control.pendingControl.generation}
+            {control.pendingControl.mode === "human"
+              ? "人工"
+              : "自动"}，代际 {control.pendingControl.generation}
           </p>
         )}
       </div>
       {error && <FieldMessage tone="error">{error}</FieldMessage>}
       <div className="domain-controls">
         <Button
-          disabled={busy || control.state !== "ready"}
+          disabled={
+            busy ||
+            canRetryResume ||
+            (control.state !== "ready" && !canRetryHandoff)
+          }
           onClick={() => manage("handoff")}
         >
-          接管桌面
+          {canRetryHandoff ? "重试接管（原请求）" : "接管桌面"}
         </Button>
         <Button
           disabled={busy || control.state !== "human" || !control.human}
@@ -498,10 +543,14 @@ function ManagedDesktop({
           关闭人工输入
         </Button>
         <Button
-          disabled={busy || !["human", "draining"].includes(control.state)}
+          disabled={
+            busy ||
+            canRetryHandoff ||
+            (!canRetryResume && !["human", "draining"].includes(control.state))
+          }
           onClick={() => manage("resume")}
         >
-          恢复自动控制
+          {canRetryResume ? "重试恢复（原请求）" : "恢复自动控制"}
         </Button>
       </div>
       <p>
@@ -604,6 +653,7 @@ function ManagedDesktop({
             maxLength={4096}
             pattern="[\x09\x0a\x0d\x20-\x7e]+"
             title="当前坐标插入支持英文、数字及 ASCII 符号"
+            placeholder="英文、数字及 ASCII 符号"
             required
           />
         </label>
@@ -659,7 +709,14 @@ function ManagedDesktop({
                   humanReceiptSchema,
                   signal,
                 );
-                if (valid(signal, ticket) && value.operationId === operationId && new URLSearchParams(window.location.search).get("operation") === operationId) setReceipt(value);
+                if (
+                  valid(signal, ticket) &&
+                  value.operationId === operationId &&
+                  new URLSearchParams(window.location.search).get(
+                    "operation",
+                  ) === operationId
+                )
+                  setReceipt(value);
               })
             }
           >
@@ -710,10 +767,13 @@ function GuiTaskForm({
     controller = useRef<AbortController | undefined>(undefined);
   const submitting = useRef(false),
     mounted = useRef(true);
-  const requestIdentity = useRef(taskId); requestIdentity.current = taskId;
+  const requestIdentity = useRef(taskId);
+  requestIdentity.current = taskId;
   const pendingIdentity = useRef("");
   useEffect(() => {
-    if (pendingIdentity.current && pendingIdentity.current !== taskId) controller.current?.abort();
+    if (pendingIdentity.current && pendingIdentity.current !== taskId)
+      controller.current?.abort();
+    if (!taskId) submitting.current = false;
     setError("");
   }, [taskId]);
   useEffect(() => {
@@ -733,7 +793,8 @@ function GuiTaskForm({
     setBusy(true);
     setError("");
     const c = new AbortController();
-    controller.current = c; pendingIdentity.current = id;
+    controller.current = c;
+    pendingIdentity.current = id;
     const timer = setTimeout(() => c.abort(), 65000);
     try {
       const value = await environmentRequest(
@@ -752,7 +813,11 @@ function GuiTaskForm({
             ? {}
             : { taskRequestId: id, prompt },
       );
-      if (c.signal.aborted || new URLSearchParams(window.location.search).get("task") !== id) return;
+      if (
+        c.signal.aborted ||
+        new URLSearchParams(window.location.search).get("task") !== id
+      )
+        return;
       if (
         value.taskRequestId !== id ||
         value.environmentId !== control.environmentId
@@ -772,14 +837,18 @@ function GuiTaskForm({
       if (mounted.current) setBusy(false);
     }
   };
-  const activeTask = task?.taskRequestId === taskId && task.environmentId === control.environmentId ? task : undefined;
+  const activeTask =
+    task?.taskRequestId === taskId &&
+    task.environmentId === control.environmentId
+      ? task
+      : undefined;
   return (
     <section className="gui-task" aria-label="GUI 任务">
       <h3>运行 GUI 任务</h3>
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          if (taskId || busy || submitting.current) return;
+          if (taskId || busy || lock.current || submitting.current) return;
           const prompt = String(
             new FormData(event.currentTarget).get("prompt") ?? "",
           ).trim();
