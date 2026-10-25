@@ -1,6 +1,7 @@
 /**
  * 功能概述：GUI provider 的许可、一次性观察及双向排空合同测试，不连接模型或真实桌面。
  * 原子发布回归在 rename 前冻结写者，验证 ready 不提前出现、旧 ledger 完整且失败不覆盖。
+ * drain 总预算回归用可控时钟确认阶段共享剩余时间、过期不派发、晚到结果不通过。
  * 主要职责：用显式 barrier 制造准备/发送/释放交错，核对零旧输入、未知结果不重放和 ACK 时点。
  * 代码库关系：直接调用 gui.mjs；实际 Cua/X11 行为继续由 check-gui-container.py 验证。
  * 输入输出与副作用：仅临时 HOME；测试结束等待收尾并删除，PNG 字节用于原尺寸/hash 配对断言。
@@ -8,6 +9,7 @@
 import test from "node:test";
 import { promises as fs } from "node:fs";
 import { publishFixtureJson } from "./gui-fixture-json.mjs";
+import { fixtureBudget } from "./gui-fixture-budget.mjs";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -15,6 +17,56 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { GuiComponent } from "./gui.mjs";
+
+test("drain stages share one absolute budget and refuse expired dispatch", async () => {
+  let now = 0;
+  const limits = [];
+  const stage = fixtureBudget(150000, {
+    now: () => now,
+    bound: (result, limit) => {
+      limits.push(limit);
+      return result;
+    },
+  });
+  await stage(() => "started", 60000, "start");
+  now = 140000;
+  await stage(() => "observed", 25000, "observe");
+  assert.deepEqual(limits, [60000, 10000]);
+  now = 150000;
+  let dispatched = false;
+  assert.throws(
+    () =>
+      stage(
+        () => {
+          dispatched = true;
+        },
+        15000,
+        "input",
+      ),
+    /total-deadline/,
+  );
+  assert.throws(stage.check, /total-deadline/);
+  assert.equal(dispatched, false);
+});
+
+test("drain cannot accept a stage result after its absolute deadline", async () => {
+  let now = 0;
+  const stage = fixtureBudget(150000, {
+    now: () => now,
+    bound: (result) => result,
+  });
+  await assert.rejects(
+    stage(
+      () => {
+        now = 150000;
+        return "late";
+      },
+      150000,
+      "late",
+    ),
+    /total-deadline/,
+  );
+});
 
 const barrier = () => {
   let resolve, reject;

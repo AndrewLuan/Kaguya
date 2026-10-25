@@ -28,15 +28,18 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="x11-")
         self.addCleanup(self.directory.cleanup)
-        self.records, self.tasks, self.clients = [], [], []
+        self.records, self.tasks, self.clients, self.server_writers = [], [], [], []
+        self.backend, self.barrier = None, None
+        # 在获得第一个 socket 前登记，asyncSetUp 中途失败也执行同一完整清理。
+        self.addAsyncCleanup(self.close)
         self.received = asyncio.Queue()
         self.backend = await asyncio.start_unix_server(self.accept, path=self.directory.name + "/real")
         self.barrier = InputBarrier(self.directory.name + "/proxy", self.directory.name + "/real")
         await self.barrier.start()
         self.barrier.authorize(lambda _: None)
-        self.addAsyncCleanup(self.close)
 
     def accept(self, reader, writer):
+        self.server_writers.append(writer)
         async def serve():
             record = []
             self.records.append(record)
@@ -54,18 +57,45 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             except (asyncio.IncompleteReadError, ConnectionError):
                 pass
             finally:
-                writer.close()
-                await writer.wait_closed()
+                writer.transport.abort()
+                await asyncio.wait_for(writer.wait_closed(), 2)
         self.tasks.append(asyncio.create_task(serve()))
 
     async def close(self):
-        await asyncio.wait_for(self.barrier.close(), 2)
-        for writer in self.clients:
-            writer.close()
-            await writer.wait_closed()
-        self.backend.close()
-        await self.backend.wait_closed()
-        await asyncio.wait_for(asyncio.gather(*self.tasks), 2)
+        errors = []
+
+        async def attempt(operation):
+            try:
+                await asyncio.wait_for(operation(), 2)
+            except Exception as error:
+                errors.append(error)
+
+        if self.barrier is not None:
+            await attempt(self.barrier.close)
+        for writer in self.clients + self.server_writers:
+            try:
+                writer.transport.abort()
+            except Exception as error:
+                errors.append(error)
+            await attempt(writer.wait_closed)
+        if self.backend is not None:
+            try:
+                self.backend.close()
+            except Exception as error:
+                errors.append(error)
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+
+        async def drain():
+            results = await asyncio.gather(*self.tasks, return_exceptions=True)
+            errors.extend(error for error in results if isinstance(error, Exception))
+
+        await attempt(drain)
+        if self.backend is not None:
+            await attempt(self.backend.wait_closed)
+        if errors:
+            raise ExceptionGroup("barrier test cleanup failed", errors)
 
     async def client(self, order):
         reader, writer = await asyncio.open_unix_connection(str(self.barrier.path))
@@ -110,6 +140,23 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await asyncio.wait_for(self.received.get(), 2), packet)
         self.assertEqual(await asyncio.wait_for(reader.readexactly(22), 2), b"request-ack" * 2)
         self.assertFalse(self.barrier.hit.is_set())
+
+    async def test_cleanup_failure_still_closes_clients_backend_and_workers(self):
+        await self.client("<")
+        close = self.barrier.close
+        error = OSError("injected proxy cleanup failure")
+
+        async def fail():
+            await close()
+            raise error
+
+        with patch.object(self.barrier, "close", fail):
+            with self.assertRaises(ExceptionGroup) as result:
+                await self.close()
+        self.assertIn(error, result.exception.exceptions)
+        self.assertFalse(self.backend.is_serving())
+        self.assertTrue(all(writer.is_closing() for writer in self.clients + self.server_writers))
+        self.assertTrue(all(task.done() for task in self.tasks))
 
     async def test_peer_denial_and_invalid_frames_fail_closed(self):
         self.barrier.authorize(lambda _: (_ for _ in ()).throw(RuntimeError("peer-denied")))
@@ -162,6 +209,26 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             packet = bytes([100, 1]) + struct.pack(order + "H", 3) + bytes([248, 1, 0, 0]) + struct.pack(order + "I", 0x1004e2d)
             self.assertTrue(matches_request(packet, order, 132, "unicode", set()))
             self.assertFalse(matches_request(packet[:-4] + bytes(4), order, 132, "unicode", set()))
+
+
+class SetupCleanupTest(unittest.TestCase):
+    def test_setup_failure_runs_registered_resource_cleanup(self):
+        original = InputBarrier.start
+
+        async def fail(barrier):
+            await original(barrier)
+            raise OSError("injected setup failure")
+
+        case = BarrierTest("test_unarmed_packets_and_server_replies_pass_unchanged")
+        result = unittest.TestResult()
+        with patch.object(InputBarrier, "start", fail):
+            case.run(result)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("injected setup failure", result.errors[0][1])
+        self.assertFalse(case.backend.is_serving())
+        self.assertFalse(case.barrier.tasks)
+        self.assertTrue(case.barrier.accept_task.done())
+        self.assertFalse(Path(case.directory.name).exists())
 
 
 class StopTest(unittest.IsolatedAsyncioTestCase):

@@ -7,25 +7,34 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { writeFile, readFile } from "node:fs/promises";
+import {
+  writeFile as rawWriteFile,
+  readFile as rawReadFile,
+} from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { CuaStdio } from "./cua-stdio.mjs";
 const exec = promisify(execFile);
-import { x11State as keyboard } from "./gui-x11.mjs";
+import { x11State as rawKeyboard } from "./gui-x11.mjs";
 
-async function bounded(promise, milliseconds, message) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), milliseconds);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+import { bounded, fixtureBudget } from "./gui-fixture-budget.mjs";
+// 四模式共用 150 秒，finally 的并行 monitor/driver/helper 收尾最多 10 秒；外层 180 秒还留 20 秒。
+const stage = fixtureBudget(150000);
+const pendingHelpers = new Set();
+const keyboard = (request) =>
+  stage(
+    () => {
+      const pending = rawKeyboard(request);
+      pendingHelpers.add(pending);
+      pending.finally(() => pendingHelpers.delete(pending)).catch(() => {});
+      return pending;
+    },
+    5000,
+    "x11-stage-timeout",
+  );
+const readFile = (...args) =>
+  stage(() => rawReadFile(...args), 5000, "fixture-read-timeout");
+const writeFile = (...args) =>
+  stage(() => rawWriteFile(...args), 5000, "fixture-write-timeout");
 
 for (const mode of ["held", "modifier", "button", "unicode"]) {
   const displays = { held: 91, modifier: 92, button: 93, unicode: 94 };
@@ -80,18 +89,21 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
         throw result.error ?? new Error(error || "monitor-failed");
     });
     completed.catch(() => {});
-    await bounded(
-      Promise.race([
-        proxyReady,
-        completed.then(() => {
-          throw new Error("monitor-exited-before-ready");
-        }),
-      ]),
+    await stage(
+      () =>
+        Promise.race([
+          proxyReady,
+          completed.then(() => {
+            throw new Error("monitor-exited-before-ready");
+          }),
+        ]),
       15000,
       "proxy-start-timeout",
     );
-    await driver.start();
-    const windows = await driver.call("list_windows", {});
+    await stage(() => driver.start(), 60000, "driver-start-timeout");
+    const call = (...args) =>
+      stage(() => driver.call(...args), 30000, "driver-read-timeout");
+    const windows = await call("list_windows", {});
     const target = windows.structuredContent?.windows.find(
       (w) =>
         w.title ===
@@ -104,14 +116,25 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
       windowId = target.window_id ?? target.id;
     assert.ok(Number.isSafeInteger(pid) && Number.isSafeInteger(windowId));
     // 先通过一次明确的窗口点击确认输入焦点；以下被中断动作仍单独发送一次。
-    const state = await driver.call("get_window_state", {
+    const state = await call("get_window_state", {
       pid,
       window_id: windowId,
       max_image_dimension: 0,
     });
     const capture = state.structuredContent?.capture_id;
-    assert.ok(capture, "terminal-capture-required");
-    const clicked = await driver.call(
+    assert.ok(
+      capture,
+      "terminal-capture-required:" +
+        JSON.stringify({
+          mode,
+          state: {
+            ...state,
+            content: state.content?.filter((item) => item.type !== "image"),
+          },
+          driverDiagnostics: driver.diagnostics,
+        }),
+    );
+    const clicked = await call(
       "click",
       {
         pid,
@@ -129,23 +152,26 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
     assert.deepEqual(before.buttons, []);
     const inputState =
       mode === "button"
-        ? await driver.call("get_window_state", {
+        ? await call("get_window_state", {
             pid,
             window_id: windowId,
             max_image_dimension: 0,
           })
         : undefined;
     monitor.stdin.end(JSON.stringify({ arm: true }) + "\n");
-    await bounded(
-      Promise.race([
-        ready,
-        completed.then(() => {
-          throw new Error("monitor-exited-before-armed");
-        }),
-      ]),
+    await stage(
+      () =>
+        Promise.race([
+          ready,
+          completed.then(() => {
+            throw new Error("monitor-exited-before-armed");
+          }),
+        ]),
       15000,
       "proxy-arm-timeout",
     );
+    // 只触发一次输入；预算不足时 gate 在 stdin.write 之前拒绝。
+    const inputGate = stage.check;
     const request =
       mode === "button"
         ? driver.call(
@@ -158,7 +184,7 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
               capture_id: inputState.structuredContent.capture_id,
               delivery_mode: "foreground",
             },
-            () => {},
+            inputGate,
           )
         : mode === "held" || mode === "modifier"
           ? driver.call(
@@ -170,7 +196,7 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
                 modifiers: mode === "modifier" ? ["shift"] : [],
                 delivery_mode: "foreground",
               },
-              () => {},
+              inputGate,
             )
           : driver.call(
               "type_text",
@@ -180,15 +206,18 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
                 text: "中".repeat(1000),
                 delivery_mode: "foreground",
               },
-              () => {},
+              inputGate,
             );
     const settled = request.then(
       () => "returned",
       () => "interrupted",
     );
-    await bounded(completed, 25000, "monitor-completion-timeout");
-    await driver.stop();
-    assert.equal(await settled, "interrupted");
+    await stage(() => completed, 25000, "monitor-completion-timeout");
+    await stage(() => driver.stop(), 5000, "driver-stop-timeout");
+    assert.equal(
+      await stage(() => settled, 1000, "input-settle-timeout"),
+      "interrupted",
+    );
     const interruption = JSON.parse(output.split("\n")[2]);
     assert.equal(
       interruption.barrier,
@@ -252,13 +281,17 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
           break;
         if (Date.now() >= deadline)
           throw new Error("application-key-release-unconfirmed");
-        await delay(20);
+        await stage(() => delay(20), 1000, "application-release-wait-timeout");
       }
     }
     if (mode === "unicode") assert.ok(reset.restoredKeycodes.length > 0);
     const after = await keyboard({ mode: "snapshot" });
     assert.deepEqual(after.mapping, before.mapping);
-    await exec("/usr/bin/test", ["-d", `/proc/${pid}`]);
+    await stage(
+      () => exec("/usr/bin/test", ["-d", `/proc/${pid}`], { timeout: 1000 }),
+      2000,
+      "application-identity-timeout",
+    );
     console.log(
       JSON.stringify({
         mode,
@@ -281,7 +314,12 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
           monitor.kill("SIGKILL");
         await bounded(monitorClosed, 5000, "monitor-close-timeout");
       })(),
-      driver.stop(),
+      bounded(driver.stop(), 10000, "driver-cleanup-timeout"),
+      bounded(
+        Promise.allSettled([...pendingHelpers]),
+        10000,
+        "x11-cleanup-timeout",
+      ),
     ]);
     for (const result of cleanup)
       if (result.status === "rejected") errors.push(result.reason);

@@ -152,6 +152,7 @@ try:
     after = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json"], lambda value: value["text"] == "W8 暂存" and value["count"] == 1)
     assert after == {"uid": 1001, "pid": ledger["pid"], "text": "W8 暂存", "count": 1}, after
     print(json.dumps({"independentApplicationLedger": after}), flush=True)
+    # 四模式共用绝对 150s，最终清理独立最多 10s；宿主 180s 另留 20s 给启动/调度/进程退出。
     drain = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-drain-probe.mjs", timeout=180)
     print(drain.stdout.decode(), flush=True)
     preserved = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
