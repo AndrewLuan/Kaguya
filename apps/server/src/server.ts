@@ -1,6 +1,7 @@
 /**
  * GUI 模型仅按 linux-tools.json 显式路由创建，首轮前选定；普通 Heavy 保持原 tier。模型配置摘要不包含凭据。
  * MCP 宿主由本文件按 Runtime 生命周期打开和回收；首次装配与配置重建共用冻结工具/provider 接口。
+ * Inspection 注入环境公开只读门面，跟随 MCP/Runtime 重挂载更新。
  * Memory 图管理通过动态 database.memoryGraph 门面接入 HTTP，数据库重挂载后使用当前实例。
  * 模板管理与配置应用共享写锁，只写本地覆盖，用户需重启加载新模板。
  * 模块配置管理复用 configuration.exclusive，与显式应用共锁；保存不会切换运行实例。
@@ -47,6 +48,7 @@
  * Inspection 仅在 Runtime 可用时注入，不把 settings、凭据或数据库对象放入 HTTP 响应。
  * Web adapter 将回复交付给持久账本；WebChatHistory 只投影已送达消息，热应用后读取当前数据库。
  */
+import { inspectionEnvironmentSource } from "./mcp-host.js";
 import {
   openServerMcp,
   closeServerMcp,
@@ -616,6 +618,7 @@ export async function startKaguyaServer(
               database,
               modules: () => activeRuntime.inspectModules(),
               secrets: secretHistory,
+              environments: () => inspectionEnvironmentSource(mcp),
             })
           : undefined;
     };

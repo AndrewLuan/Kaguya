@@ -5,6 +5,7 @@
  * 代码库关系：native-memory 的所有读取共用此实现；currentInvalidity 仅读局部依赖元数据；全文历史查询从历史正文计算，
  * 不使用当前索引或当前边。publish 必须持有 7149321 写锁直到提交，保证发布前缀有序。
  * 回执正规来源通过 sourceDependencies 保留实际依赖；撤回沿该持久闭包投影到来源根。
+ * Inspection 可传 maxNodes 限制历史依赖展开；超限明确失败，不能输出不完整的有效性证明。
  * 输入输出与副作用：只读 SQL，返回独立 Map；不修改 epoch、原文或已发布 revision。
  */
 import {
@@ -177,6 +178,7 @@ export async function readMemoryView(
     scope?: string;
     owners?: readonly string[];
     ids?: readonly string[];
+    maxNodes?: number;
   },
 ): Promise<MemoryView> {
   const nodes = new Map<string, NativeMemoryNode>();
@@ -194,14 +196,23 @@ export async function readMemoryView(
       JOIN information_lifecycle l ON l.information_id=p.information_id
       CROSS JOIN LATERAL jsonb_array_elements(p.nodes) item
       WHERE l.position<=$1::bigint AND item->>'id' IN (SELECT id FROM candidates)
-      ORDER BY item->>'id',l.position DESC`,
-        [upper, ids ?? null, selection.scope ?? null],
+      ORDER BY item->>'id',l.position DESC LIMIT $4`,
+        [
+          upper,
+          ids ?? null,
+          selection.scope ?? null,
+          selection.maxNodes === undefined ? null : selection.maxNodes + 1,
+        ],
       )
     ).rows;
+    if (selection.maxNodes !== undefined && rows.length > selection.maxNodes)
+      throw new Error("inspection-memory-dependency-budget");
     for (const row of rows) {
       const n = nativeMemoryNodeSchema.parse(row.node);
       nodes.set(n.id, n);
     }
+    if (selection.maxNodes !== undefined && nodes.size > selection.maxNodes)
+      throw new Error("inspection-memory-dependency-budget");
   };
   await load(selection.ids);
   let edges: HistoricalEdge[] = [];
@@ -220,10 +231,19 @@ export async function readMemoryView(
         (entry.edge->>'sourceId'=ANY($2::text[]) OR entry.edge->>'targetId'=ANY($2::text[]))
     ), latest AS (SELECT DISTINCT ON(edge->>'sourceId',edge->>'targetId',edge->>'relation') edge,added
       FROM operations ORDER BY edge->>'sourceId',edge->>'targetId',edge->>'relation',position DESC,added DESC)
-    SELECT edge FROM latest WHERE added`,
-        [upper, [...nodes.keys()]],
+    SELECT edge FROM latest WHERE added LIMIT $3`,
+        [
+          upper,
+          [...nodes.keys()],
+          selection.maxNodes === undefined ? null : selection.maxNodes * 4 + 1,
+        ],
       )
     ).rows.map((r) => r.edge);
+    if (
+      selection.maxNodes !== undefined &&
+      edges.length > selection.maxNodes * 4
+    )
+      throw new Error("inspection-memory-dependency-budget");
     const missing = [
       ...new Set(
         edges

@@ -54,6 +54,7 @@ const developerGuide: DefaultTheme.SidebarItem[] = [
       { text: "信息账本", link: "/developers/information-ledger" },
       { text: "测试与兼容边界", link: "/developers/testing-compatibility" },
       { text: "Runtime 可观测性", link: "/developers/observability" },
+      { text: "持续 Agent 领域检视", link: "/developers/inspection" },
       { text: "一次性调度", link: "/developers/scheduler" },
       { text: "短心跳恢复", link: "/developers/heartbeat" },
       { text: "周期维护调度", link: "/developers/cadence" },

@@ -22,6 +22,7 @@ const criticalTests = [
   "packages/database/src/observation-store.test.ts",
   "packages/mcp/src/host.test.ts",
   "apps/server/src/mcp-host.test.ts",
+  "apps/server/src/inspection-domain.test.ts",
   "packages/runtime/src/action.test.ts",
   "packages/runtime/src/native-tool-loop.test.ts",
   "packages/runtime/src/native-tool-results.test.ts",
