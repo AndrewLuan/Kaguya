@@ -128,10 +128,16 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
         JSON.stringify({
           mode,
           state: {
-            ...state,
-            content: state.content?.filter((item) => item.type !== "image"),
+            isError: state.isError,
+            text: state.content
+              ?.filter((item) => item.type === "text")
+              .slice(0, 4)
+              .map((item) => item.text?.slice(0, 2048)),
+            screenshot_error: String(
+              state.structuredContent?.screenshot_error ?? "",
+            ).slice(0, 2048),
           },
-          driverDiagnostics: driver.diagnostics,
+          driverDiagnostics: driver.diagnostics.slice(-8192),
         }),
     );
     const clicked = await call(

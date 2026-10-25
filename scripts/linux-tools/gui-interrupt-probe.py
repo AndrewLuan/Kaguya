@@ -157,6 +157,8 @@ async def main():
         if not matches(frozen, mode):
             raise RuntimeError("input-state-ended-before-freeze")
         repeat = await observe_repeat(frozen["keys"]) if mode == "held" else None
+        if barrier.failure.done():
+            raise barrier.failure.result()
         print(json.dumps({"mode": mode, "observed": frozen, "autoRepeat": repeat,
                           "barrier": "forwarded-real-request-blocked-successors", "stoppedThreads": stopped,
                           "requestOpcode": barrier.forwarded_target[0]}), flush=True)

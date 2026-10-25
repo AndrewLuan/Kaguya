@@ -5,12 +5,16 @@
 """
 import asyncio
 import importlib.util
+import os
+import socket
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
-from gui_input_barrier import InputBarrier, matches_request, read_request, read_setup
+import gui_input_barrier as barrier_module
+from gui_input_barrier import InputBarrier, RawReader, send_packet, read_reply, matches_request, read_request, read_setup
 
 
 def setup(order):
@@ -24,11 +28,20 @@ def event(order, kind, detail, opcode=132):
     return bytes([opcode, 2]) + struct.pack(order + "H", 9) + bytes([kind, detail]) + bytes(30)
 
 
+def setup_reply(order):
+    return bytes([1, 0]) + struct.pack(order + "HHH", 11, 0, 0)
+
+
+def reply(order, fds=0):
+    return bytes([1, fds]) + struct.pack(order + "HI", 1, 0) + bytes(24)
+
+
 class BarrierTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="x11-")
         self.addCleanup(self.directory.cleanup)
-        self.records, self.tasks, self.clients, self.server_writers = [], [], [], []
+        self.records, self.tasks, self.clients, self.server_writers, self.raw_clients = [], [], [], [], []
+        self.fd_response = None
         self.backend, self.barrier = None, None
         # 在获得第一个 socket 前登记，asyncSetUp 中途失败也执行同一完整清理。
         self.addAsyncCleanup(self.close)
@@ -46,14 +59,21 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             try:
                 initial, order = await read_setup(reader)
                 record.append(initial)
-                writer.write(b"setup-ack")
+                writer.write(setup_reply(order))
                 await writer.drain()
                 while True:
                     packet = await read_request(reader, order)
                     record.append(packet)
                     self.received.put_nowait(packet)
-                    writer.write(b"request-ack")
-                    await writer.drain()
+                    if self.fd_response is None:
+                        writer.write(reply(order))
+                        await writer.drain()
+                    else:
+                        raw = writer.get_extra_info("socket").dup()
+                        try:
+                            await send_packet(raw, reply(order, 1), [os.dup(self.fd_response)])
+                        finally:
+                            raw.close()
             except (asyncio.IncompleteReadError, ConnectionError):
                 pass
             finally:
@@ -78,6 +98,11 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             except Exception as error:
                 errors.append(error)
             await attempt(writer.wait_closed)
+        for connection in self.raw_clients:
+            try:
+                connection.close()
+            except Exception as error:
+                errors.append(error)
         if self.backend is not None:
             try:
                 self.backend.close()
@@ -104,7 +129,7 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
         for byte in setup(order):
             writer.write(bytes([byte]))
             await writer.drain()
-        self.assertEqual(await asyncio.wait_for(reader.readexactly(9), 2), b"setup-ack")
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(8), 2), setup_reply(order))
         return reader, writer
 
     async def test_little_endian_coalesced_release_and_other_connections_are_blocked(self):
@@ -122,7 +147,7 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
         await asyncio.wait_for(self.barrier.hit.wait(), 2)
         self.assertEqual(await asyncio.wait_for(self.received.get(), 2), down)
-        self.assertEqual(await asyncio.wait_for(reader.readexactly(11), 2), b"request-ack")
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(32), 2), reply(order))
         other.write(release)
         await other.drain()
         await self.close()
@@ -138,8 +163,139 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
         for packet in packets:
             self.assertEqual(await asyncio.wait_for(self.received.get(), 2), packet)
-        self.assertEqual(await asyncio.wait_for(reader.readexactly(22), 2), b"request-ack" * 2)
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(64), 2), reply("<") * 2)
         self.assertFalse(self.barrier.hit.is_set())
+
+    async def test_shared_memory_fd_reaches_client_with_its_reply(self):
+        with tempfile.TemporaryFile() as pixels:
+            pixels.write(b"actual shared-memory pixels")
+            pixels.seek(0)
+            self.fd_response = pixels.fileno()
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.setblocking(False)
+            self.raw_clients.append(connection)
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(connection, str(self.barrier.path)), 2)
+            reader = RawReader(connection)
+            self.addCleanup(lambda: [os.close(fd) for fd in reader.take_fds()])
+            await send_packet(connection, setup("<"), [])
+            self.assertEqual(await asyncio.wait_for(read_reply(reader, "<", initial=True), 2), setup_reply("<"))
+            await send_packet(connection, event("<", 2, 38), [])
+            self.assertEqual(await asyncio.wait_for(read_reply(reader, "<"), 2), reply("<", 1))
+            descriptors = reader.take_fds()
+            self.assertEqual(len(descriptors), 1)
+            try:
+                self.assertFalse(os.get_inheritable(descriptors[0]))
+                self.assertEqual(os.read(descriptors[0], 64), b"actual shared-memory pixels")
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
+
+    async def test_send_failure_closes_owned_descriptor(self):
+        left, right = socket.socketpair()
+        self.raw_clients.extend([left, right])
+        left.setblocking(False)
+        right.close()
+        with tempfile.TemporaryFile() as source:
+            descriptor = os.dup(source.fileno())
+            with self.assertRaises(ConnectionError):
+                await send_packet(left, b"x", [descriptor])
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    async def test_cancelled_send_closes_owned_descriptor(self):
+        waiting = asyncio.Event()
+
+        async def blocked(*_args, **_kwargs):
+            waiting.set()
+            await asyncio.Future()
+
+        class FullSocket:
+            def sendmsg(self, *_args):
+                raise BlockingIOError()
+
+        with tempfile.TemporaryFile() as source:
+            descriptor = os.dup(source.fileno())
+            with patch.object(barrier_module, "socket_ready", blocked):
+                task = asyncio.create_task(send_packet(FullSocket(), b"x", [descriptor]))
+                try:
+                    await asyncio.wait_for(waiting.wait(), 2)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    async def test_truncated_ancillary_closes_all_received_descriptors(self):
+        left, right = socket.socketpair()
+        self.raw_clients.extend([left, right])
+        left.setblocking(False)
+        right.setblocking(False)
+        with tempfile.TemporaryFile() as source:
+            await send_packet(left, b"x", [os.dup(source.fileno()) for _ in range(17)])
+        reader = RawReader(right)
+        with patch.object(barrier_module.os, "close", wraps=os.close) as closed, warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="received malformed or improperly-truncated ancillary data", category=RuntimeWarning)
+            with self.assertRaisesRegex(RuntimeError, "invalid-x11-ancillary-data"):
+                await asyncio.wait_for(reader.readexactly(1), 2)
+        self.assertFalse(reader.fds)
+        self.assertGreater(len(closed.call_args_list), 0)
+        for call in closed.call_args_list:
+            with self.assertRaises(OSError):
+                os.fstat(call.args[0])
+
+    async def test_request_fd_and_partial_send_keep_one_descriptor_transfer(self):
+        left, right = socket.socketpair()
+        self.raw_clients.extend([left, right])
+        left.setblocking(False)
+        right.setblocking(False)
+        with tempfile.TemporaryFile() as source:
+            source.write(b"request shared memory")
+            source.seek(0)
+            await send_packet(left, event("<", 2, 38), [os.dup(source.fileno())])
+            reader = RawReader(right)
+            self.assertEqual(await asyncio.wait_for(read_request(reader, "<"), 2), event("<", 2, 38))
+            descriptors = reader.take_fds()
+            try:
+                self.assertEqual(len(descriptors), 1)
+                self.assertEqual(os.read(descriptors[0], 64), b"request shared memory")
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
+            transferred = []
+
+            class PartialSocket:
+                def sendmsg(self, buffers, ancillary):
+                    transferred.append((bytes(buffers[0][:1]), bool(ancillary)))
+                    return 1
+
+            await send_packet(PartialSocket(), b"abc", [os.dup(source.fileno())])
+            self.assertEqual(transferred, [(b"a", True), (b"b", False), (b"c", False)])
+
+    async def test_proxy_close_reclaims_fd_from_an_incomplete_request(self):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.setblocking(False)
+        self.raw_clients.append(connection)
+        await asyncio.wait_for(asyncio.get_running_loop().sock_connect(connection, str(self.barrier.path)), 2)
+        reader = RawReader(connection)
+        await send_packet(connection, setup("<"), [])
+        await asyncio.wait_for(read_reply(reader, "<", initial=True), 2)
+        owned = []
+        received = asyncio.Event()
+        original = os.set_inheritable
+
+        def track(descriptor, value):
+            original(descriptor, value)
+            owned.append(descriptor)
+            received.set()
+
+        with tempfile.TemporaryFile() as source, patch.object(barrier_module.os, "set_inheritable", track):
+            await send_packet(connection, event("<", 2, 38)[:2], [os.dup(source.fileno())])
+            await asyncio.wait_for(received.wait(), 2)
+            await self.close()
+        self.assertTrue(owned)
+        for descriptor in owned:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     async def test_cleanup_failure_still_closes_clients_backend_and_workers(self):
         await self.client("<")
