@@ -1,6 +1,6 @@
 /**
  * 功能概述：真实 Cua 输入被中断后的 Driver 组退出及 X11 held/映射收尾验收。
- * 主要职责：冻结 baseline，等待监视器就绪后仅发送一次输入；触发实际状态后 kill，再 release/readback。
+ * 主要职责：CI 私有代理逐帧转发一次真实输入，在目标请求后阻塞后续请求；真实状态确认并停止整组后 kill，再 release/readback。
  * 代码库关系：gui-interrupt-probe.py 提供确定中断边界，gui-x11.py 是固定可信收尾入口。
  * 输入输出与副作用：只向隔离合成终端输入未执行字符，不按 Enter；不结束应用，不调用模型。
  */
@@ -13,12 +13,83 @@ import { CuaStdio } from "./cua-stdio.mjs";
 const exec = promisify(execFile);
 import { x11State as keyboard } from "./gui-x11.mjs";
 
+async function bounded(promise, milliseconds, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 for (const mode of ["held", "modifier", "button", "unicode"]) {
-  const driver = new CuaStdio();
+  const displays = { held: 91, modifier: 92, button: 93, unicode: 94 };
   let monitor;
+  const driver = new CuaStdio((executable, args, options) => {
+    const child = spawn(executable, args, {
+      ...options,
+      env: { ...options.env, DISPLAY: `:${displays[mode]}` },
+    });
+    monitor.stdin.write(JSON.stringify({ pid: child.pid }) + "\n");
+    return child;
+  });
   let monitorClosed;
   let primary;
   try {
+    monitor = spawn(
+      "/usr/bin/python3",
+      ["/opt/kaguya-tools/gui-interrupt-probe.py", mode],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    // close 在 spawn error 后也会发生；立即登记，不能在 finally 等可能永不发生的 exit。
+    let spawnError;
+    monitorClosed = new Promise((resolve) => {
+      monitor.once("error", (error) => {
+        spawnError = error;
+      });
+      monitor.once("close", (code) => resolve({ code, error: spawnError }));
+    });
+    let output = "",
+      error = "",
+      readyResolve,
+      proxyResolve;
+    const ready = new Promise((resolve) => {
+      readyResolve = resolve;
+    });
+    const proxyReady = new Promise((resolve) => {
+      proxyResolve = resolve;
+    });
+    monitor.stdout.on("data", (data) => {
+      output += data;
+      if (output.startsWith("proxy-ready\n")) proxyResolve();
+      if (output.startsWith("proxy-ready\nready\n")) readyResolve();
+    });
+    monitor.stderr.on("data", (data) => {
+      error += data;
+    });
+    monitor.stdin.on("error", (cause) => {
+      error += cause.message;
+    });
+    const completed = monitorClosed.then((result) => {
+      if (result.error || result.code !== 0)
+        throw result.error ?? new Error(error || "monitor-failed");
+    });
+    completed.catch(() => {});
+    await bounded(
+      Promise.race([
+        proxyReady,
+        completed.then(() => {
+          throw new Error("monitor-exited-before-ready");
+        }),
+      ]),
+      15000,
+      "proxy-start-timeout",
+    );
     await driver.start();
     const windows = await driver.call("list_windows", {});
     const target = windows.structuredContent?.windows.find(
@@ -64,46 +135,17 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
             max_image_dimension: 0,
           })
         : undefined;
-    monitor = spawn(
-      "/usr/bin/python3",
-      [
-        "/opt/kaguya-tools/gui-interrupt-probe.py",
-        String(driver.identity().pid),
-        mode,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+    monitor.stdin.end(JSON.stringify({ arm: true }) + "\n");
+    await bounded(
+      Promise.race([
+        ready,
+        completed.then(() => {
+          throw new Error("monitor-exited-before-armed");
+        }),
+      ]),
+      15000,
+      "proxy-arm-timeout",
     );
-    // close 在 spawn error 后也会发生；立即登记，不能在 finally 等可能永不发生的 exit。
-    let spawnError;
-    monitorClosed = new Promise((resolve) => {
-      monitor.once("error", (error) => {
-        spawnError = error;
-      });
-      monitor.once("close", (code) => resolve({ code, error: spawnError }));
-    });
-    let output = "",
-      error = "",
-      readyResolve;
-    const ready = new Promise((resolve) => {
-      readyResolve = resolve;
-    });
-    monitor.stdout.on("data", (data) => {
-      output += data;
-      if (output.startsWith("ready\n")) readyResolve();
-    });
-    monitor.stderr.on("data", (data) => {
-      error += data;
-    });
-    const completed = monitorClosed.then((result) => {
-      if (result.error || result.code !== 0)
-        throw result.error ?? new Error(error || "monitor-failed");
-    });
-    await Promise.race([
-      ready,
-      completed.then(() => {
-        throw new Error("monitor-exited-before-ready");
-      }),
-    ]);
     const request =
       mode === "button"
         ? driver.call(
@@ -144,10 +186,20 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
       () => "returned",
       () => "interrupted",
     );
-    await completed;
+    await bounded(completed, 25000, "monitor-completion-timeout");
     await driver.stop();
     assert.equal(await settled, "interrupted");
-    const interruption = JSON.parse(output.split("\n")[1]);
+    const interruption = JSON.parse(output.split("\n")[2]);
+    assert.equal(
+      interruption.barrier,
+      "forwarded-real-request-blocked-successors",
+    );
+    assert.ok(Object.keys(interruption.stoppedThreads).length > 0);
+    assert.ok(
+      Object.values(interruption.stoppedThreads).every(
+        ([state]) => state === "T",
+      ),
+    );
     const residual = await keyboard({ mode: "snapshot" });
     await writeFile(
       `/home/tool/gui-drain-${mode}.json`,
@@ -227,7 +279,7 @@ for (const mode of ["held", "modifier", "button", "unicode"]) {
       (async () => {
         if (monitor && monitor.exitCode === null && monitor.signalCode === null)
           monitor.kill("SIGKILL");
-        await monitorClosed;
+        await bounded(monitorClosed, 5000, "monitor-close-timeout");
       })(),
       driver.stop(),
     ]);

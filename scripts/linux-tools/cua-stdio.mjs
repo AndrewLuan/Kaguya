@@ -1,6 +1,7 @@
 /**
  * 功能概述：固定 Cua 0.38 的私有 stdio 通道，只开放观察与基础输入，不转发任意 MCP。
  * 主要职责：CuaStdio.start 验证协议/发现；call 在最后 stdin.write 前执行宿主 gate；stop 杀并排空专属进程组。
+ * 构造器只向可信调用方提供 spawn 依赖注入，供 CI 的 X11 代理路由；默认命令、环境和工具边界保持固定。
  * 代码库关系：GUI component 与真实 Linux probe 共用；应用 UID 无法取得此进程的 stdin 或环境。
  * 输入输出与副作用：有界 JSON 行、请求 deadline、真实响应 ID 配对；超时/断连拒绝未完成调用，不自动重发。
  */
@@ -22,6 +23,11 @@ const INPUT = new Set([
   "scroll",
 ]);
 export class CuaStdio {
+  #spawn;
+  // 可信代码依赖注入：Linux drain fixture 仅改子进程 DISPLAY；生产调用仍使用固定 spawn/env。
+  constructor(spawnDriver = spawn) {
+    this.#spawn = spawnDriver;
+  }
   #child;
   #pending = new Map();
   #id = 0;
@@ -30,7 +36,7 @@ export class CuaStdio {
   diagnostics = "";
   async start() {
     if (this.#child || this.#closed) throw new Error("cua-already-started");
-    const child = (this.#child = spawn(
+    const child = (this.#child = this.#spawn(
       "/opt/cua/cua-driver",
       ["mcp", "--direct"],
       {

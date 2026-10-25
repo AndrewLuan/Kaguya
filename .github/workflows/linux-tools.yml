@@ -30,6 +30,7 @@ jobs:
           python3 -B scripts/linux-tools/check_gui_x11.py
           python3 -B scripts/linux-tools/check_gui_readiness.py
           python3 -B scripts/linux-tools/check_gui_cleanup.py
+          python3 -B scripts/linux-tools/check_gui_barrier.py
       - name: Prepare pinned OCI builder
         run: |
           docker buildx create --name kaguya-oci --driver docker-container --driver-opt image=moby/buildkit@sha256:e39f6119f134b4811af19fd5c20f495a6a264a85c1b6920daf569b23009dd42c --use
