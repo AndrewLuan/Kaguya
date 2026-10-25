@@ -341,7 +341,12 @@ export class ActionExecutor implements ActionAccess {
         ]);
         if (requireForwarded && !forwarded)
           throw new Error("action-cancel-forwarding-unconfirmed");
-        if (receipt)
+        // broker 可返回原成功/拒绝回执，说明取消已送达；它不是取消证据。
+        // 原 unknown/partial 只由显式 reconciliation 升级，不在取消路径改写。
+        if (
+          receipt &&
+          ["cancelled", "partial", "unknown"].includes(receipt.status)
+        )
           return this.options.store.confirmCancellation(
             input,
             view.attemptId,

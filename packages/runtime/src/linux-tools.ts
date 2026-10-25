@@ -109,12 +109,44 @@ export class LinuxToolsHost {
   private readonly manualBlocked = new Set<string>();
   private readonly timer: ReturnType<typeof setInterval>;
   private closed = false;
+  private readonly actionEnvironment: Required<
+    Pick<
+      ActionExecutorOptions,
+      "resolveLeaseCredential" | "validateEnvironment"
+    >
+  >;
   constructor(
     readonly configuration: LinuxToolsConfiguration,
     readonly client = new LinuxEnvironmentClient(),
     private readonly ttlSeconds = 120,
   ) {
     linuxToolsConfigurationSchema.parse(configuration);
+    this.actionEnvironment = {
+      ...this.client.actionHooks,
+      resolveLeaseCredential: async (input, mode) => {
+        if (mode === "cancel") {
+          const original = input.intent.environment;
+          if (
+            !input.controlAuthorizationId ||
+            !original ||
+            !this.configuration.bindings.some(
+              (binding) =>
+                binding.scope === input.intent.scope &&
+                binding.environmentId === original.environmentId &&
+                binding.workflowId === original.workflowId,
+            )
+          )
+            throw new Error("linux-tools-cancel-binding-denied");
+          await this.bind(input.intent.scope);
+        }
+        return this.client.actionHooks.resolveLeaseCredential(input, mode);
+      },
+    } satisfies Required<
+      Pick<
+        ActionExecutorOptions,
+        "resolveLeaseCredential" | "validateEnvironment"
+      >
+    >;
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 300)
       throw new Error("invalid-host-lease-ttl");
     this.timer = setInterval(
@@ -497,32 +529,7 @@ export class LinuxToolsHost {
     return {
       nativeTools: tools,
       actionProviders: tools.registrations.length ? [provider] : [],
-      actionEnvironment: {
-        ...this.client.actionHooks,
-        resolveLeaseCredential: async (input, mode) => {
-          if (mode === "cancel") {
-            const original = input.intent.environment;
-            if (
-              !input.controlAuthorizationId ||
-              !original ||
-              !this.configuration.bindings.some(
-                (binding) =>
-                  binding.scope === input.intent.scope &&
-                  binding.environmentId === original.environmentId &&
-                  binding.workflowId === original.workflowId,
-              )
-            )
-              throw new Error("linux-tools-cancel-binding-denied");
-            await this.bind(input.intent.scope);
-          }
-          return this.client.actionHooks.resolveLeaseCredential(input, mode);
-        },
-      } satisfies Required<
-        Pick<
-          ActionExecutorOptions,
-          "resolveLeaseCredential" | "validateEnvironment"
-        >
-      >,
+      actionEnvironment: this.actionEnvironment,
     };
   }
   async close() {

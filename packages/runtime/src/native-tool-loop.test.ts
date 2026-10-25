@@ -981,6 +981,8 @@ for (const postgres of backends)
         f.provider.cancel = async (input) => {
           cancelledAttempts.push(input.attemptId);
           if (fail) throw new Error("synthetic cancellation transport failure");
+          // broker 已成功但响应丢失：恢复转发可收敛，W3 不据此把 unknown 升级。
+          return mode === "provider-failure" ? outcome : undefined;
         };
         const queued = await service.submit("synthetic-desktop", input);
         try {

@@ -449,6 +449,116 @@ describe.each(backends)("action lifecycle (PostgreSQL=%s)", (postgres) => {
     expect(JSON.stringify(facts.rows)).not.toContain(token);
   });
 
+  it.each(["unknown", "partial"] as const)(
+    "accepts cancellation forwarding after a lost broker success without upgrading the original %s receipt",
+    async (state) => {
+      const f = await fixture(postgres);
+      const environment = {
+        environmentId: "env",
+        generation: 1,
+        workspaceId: "workspace",
+        resourceIds: ["desktop"],
+        workflowId: "workflow",
+        leaseId: "original-lease",
+        fencing: "1",
+        expiresAt: f.intent.deadline,
+      };
+      const calls: { method: string; params: Record<string, unknown> }[] = [];
+      let effects = 0;
+      const clientFor = (reference: typeof environment) =>
+        new LinuxEnvironmentClient(async (method, params) => {
+          calls.push({ method, params });
+          if (method === "lease.acquire")
+            return {
+              environment: reference,
+              token: "synthetic-private-control-lease-token",
+            };
+          if (method === "lease.validate") return { valid: true };
+          if (method === "operation.execute") {
+            effects++;
+            if (state === "unknown")
+              throw new Error("lost successful broker response");
+            return { ...success, status: "partial" };
+          }
+          if (method === "operation.cancel") return success;
+          throw new Error(`unexpected RPC: ${method}`);
+        });
+      const original = clientFor(environment);
+      f.intent.environment = await original.acquire({
+        environmentId: "env",
+        scope: f.scope,
+        workflowId: "workflow",
+      });
+      f.intent.toolName = "gui.observe";
+      await f.authorize();
+      const first = new ActionExecutor({
+        store: f.db.actions,
+        providers: [original.provider("test")],
+        ...original.actionHooks,
+      });
+      cleanups.push(() => first.close());
+      const registered = await first.register(f.intent);
+      const before = await first.execute(registered.intentId, f.scope);
+      expect(before.state).toBe(state);
+      await first.close();
+      await f.reconnect();
+      const restored = clientFor({
+        ...environment,
+        generation: 2,
+        leaseId: "control-lease",
+        fencing: "2",
+      });
+      await restored.acquire({
+        environmentId: "env",
+        scope: f.scope,
+        workflowId: "workflow",
+      });
+      const executor = new ActionExecutor({
+        store: f.db.actions,
+        providers: [restored.provider("test")],
+        ...restored.actionHooks,
+      });
+      cleanups.push(() => executor.close());
+      for (let retry = 0; retry < 2; retry++) {
+        const after = await executor.cancelForwarded(
+          f.intervention(registered.intentId),
+        );
+        expect(after.state).toBe(state);
+        expect(after.receiptId).toBe(before.receiptId);
+        expect(after.attemptId).toBe(before.attemptId);
+      }
+      const dispatched = calls.find(
+        (call) => call.method === "operation.execute",
+      )!.params;
+      const cancellations = calls.filter(
+        (call) => call.method === "operation.cancel",
+      );
+      expect(cancellations).toHaveLength(2);
+      for (const { params } of cancellations)
+        expect(params).toMatchObject({
+          attemptId: dispatched.attemptId,
+          operationId: dispatched.operationId,
+          digest: dispatched.digest,
+          environment,
+          controlEnvironment: { generation: 2, leaseId: "control-lease" },
+        });
+      const receipt = await executor.readReceipt(
+        before.receiptId!,
+        f.scope,
+        f.intent.authorizationId,
+      );
+      expect(receipt.outcome.status).toBe(state);
+      expect(
+        (
+          await f.db.sql.query(
+            "SELECT information_id FROM information_atoms WHERE kind IN ('core.action.result.v1','core.action.reconciled.v1')",
+          )
+        ).rows,
+      ).toHaveLength(1);
+      expect(effects).toBe(1);
+    },
+  );
+
   it.each([true, false])(
     "serializes real Memory-lock competition (admission first=%s)",
     async (admissionFirst) => {
