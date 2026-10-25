@@ -1,7 +1,7 @@
 """功能概述：真实 Unix socket 验证 CI X11 屏障的分帧、身份准入与关闭行为。
-主要职责：BarrierTest 发送分片握手、合并 down/release 和跨连接请求；验证目标只转发一次，后继永不放行。
+主要职责：BarrierTest 验证分帧、FD 回收、单次目标与后继阻塞；SetupCleanupTest 注入 setup 失败，StopTest 验证停止身份。
 代码库关系：调用 gui_input_barrier 的实际代理；主 Linux GUI fixture 另验证固定 Cua 与真实 X server。
-输入输出与副作用：仅临时 socket 与内存 X11 数据；无需桌面、Podman 或固定 sleep，所有事件等待有界。
+输入输出与副作用：仅临时 socket/FD 与内存数据；有界全资源清理，仅已声明拒绝且 FD 已关闭的 ECONNRESET 是预期终态。
 """
 import asyncio
 import importlib.util
@@ -12,7 +12,7 @@ import struct
 import tempfile
 import unittest
 import warnings
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import gui_input_barrier as barrier_module
 from gui_input_barrier import InputBarrier, RawReader, send_packet, read_reply, matches_request, read_request, read_setup
 
@@ -42,6 +42,7 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         self.records, self.tasks, self.clients, self.server_writers, self.raw_clients = [], [], [], [], []
         self.fd_response = None
+        self.expected_resets = set()
         self.backend, self.barrier = None, None
         # 在获得第一个 socket 前登记，asyncSetUp 中途失败也执行同一完整清理。
         self.addAsyncCleanup(self.close)
@@ -90,6 +91,15 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             except Exception as error:
                 errors.append(error)
 
+        async def wait_writer(writer):
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                endpoint = writer.get_extra_info("socket")
+                # Linux 拒绝连接会以 ECONNRESET 完成 close；只接受已声明的拒绝且 FD 确实关闭。
+                if writer not in self.expected_resets or not writer.is_closing() or (endpoint is not None and endpoint.fileno() != -1):
+                    raise
+
         if self.barrier is not None:
             await attempt(self.barrier.close)
         for writer in self.clients + self.server_writers:
@@ -97,7 +107,7 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
                 writer.transport.abort()
             except Exception as error:
                 errors.append(error)
-            await attempt(writer.wait_closed)
+            await attempt(lambda: wait_writer(writer))
         for connection in self.raw_clients:
             try:
                 connection.close()
@@ -182,8 +192,8 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
             await send_packet(connection, event("<", 2, 38), [])
             self.assertEqual(await asyncio.wait_for(read_reply(reader, "<"), 2), reply("<", 1))
             descriptors = reader.take_fds()
-            self.assertEqual(len(descriptors), 1)
             try:
+                self.assertEqual(len(descriptors), 1)
                 self.assertFalse(os.get_inheritable(descriptors[0]))
                 self.assertEqual(os.read(descriptors[0], 64), b"actual shared-memory pixels")
             finally:
@@ -314,10 +324,23 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(writer.is_closing() for writer in self.clients + self.server_writers))
         self.assertTrue(all(task.done() for task in self.tasks))
 
+    async def test_only_declared_rejection_accepts_reset_of_a_closed_socket(self):
+        _, writer = await self.client("<")
+        reset = ConnectionResetError("injected peer reset")
+        with patch.object(writer, "wait_closed", AsyncMock(side_effect=reset)):
+            with self.assertRaises(ExceptionGroup) as result:
+                await self.close()
+            self.assertIn(reset, result.exception.exceptions)
+            self.expected_resets.add(writer)
+            await self.close()
+        self.assertEqual(writer.get_extra_info("socket").fileno(), -1)
+        self.assertFalse(self.backend.is_serving())
+
     async def test_peer_denial_and_invalid_frames_fail_closed(self):
         self.barrier.authorize(lambda _: (_ for _ in ()).throw(RuntimeError("peer-denied")))
         _, writer = await asyncio.open_unix_connection(str(self.barrier.path))
         self.clients.append(writer)
+        self.expected_resets.add(writer)
         writer.write(setup("<"))
         await writer.drain()
         error = await asyncio.wait_for(self.barrier.failure, 2)
@@ -340,6 +363,7 @@ class BarrierTest(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_handshake_fails_closed_without_forwarding_auth(self):
         _, writer = await asyncio.open_unix_connection(str(self.barrier.path))
         self.clients.append(writer)
+        self.expected_resets.add(writer)
         writer.write(b"?" + setup("<")[1:])
         await writer.drain()
         error = await asyncio.wait_for(self.barrier.failure, 2)

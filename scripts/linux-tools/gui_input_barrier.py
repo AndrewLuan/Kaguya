@@ -1,5 +1,5 @@
 """功能概述：仅供 drain 验收的 X11 请求屏障，转发真实 Cua 数据，不生成输入。
-主要职责：RawReader/send_packet 同步转发帧与 SCM_RIGHTS；InputBarrier 在目标请求后封闭所有后续请求。
+主要职责：RawReader/send_packet 同步转发帧与 SCM_RIGHTS；InputBarrier 同步登记 accepted socket，在目标请求后封闭后续请求。
 代码库关系：gui-interrupt-probe.py 注入目标匹配器，在屏障后验证真实 X11 状态并停止驱动。
 输入输出与副作用：独立 Unix socket 代理 :99；MIT-SHM 截图 FD 随对应回复转发，失败/关闭时回收本地 FD 与 socket。
 """
@@ -184,7 +184,12 @@ class InputBarrier:
     async def accept(self):
         try:
             while True:
-                connection, _ = await asyncio.get_running_loop().sock_accept(self.server)
+                try:
+                    connection, _ = self.server.accept()
+                except BlockingIOError:
+                    await socket_ready(self.server)
+                    continue
+                # accept 与登记之间没有 await：取消不能遗失已被内核接受但尚未交给任务的 socket。
                 connection.setblocking(False)
                 self.connections.add(connection)
                 self.connected(connection)
@@ -260,11 +265,11 @@ class InputBarrier:
                     self.connections.discard(connection)
 
     async def close(self):
-        if self.server is not None:
-            self.server.close()
         if self.accept_task is not None:
             self.accept_task.cancel()
             await asyncio.gather(self.accept_task, return_exceptions=True)
+        if self.server is not None:
+            self.server.close()
         tasks = list(self.tasks)
         for task in tasks:
             task.cancel()
