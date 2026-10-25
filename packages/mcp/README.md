@@ -95,3 +95,27 @@ CuaDriver 0.38.0 的真实兼容验证与合成 2025-06-18 协议测试分别记
 500ms专测的两次恢复观察和控制ACK另行计入32.5秒body，未改变实际请求deadline。普通3秒配置下，schema重连、通知、凭据和错误后重连也按同一账本计算。Server晚到fixture沿用其原有分阶段预算，并使用相同ACK控制。清理单独释放控制并等待原工作；主断言、控制 ACK 或原工作任一失败都保留诊断，不跳过后续清理。关闭后的清理仅在确认受控进程已退出时允许端点缺席。
 
 确定性回归在服务 hold 后留下半份 JSON，不发送文件通知，再用控制 ACK 释放真实 stdio/HTTP RPC；另模拟状态已应用但 ACK 丢失，验证原 discovery 仍收敛且主错误与 ACK 错误均保留。完整 MCP 文件及消费该服务的 Server/Linux 组合文件共同验收，不以重复跑绿作为修复证据。
+
+## Server fixture 的因果等待
+
+`apps/server/src/mcp-host.test.ts` 以HTTP响应的requestId找到原入站I，核对同目标的Identity terminal、candidate/claim及turn context T；Web身份允许 `unresolved/ephemeral`。Router的冒号scope与MCP的JSON tuple分开核验。第二阶段确认同T的Situation与同candidate的Attention observe；第三阶段确认以T为source的Light request、配对completion、获胜decision及Heavy intent。引用和Runtime context贯穿校验，不读取最新无关事件。stdio/HTTP正式链路、同scope GUI聊天及两种late用例共用同一局部helper。
+
+各持久里程碑沿用8秒/20毫秒条件等待。失败诊断保留backend、worker PID/ID、各阶段耗时、活动阶段、原input/turn/candidate/claim/request ID和Light/Heavy/GUI计数，不记录prompt或凭据。setup和close按真实Promise记录；没有新增会遗弃初始化Promise的race。测试mcp.json显式记录原有默认30秒I/O预算，保持原fixture请求语义；生产默认、全局helper和MCP专用deadline测试不变。
+
+正文预算保守累加：每轮setup=HTTP ready8秒+文件/数据库15秒+MCP握手30秒+目录发现30秒+Runtime bootstrap15秒=98秒；每段持久等待8秒、每次显式close20秒、每次管理端MCP读取30秒、每次控制ACK2秒，另留文件I/O5秒。
+
+| 用例                         | setup轮数 | 等待段 | close次数 | MCP读取 | ACK | 正文上限 |
+| ---------------------------- | --------: | -----: | --------: | ------: | --: | -------: |
+| stdio/HTTP正式链路           |         1 |      6 |         1 |       2 |   0 |    231秒 |
+| 同scope聊天/管理GUI          |         1 |      6 |         1 |       0 |   0 |    171秒 |
+| Runtime关闭失败/部分启动失败 |         1 |      0 |         1 |       0 |   0 |    123秒 |
+| MCP关闭失败重试              |         1 |      0 |         2 |       0 |   0 |    143秒 |
+| 候选Runtime重建失败          |         2 |      0 |         2 |       0 |   0 |    241秒 |
+| late before/after unknown    |         1 |  最多7 |         1 |       0 |   2 |    183秒 |
+| 确定性Light gate             |         1 |      8 |         1 |       0 |   0 |    187秒 |
+
+cleanup按fixture owner关联。hook独立上限130秒：gate release/observer settle16秒、fixture宏阶段100秒、Linux辅助5秒和余量9秒。fixture宏阶段为Server close20秒、最多两个真实MCP owner各8秒、失败时真实Runtime close20秒及原Server close settlement16秒、数据库10秒、HTTP child退出8秒、文件5秒，合计95秒并留5秒串行开销。真实MCP owner通过原公开close能力回收，再只读确认PID退出；不向裸PID发送终止信号。超时Server.close不被当作已经结算，fallback在DB关闭前执行。此前同fixture的gate/auxiliary错误也会阻止删除诊断目录；其他fixture不继承该错误。
+
+受控清理探针使Server.close等待gate，同时注入辅助清理错误；它确认stdio owner独立退出后释放gate，等待原close完成，验证两类错误均保留且真实资源已关闭。其正文预算为setup98秒+一次观察8秒+两次有界cleanup结果等待各130秒+两次原close settlement各16秒+I/O5秒=403秒。另一探针用两个未启动Server的独立DB/file fixture验证保留边界，预算为两轮文件/DB各15秒、DB close各10秒、file close各5秒、辅助5秒和I/O5秒=70秒。正常body和hook预算不互相借用。
+
+Light gate只阻塞合成模型响应。held时独立读取共享readiness predicate，确认同turn的requested=1而completion/decision/intent=0且Heavy/effect仍0；释放后才启动独立8秒完成等待。release与observer settlement在正文finally和清理兜底中分别处理。该检查不使用固定sleep。历史首轮失败与避开lint的对照分别保留；一次通过不作为唯一资源根因的证明。
