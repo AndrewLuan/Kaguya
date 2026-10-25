@@ -43,6 +43,33 @@ afterEach(async () => {
   if (rejected.length) throw new AggregateError(rejected, "MCP cleanup failed");
 }, 20000); // 控制ACK2s、stdio树回收5s及已知worker退出8s，另留文件清理余量。
 const wait = { timeout: 8000, interval: 20 };
+/** 保守累加串行阶段；并行于 RPC 的观察也单列，不以某阶段未用完预算补给其他阶段。 */
+function fixtureBudget({
+  connections,
+  calls = 0,
+  polls = 0,
+  controls = 0,
+  closes = 0,
+  timeoutMs = 16000,
+}: {
+  connections: number;
+  calls?: number;
+  polls?: number;
+  controls?: number;
+  closes?: number;
+  timeoutMs?: number;
+}) {
+  // ready8s + 每次连接独立的握手/分页发现 + RPC + 每次观察8s + ACK2s + close5s + 文件I/O5s。
+  return (
+    8000 +
+    connections * 2 * timeoutMs +
+    calls * timeoutMs +
+    polls * 8000 +
+    controls * 2000 +
+    closes * 5000 +
+    5000
+  );
+}
 async function fixture(
   mode: "stdio" | "http",
   protocol = "2025-11-25",
@@ -442,24 +469,29 @@ it.each(["headerMismatch", "inputRequired", "drop"])(
       ),
     ).toHaveLength(4);
   },
+  fixtureBudget({ connections: 2, calls: 1, timeoutMs: 3000 }),
 );
-it("keeps an old definition frozen after reconnect publishes a changed schema", async () => {
-  const f = await fixture("http");
-  const host = await f.open();
-  const frozen = host.snapshot();
-  await f.update({ schemaType: "string" });
-  await host.reconnect("test");
-  expect(frozen.nativeTools.registrations[0]!.version).not.toBe(
-    host.status()[0]!.tools[0]!.revision,
-  );
-  expect(await invoke(host)).toMatchObject({
-    status: "rejected",
-    evidence: "not-executed",
-  });
-  expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
-    0,
-  );
-});
+it(
+  "keeps an old definition frozen after reconnect publishes a changed schema",
+  async () => {
+    const f = await fixture("http");
+    const host = await f.open();
+    const frozen = host.snapshot();
+    await f.update({ schemaType: "string" });
+    await host.reconnect("test");
+    expect(frozen.nativeTools.registrations[0]!.version).not.toBe(
+      host.status()[0]!.tools[0]!.revision,
+    );
+    expect(await invoke(host)).toMatchObject({
+      status: "rejected",
+      evidence: "not-executed",
+    });
+    expect(
+      (await f.logs()).filter((row) => row.kind === "effect"),
+    ).toHaveLength(0);
+  },
+  fixtureBudget({ connections: 2, calls: 1, controls: 1, timeoutMs: 3000 }),
+);
 it.each(["stdio", "http"] as const)(
   "keeps cancellation and late %s results unconfirmed with exactly one effect",
   async (mode) => {
@@ -513,7 +545,7 @@ it.each(["stdio", "http"] as const)(
       (await f.logs()).filter((row) => row.kind === "effect"),
     ).toHaveLength(1);
   },
-  65000,
+  fixtureBudget({ connections: 2, calls: 1, polls: 3, controls: 1 }),
 );
 it("does not restart an exited stdio process while reading its unconfirmed outcome", async () => {
   const f = await fixture("stdio", "2025-06-18", { exit: true });
@@ -530,21 +562,27 @@ it("does not restart an exited stdio process while reading its unconfirmed outco
     f.acknowledgeUnconfirmedClose();
   }
 });
-it("redacts referenced credentials from content and denies other scopes/resources", async () => {
-  const f = await fixture("stdio", "2025-11-25", { echoSecret: true });
-  const host = await f.open();
-  expect(JSON.stringify(await invoke(host))).not.toContain("synthetic-secret");
-  await expect(
-    host.readResource("test", "scope", "fixture://denied/item"),
-  ).rejects.toThrow("mcp-resource-denied");
-  await expect(host.listResources("test", "other")).rejects.toThrow(
-    "mcp-scope-denied",
-  );
-  await f.update({ escapeResource: true });
-  await expect(
-    host.readResource("test", "scope", "fixture://allowed/item"),
-  ).rejects.toThrow("mcp-resource-result-denied");
-});
+it(
+  "redacts referenced credentials from content and denies other scopes/resources",
+  async () => {
+    const f = await fixture("stdio", "2025-11-25", { echoSecret: true });
+    const host = await f.open();
+    expect(JSON.stringify(await invoke(host))).not.toContain(
+      "synthetic-secret",
+    );
+    await expect(
+      host.readResource("test", "scope", "fixture://denied/item"),
+    ).rejects.toThrow("mcp-resource-denied");
+    await expect(host.listResources("test", "other")).rejects.toThrow(
+      "mcp-scope-denied",
+    );
+    await f.update({ escapeResource: true });
+    await expect(
+      host.readResource("test", "scope", "fixture://allowed/item"),
+    ).rejects.toThrow("mcp-resource-result-denied");
+  },
+  fixtureBudget({ connections: 1, calls: 2, controls: 1, timeoutMs: 3000 }),
+);
 it("reports capabilities explicitly and defaults missing config to disabled", async () => {
   const f = await fixture("http", "2026-07-28", { unsupported: true });
   expect(await loadMcpConfiguration(f.root)).toEqual({
@@ -558,100 +596,110 @@ it("reports capabilities explicitly and defaults missing config to disabled", as
   );
 });
 
-it("invalidates an arrived stdio directory notification without refreshing or executing", async () => {
-  const f = await fixture("stdio");
-  const host = await f.open();
-  const snapshot = host.snapshot();
-  const input = execution(host);
-  input.intent.target = (
-    await snapshot.nativeTools.registrations[0]!.bind({
-      arguments: input.intent.arguments,
-      scope: "scope",
-      runInformationId: "run",
-      stepInformationId: "step",
-    })
-  ).target;
-  await f.update({ notify: true });
-  await expect.poll(() => host.status()[0]!.tools.length, wait).toBe(0);
-  expect(
-    await snapshot.nativeTools.registrations[0]!.authorize({
-      intent: input.intent,
-      mode: "execute",
-    }),
-  ).toBe(false);
-  expect(await snapshot.actionProviders[0]!.execute(input)).toMatchObject({
-    status: "rejected",
-    evidence: "not-executed",
-  });
-  expect(
-    (await f.logs()).filter(
-      (row) => row.kind === "request" && row.method === "tools/list",
-    ),
-  ).toHaveLength(2);
-  expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
-    0,
-  );
-});
-it("does not admit an old provider during delayed reconnect discovery", async () => {
-  const f = await fixture("http");
-  const host = await f.open({ timeoutMs: 16000 });
-  const snapshot = host.snapshot();
-  const input = execution(host);
-  input.intent.target = (
-    await snapshot.nativeTools.registrations[0]!.bind({
-      arguments: input.intent.arguments,
-      scope: "scope",
-      runInformationId: "run",
-      stepInformationId: "step",
-    })
-  ).target;
-  await f.update({ holdList: true });
-  const reconnect = host.reconnect("test");
-  const observed = Promise.allSettled([reconnect]);
-  let held: { method: string; rpcId: string | number } | undefined;
-  await withSyntheticRelease(
-    async () => {
-      await expect
-        .poll(
-          async () =>
-            (await f.logs()).filter(
-              (row) => row.kind === "held" && row.method === "tools/list",
-            ).length,
-          wait,
-        )
-        .toBe(1);
-      held = (await f.logs()).find(
-        (row) => row.kind === "held" && row.method === "tools/list",
-      );
-      expect(await snapshot.actionProviders[0]!.execute(input)).toMatchObject({
-        status: "rejected",
-        evidence: "not-executed",
-      });
-    },
-    async () => {
-      const ack = await f.update({ release: true });
-      expect(ack.released).toContainEqual({
-        method: held?.method,
-        rpcId: held?.rpcId,
-      });
-    },
-    observed,
-  );
-  expect(
-    (await f.logs()).filter(
-      (row) => row.kind === "released" && row.method === "tools/list",
-    ),
-  ).toHaveLength(1);
-  expect(
-    (await f.logs()).filter(
-      (row) => row.kind === "request" && row.method === "tools/list",
-    ),
-  ).toHaveLength(4);
-  expect(host.status()[0]!.tools).toHaveLength(2);
-  expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
-    0,
-  );
-}, 80000); // ready8s + 初始/重连的握手、发现共4×16s + hold配置ACK2s=74s，余6s供文件I/O；hook清理另有20s。
+it(
+  "invalidates an arrived stdio directory notification without refreshing or executing",
+  async () => {
+    const f = await fixture("stdio");
+    const host = await f.open();
+    const snapshot = host.snapshot();
+    const input = execution(host);
+    input.intent.target = (
+      await snapshot.nativeTools.registrations[0]!.bind({
+        arguments: input.intent.arguments,
+        scope: "scope",
+        runInformationId: "run",
+        stepInformationId: "step",
+      })
+    ).target;
+    await f.update({ notify: true });
+    await expect.poll(() => host.status()[0]!.tools.length, wait).toBe(0);
+    expect(
+      await snapshot.nativeTools.registrations[0]!.authorize({
+        intent: input.intent,
+        mode: "execute",
+      }),
+    ).toBe(false);
+    expect(await snapshot.actionProviders[0]!.execute(input)).toMatchObject({
+      status: "rejected",
+      evidence: "not-executed",
+    });
+    expect(
+      (await f.logs()).filter(
+        (row) => row.kind === "request" && row.method === "tools/list",
+      ),
+    ).toHaveLength(2);
+    expect(
+      (await f.logs()).filter((row) => row.kind === "effect"),
+    ).toHaveLength(0);
+  },
+  fixtureBudget({ connections: 1, polls: 1, controls: 1, timeoutMs: 3000 }),
+);
+it(
+  "does not admit an old provider during delayed reconnect discovery",
+  async () => {
+    const f = await fixture("http");
+    const host = await f.open({ timeoutMs: 16000 });
+    const snapshot = host.snapshot();
+    const input = execution(host);
+    input.intent.target = (
+      await snapshot.nativeTools.registrations[0]!.bind({
+        arguments: input.intent.arguments,
+        scope: "scope",
+        runInformationId: "run",
+        stepInformationId: "step",
+      })
+    ).target;
+    await f.update({ holdList: true });
+    const reconnect = host.reconnect("test");
+    const observed = Promise.allSettled([reconnect]);
+    let held: { method: string; rpcId: string | number } | undefined;
+    await withSyntheticRelease(
+      async () => {
+        await expect
+          .poll(
+            async () =>
+              (await f.logs()).filter(
+                (row) => row.kind === "held" && row.method === "tools/list",
+              ).length,
+            wait,
+          )
+          .toBe(1);
+        held = (await f.logs()).find(
+          (row) => row.kind === "held" && row.method === "tools/list",
+        );
+        expect(await snapshot.actionProviders[0]!.execute(input)).toMatchObject(
+          {
+            status: "rejected",
+            evidence: "not-executed",
+          },
+        );
+      },
+      async () => {
+        const ack = await f.update({ release: true });
+        expect(ack.released).toContainEqual({
+          method: held?.method,
+          rpcId: held?.rpcId,
+        });
+      },
+      observed,
+    );
+    expect(
+      (await f.logs()).filter(
+        (row) => row.kind === "released" && row.method === "tools/list",
+      ),
+    ).toHaveLength(1);
+    expect(
+      (await f.logs()).filter(
+        (row) => row.kind === "request" && row.method === "tools/list",
+      ),
+    ).toHaveLength(4);
+    expect(host.status()[0]!.tools).toHaveLength(2);
+    expect(
+      (await f.logs()).filter((row) => row.kind === "effect"),
+    ).toHaveLength(0);
+  },
+  fixtureBudget({ connections: 2, polls: 1, controls: 2 }),
+);
 it.each(["2025-11-25", "2026-07-28"])(
   "aborts actual hanging HTTP I/O at the %s operation deadline",
   async (protocol) => {
@@ -681,6 +729,13 @@ it.each(["2025-11-25", "2026-07-28"])(
       (await f.logs()).filter((row) => row.kind === "effect"),
     ).toHaveLength(1);
   },
+  fixtureBudget({
+    connections: 1,
+    calls: 1,
+    polls: 2,
+    controls: 1,
+    timeoutMs: 500,
+  }),
 );
 
 it("reaps the ordinary stdio descendant process group on unload", async () => {
@@ -939,85 +994,93 @@ it("bounds and reaps a non-exiting Windows tree helper using a real child", asyn
   }
 });
 
-it("keeps late RPC identities local to each connection generation and ignores unknown IDs", async () => {
-  const f = await fixture("stdio", "2026-07-28", {
-    hold: true,
-    echoSecret: true,
-  });
-  const host = await f.open({ timeoutMs: 16000 });
-  for (let index = 0; index < 2; index++) {
-    const input = execution(host);
-    input.attemptId = `attempt-${index}`;
-    input.intentId = `intent-${index}`;
-    input.operationId = input.intent.operationId = `operation-${index}`;
-    const work = invoke(host, input);
+it(
+  "keeps late RPC identities local to each connection generation and ignores unknown IDs",
+  async () => {
+    const f = await fixture("stdio", "2026-07-28", {
+      hold: true,
+      echoSecret: true,
+    });
+    const host = await f.open({ timeoutMs: 16000 });
+    for (let index = 0; index < 2; index++) {
+      const input = execution(host);
+      input.attemptId = `attempt-${index}`;
+      input.intentId = `intent-${index}`;
+      input.operationId = input.intent.operationId = `operation-${index}`;
+      const work = invoke(host, input);
+      await expect
+        .poll(
+          async () =>
+            (await f.logs()).filter((row) => row.kind === "effect").length,
+          wait,
+        )
+        .toBe(index + 1);
+      await host.snapshot().actionProviders[0]!.cancel!(input);
+      expect(await work).toMatchObject({ status: "unknown" });
+      await f.update({ release: true, unknownReply: true });
+      await expect.poll(() => f.lateResults.length, wait).toBe(index + 1);
+      expect(f.lateResults[index]!.envelope.requests[0]).toMatchObject({
+        intentId: input.intentId,
+        attemptId: input.attemptId,
+        operationId: input.operationId,
+      });
+      expect(JSON.stringify(f.lateResults[index])).not.toContain(
+        "synthetic-secret",
+      );
+      if (index === 0) {
+        await f.update({ release: false, unknownReply: false });
+        await host.reconnect("test");
+      }
+    }
+    const [first, second] = f.lateResults.map((item) => item.envelope);
+    expect(first!.requests[0]!.rpcId).toBe(second!.requests[0]!.rpcId);
+    expect(first!.source.transportGeneration).not.toBe(
+      second!.source.transportGeneration,
+    );
+    await host.close();
+    expect(f.lateResults).toHaveLength(2);
+  },
+  fixtureBudget({ connections: 2, calls: 2, polls: 4, controls: 3, closes: 1 }),
+);
+it(
+  "retains a failed late-result observation with the same ID until close can persist it",
+  async () => {
+    let failing = true;
+    const attempts: string[] = [];
+    const f = await fixture(
+      "stdio",
+      "2026-07-28",
+      { hold: true },
+      async (_envelope, id) => {
+        attempts.push(id);
+        if (failing) throw new Error("synthetic evidence persistence failure");
+      },
+    );
+    const host = await f.open({ timeoutMs: 16000 });
+    const input = execution(host),
+      work = invoke(host, input);
     await expect
       .poll(
         async () =>
           (await f.logs()).filter((row) => row.kind === "effect").length,
         wait,
       )
-      .toBe(index + 1);
+      .toBe(1);
     await host.snapshot().actionProviders[0]!.cancel!(input);
     expect(await work).toMatchObject({ status: "unknown" });
-    await f.update({ release: true, unknownReply: true });
-    await expect.poll(() => f.lateResults.length, wait).toBe(index + 1);
-    expect(f.lateResults[index]!.envelope.requests[0]).toMatchObject({
-      intentId: input.intentId,
-      attemptId: input.attemptId,
-      operationId: input.operationId,
-    });
-    expect(JSON.stringify(f.lateResults[index])).not.toContain(
-      "synthetic-secret",
-    );
-    if (index === 0) {
-      await f.update({ release: false, unknownReply: false });
-      await host.reconnect("test");
-    }
-  }
-  const [first, second] = f.lateResults.map((item) => item.envelope);
-  expect(first!.requests[0]!.rpcId).toBe(second!.requests[0]!.rpcId);
-  expect(first!.source.transportGeneration).not.toBe(
-    second!.source.transportGeneration,
-  );
-  await host.close();
-  expect(f.lateResults).toHaveLength(2);
-}, 65000);
-it("retains a failed late-result observation with the same ID until close can persist it", async () => {
-  let failing = true;
-  const attempts: string[] = [];
-  const f = await fixture(
-    "stdio",
-    "2026-07-28",
-    { hold: true },
-    async (_envelope, id) => {
-      attempts.push(id);
-      if (failing) throw new Error("synthetic evidence persistence failure");
-    },
-  );
-  const host = await f.open({ timeoutMs: 16000 });
-  const input = execution(host),
-    work = invoke(host, input);
-  await expect
-    .poll(
-      async () =>
-        (await f.logs()).filter((row) => row.kind === "effect").length,
-      wait,
-    )
-    .toBe(1);
-  await host.snapshot().actionProviders[0]!.cancel!(input);
-  expect(await work).toMatchObject({ status: "unknown" });
-  await f.update({ release: true });
-  await expect.poll(() => attempts.length, wait).toBe(1);
-  await expect(host.close()).rejects.toThrow("mcp-cleanup-failed");
-  failing = false;
-  await host.close();
-  expect(attempts).toHaveLength(3);
-  expect(new Set(attempts).size).toBe(1);
-  expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
-    1,
-  );
-}, 65000);
+    await f.update({ release: true });
+    await expect.poll(() => attempts.length, wait).toBe(1);
+    await expect(host.close()).rejects.toThrow("mcp-cleanup-failed");
+    failing = false;
+    await host.close();
+    expect(attempts).toHaveLength(3);
+    expect(new Set(attempts).size).toBe(1);
+    expect(
+      (await f.logs()).filter((row) => row.kind === "effect"),
+    ).toHaveLength(1);
+  },
+  fixtureBudget({ connections: 1, calls: 1, polls: 2, controls: 1, closes: 2 }),
+);
 
 it.each(["stdio", "http"] as const)(
   "releases a held %s RPC by ACK even when the state file publication is incomplete and no watch event is used",
@@ -1062,44 +1125,48 @@ it.each(["stdio", "http"] as const)(
       observed,
     );
   },
-  65000,
+  fixtureBudget({ connections: 1, calls: 1, polls: 1, controls: 2 }),
 );
-it("settles actual held discovery and preserves both errors when an inspection fails and its applied release ACK is lost", async () => {
-  const f = await fixture("http");
-  const host = await f.open({ timeoutMs: 16000 });
-  await f.update({ holdList: true });
-  const reconnect = host.reconnect("test");
-  const observed = Promise.allSettled([reconnect]);
-  let error: AggregateError | undefined;
-  try {
-    await withSyntheticRelease(
-      async () => {
-        await expect
-          .poll(
-            async () =>
-              (await f.logs()).filter(
-                (row) => row.kind === "held" && row.method === "tools/list",
-              ).length,
-            wait,
-          )
-          .toBe(1);
-        throw new Error("synthetic inspection failure");
-      },
-      () => f.update({ release: true, dropControlAck: true }),
-      observed,
-    );
-  } catch (caught) {
-    error = caught as AggregateError;
-  }
-  expect(error).toBeInstanceOf(AggregateError);
-  expect(error!.errors.map((item) => item.message)).toEqual([
-    "synthetic inspection failure",
-    "synthetic-control-closed-before-ack",
-  ]);
-  expect(await observed).toEqual([{ status: "fulfilled", value: undefined }]);
-  expect(host.status()[0]!.tools).toHaveLength(2);
-  expect((await f.logs()).filter((row) => row.kind === "effect")).toHaveLength(
-    0,
-  );
-  await f.update({ release: true, dropControlAck: false });
-}, 80000);
+it(
+  "settles actual held discovery and preserves both errors when an inspection fails and its applied release ACK is lost",
+  async () => {
+    const f = await fixture("http");
+    const host = await f.open({ timeoutMs: 16000 });
+    await f.update({ holdList: true });
+    const reconnect = host.reconnect("test");
+    const observed = Promise.allSettled([reconnect]);
+    let error: AggregateError | undefined;
+    try {
+      await withSyntheticRelease(
+        async () => {
+          await expect
+            .poll(
+              async () =>
+                (await f.logs()).filter(
+                  (row) => row.kind === "held" && row.method === "tools/list",
+                ).length,
+              wait,
+            )
+            .toBe(1);
+          throw new Error("synthetic inspection failure");
+        },
+        () => f.update({ release: true, dropControlAck: true }),
+        observed,
+      );
+    } catch (caught) {
+      error = caught as AggregateError;
+    }
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error!.errors.map((item) => item.message)).toEqual([
+      "synthetic inspection failure",
+      "synthetic-control-closed-before-ack",
+    ]);
+    expect(await observed).toEqual([{ status: "fulfilled", value: undefined }]);
+    expect(host.status()[0]!.tools).toHaveLength(2);
+    expect(
+      (await f.logs()).filter((row) => row.kind === "effect"),
+    ).toHaveLength(0);
+    await f.update({ release: true, dropControlAck: false });
+  },
+  fixtureBudget({ connections: 2, polls: 1, controls: 3 }),
+);

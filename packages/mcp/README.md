@@ -81,6 +81,17 @@ CuaDriver 0.38.0 的真实兼容验证与合成 2025-06-18 协议测试分别记
 
 `@kaguya/mcp/testing` 的合成服务通过独立、随机令牌保护的回环控制 socket 应用完整状态，宿主用 `applySyntheticControl` 等待配对 ACK。`state.json` 只用于新进程启动，不监听文件事件；已运行服务不会在写入中间状态时读取它。控制端点只写测试 journal，不进入 MCP 目录、注册项或生产配置。服务按原 method/RPC ID 记录 `held`、`released` 和 `control-applied`。控制 ACK 明确表示状态已应用与哪些 barrier 已释放，不能代替 MCP 请求自身的完成。
 
-结构性 hold 用例采用 fixture-only 16 秒连接/请求预算，8 秒观察与 2 秒控制 ACK 留出 6 秒响应余量；500 ms 实际 HTTP deadline 专测保持原预算。延迟 reconnect 用例的 body 上限为80秒：HTTP ready 8秒、初始与重连的握手/发现共4×16秒、hold配置ACK 2秒合计74秒，另留6秒给文件I/O；afterEach清理另有20秒上限。清理单独释放控制并等待原工作；主断言、控制 ACK 或原工作任一失败都保留诊断，不跳过后续清理。共享 Server 晚到用例同样使用 ACK，关闭后的清理仅在确认受控进程已退出时允许端点缺席。
+结构性 hold 用例采用 fixture-only 16 秒连接/请求预算，8 秒观察与 2 秒控制 ACK 留出 6 秒响应余量；500 ms 实际 HTTP deadline 专测保持原预算。`fixtureBudget` 保守累加 body 上限：ready 8 秒 + 每个 open/reconnect 的握手、分页发现各一份 timeout + 每个 RPC 一份 timeout + 每次观察8秒 + 每次控制ACK2秒 + 每次显式close5秒 + 文件I/O5秒。并行于RPC的观察仍单列，不依赖阶段间借用余量。afterEach清理另有20秒上限。
+
+| 控制用例                        | connections | calls | polls | controls | closes | body上限 |
+| ------------------------------- | ----------: | ----: | ----: | -------: | -----: | -------: |
+| 延迟 reconnect 旧 provider 拒绝 |           2 |     0 |     1 |        2 |      0 |     89秒 |
+| cancel 与迟到，含重连           |           2 |     1 |     3 |        1 |      0 |    119秒 |
+| 两代 late RPC                   |           2 |     2 |     4 |        3 |      1 |    152秒 |
+| late 保存失败后 close 重试      |           1 |     1 |     2 |        1 |      2 |     89秒 |
+| 半写状态且无 watch 通知         |           1 |     1 |     1 |        2 |      0 |     73秒 |
+| release 已应用但 ACK 丢失       |           2 |     0 |     1 |        3 |      0 |     91秒 |
+
+500ms专测的两次恢复观察和控制ACK另行计入32.5秒body，未改变实际请求deadline。普通3秒配置下，schema重连、通知、凭据和错误后重连也按同一账本计算。Server晚到fixture沿用其原有分阶段预算，并使用相同ACK控制。清理单独释放控制并等待原工作；主断言、控制 ACK 或原工作任一失败都保留诊断，不跳过后续清理。关闭后的清理仅在确认受控进程已退出时允许端点缺席。
 
 确定性回归在服务 hold 后留下半份 JSON，不发送文件通知，再用控制 ACK 释放真实 stdio/HTTP RPC；另模拟状态已应用但 ACK 丢失，验证原 discovery 仍收敛且主错误与 ACK 错误均保留。完整 MCP 文件及消费该服务的 Server/Linux 组合文件共同验收，不以重复跑绿作为修复证据。
