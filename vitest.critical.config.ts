@@ -1,4 +1,5 @@
 /**
+ * GUI 门禁包括原始图片 SDK 请求体、固定模型恢复以及人工控制丢回执与清理。
  * 功能概述：将 PR 必须执行的集成测试列为关键门禁，复用根 Vitest 配置和分片策略。
  * 主要职责：criticalTests 固定完整文件清单；校验文件存在后合并配置，禁止按用例名称缩小范围。
  * 代码库关系：CI 的关键分片调用本文件；包含观察仓储、Runtime/环境执行接线、Memory 重挂载、Demo DAG 及 Lifecycle/Router/Heartbeat 回归。
@@ -23,6 +24,10 @@ const criticalTests = [
   "apps/server/src/mcp-host.test.ts",
   "packages/runtime/src/action.test.ts",
   "packages/runtime/src/native-tool-loop.test.ts",
+  "packages/runtime/src/native-tool-results.test.ts",
+  "apps/server/src/native-gui-wire.test.ts",
+  "packages/runtime/src/environment-human.test.ts",
+  "apps/server/src/linux-environment-routes.test.ts",
   "packages/llm/src/client.test.ts",
   "packages/runtime/src/environment.test.ts",
   "packages/runtime/src/linux-tools.test.ts",

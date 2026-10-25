@@ -1,4 +1,5 @@
 /**
+ * GUI 模型仅按 linux-tools.json 显式路由创建，首轮前选定；普通 Heavy 保持原 tier。模型配置摘要不包含凭据。
  * MCP 宿主由本文件按 Runtime 生命周期打开和回收；首次装配与配置重建共用冻结工具/provider 接口。
  * Memory 图管理通过动态 database.memoryGraph 门面接入 HTTP，数据库重挂载后使用当前实例。
  * 模板管理与配置应用共享写锁，只写本地覆盖，用户需重启加载新模板。
@@ -50,6 +51,7 @@ import {
   openServerMcp,
   closeServerMcp,
   withServerMcp,
+  serverGuiModelBindings,
   registerMcpRoutes,
   withMcpKindRegistry,
 } from "./mcp-host.js";
@@ -82,7 +84,7 @@ import {
 import { pathToFileURL } from "node:url";
 
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { KaguyaLlmGenerationOptions } from "@kaguya/llm/client";
+import { boundedModelFetch, type KaguyaLlmGenerationOptions } from "@kaguya/llm/client";
 import {
   ConfigError,
   ConfigIncompleteError,
@@ -506,6 +508,7 @@ export async function startKaguyaServer(
           ...withServerMcp(
             mcp,
             createMessageComposition(resolveModelSelection, {
+              nativeTaskModels: createGuiModelRoutes(mcp, selectedProfile),
               ...(config.nativeMemoryTools ? { nativeMemoryTools: true } : {}),
               pluginModelTasks: pluginSnapshot.modelTasks,
               ...createMemoryCompositionOptions(
@@ -790,6 +793,7 @@ export async function startKaguyaServer(
               createMessageComposition(
                 createRuntimeModelSelectionResolver(snapshot.profile),
                 {
+                  nativeTaskModels: createGuiModelRoutes(nextMcp, snapshot.profile),
                   ...createMemoryCompositionOptions(
                     memoryConfigFromModules(snapshot.moduleConfigs),
                   ),
@@ -1055,9 +1059,22 @@ export function formatAccessUrl(
   return `Kaguya access URL: http://${host}:${config.port}/#gatewayToken=${encodeURIComponent(config.gatewayToken)}`;
 }
 
+/** linux-tools.json 的显式 GUI 目标只为对应任务创建路由，不更改普通 Heavy tier。 */
+function createGuiModelRoutes(host: McpHost, profile: UserConfigProfile) {
+  return serverGuiModelBindings(host).map(binding => {
+    const gui = structuredClone(profile);
+    if (!gui.ai.modelTiers) throw new Error("GUI model tiers unavailable");
+    gui.ai.modelTiers.heavy = {...gui.ai.modelTiers.heavy, providerId: binding.providerId, modelId: binding.modelId};
+    const resolve = createRuntimeModelSelectionResolver(gui);
+    return {definitionId: "agent.heavy", taskId: "agent.heavy.respond", routeId: binding.routeId,
+      tier: "heavy" as const, resolve: () => resolve({modelTier: "heavy"})};
+  });
+}
+
 export function createRuntimeModelSelectionResolver(
   profile: UserConfigProfile,
 ): RuntimeModelSelectionResolver {
+  profile = structuredClone(profile);
   assertProfileReady(profile);
   const selectedProfileId = profile.id;
   const providerCache = new Map<
@@ -1097,6 +1114,7 @@ export function createRuntimeModelSelectionResolver(
         name: `kaguya-${selectedProfileId}-${provider.id}`,
         apiKey: provider.apiKey,
         baseURL: provider.baseUrl,
+        fetch: boundedModelFetch(),
         ...openAICompatibleProviderSettings(provider.settings),
       });
       providerCache.set(cacheKey, client);
@@ -1106,6 +1124,11 @@ export function createRuntimeModelSelectionResolver(
       modelId: target.modelId,
       model: client.chatModel(target.modelId),
       generationOptions: generationOptionsForTier(target, provider.settings),
+      ...(!new URL(provider.baseUrl).search && !new URL(provider.baseUrl).username && !new URL(provider.baseUrl).password ? {configuration: {
+        adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions",
+        endpoint: new URL(provider.baseUrl).origin + new URL(provider.baseUrl).pathname,
+        revision: "1",
+      }} : {}),
     };
   };
 

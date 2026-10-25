@@ -1,4 +1,5 @@
 /**
+ * 模型绑定缺失与变化有独立停止原因；旧 run 保持终态而不重新派发。
  * 功能概述：定义原生工具循环的持久事实和有界预算，LLM 与外部行动各自保存真实结果。
  * run 固定宿主配置；step 保存后继冻结知识；result 保存 call/receipt 配对；terminal 表示停止推进。
  * Runtime 写入，database 从 step 与真实模型请求重验补充依据；声明不执行工具或授予权限。
@@ -102,6 +103,8 @@ export const nativeToolTerminalInformationKind = defineInformationKind({
         "unknown",
         "partial",
         "unavailable",
+        "native-model-binding-missing",
+        "native-model-binding-changed",
         "protocol",
       ]),
       modelResult: z.record(z.string(), z.json()).nullable(),

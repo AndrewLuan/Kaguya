@@ -1,4 +1,6 @@
 /**
+ * guiModel 显式选定 scope 的模型路由；原生 GUI bind 要求此配置，人工控制仍独立使用已配置桌面。
+ * readArtifact 只允许绑定环境与 scope，并向原生循环提供归档 blob，无截图副作用。
  * 功能概述：把显式宿主配置的 Linux shell/Chromium/GUI 工具接入 W4 原生目录和 W3/W6 执行边界。
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
  * snapshot 提供 shell.exec 的有界 schema、scope/target 授权与 broker provider，不另建工具循环。
@@ -74,6 +76,7 @@ export const linuxToolsConfigurationSchema = z
             workflowId: text,
             browser: z.boolean().optional(),
             gui: z.boolean().optional(),
+            guiModel: z.object({routeId: text, providerId: text, modelId: text}).strict().optional(),
           })
           .strict(),
       )
@@ -82,6 +85,8 @@ export const linuxToolsConfigurationSchema = z
   .strict()
   .refine(
     (v) =>
+      v.bindings.every(b => !b.guiModel || b.gui === true) &&
+      new Set(v.bindings.flatMap(b => b.guiModel ? [b.guiModel.routeId] : [])).size === v.bindings.filter(b => b.guiModel).length &&
       new Set(v.bindings.map((b) => b.scope)).size === v.bindings.length &&
       new Set(v.bindings.map((b) => b.environmentId)).size ===
         v.bindings.length,
@@ -348,10 +353,17 @@ export class LinuxToolsHost {
       (tool) =>
         tool.id === "shell.exec" ||
         this.configuration.bindings.some((b) =>
-          tool.id.startsWith("gui.") ? b.gui === true : b.browser === true,
+          tool.id.startsWith("gui.") ? b.gui === true && Boolean(b.guiModel) : b.browser === true,
         ),
     );
     const tools: NativeToolLoopOptions = {
+      modelRoutes: this.configuration.bindings.flatMap(b => b.guiModel ? [{scope: b.scope,
+        definitionId: "agent.heavy", taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy" as const, routeId: b.guiModel.routeId}}] : []),
+      readArtifact: ({id, scope, environmentId}) => {
+        if (!this.configuration.bindings.some(b => b.gui && b.scope === scope && b.environmentId === environmentId))
+          throw new Error("native-image-scope-denied");
+        return this.client.readArtifact(id, scope, environmentId);
+      },
       registrations: this.configuration.bindings.length
         ? declarations.map((tool) => ({
             id: tool.id,
@@ -371,7 +383,7 @@ export class LinuxToolsHost {
                   (b) =>
                     b.scope === scope &&
                     (tool.id.startsWith("gui.")
-                      ? b.gui === true
+                      ? b.gui === true && Boolean(b.guiModel)
                       : b.browser === true),
                 )
               )

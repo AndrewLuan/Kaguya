@@ -1,4 +1,5 @@
 /**
+ * 原生 GUI 目录要求显式 guiModel 路由；人工控制配置不会自动替换普通模型。
  * 功能概述：跨平台验证 Linux 原生注册的 scope/target、串行 lease 绑定及关闭资源归属。
  * 使用受控 transport 核对实际 RPC；不将其视为 Podman 或 shell 运行证明。
  * 代码库关系：消费生产 LinuxToolsHost/Client，受影响 schema 与 hooks 均在此覆盖。
@@ -29,6 +30,7 @@ describe("Linux native shell registry", () => {
             environmentId: "desktop",
             workflowId: "gui-flow",
             gui: true,
+            guiModel: {routeId: "gui.approved", providerId: "vision", modelId: "gui"},
           },
         ],
       },
@@ -37,6 +39,8 @@ describe("Linux native shell registry", () => {
       }),
     );
     try {
+      expect(host.snapshot().nativeTools.modelRoutes).toEqual([{scope: "gui-scope", definitionId: "agent.heavy",
+        taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy", routeId: "gui.approved"}}]);
       const registrations = host.snapshot().nativeTools.registrations;
       expect(registrations.map((tool) => tool.id)).toEqual([
         "shell.exec",

@@ -1,4 +1,5 @@
 /**
+ * serverGuiModelBindings 仅返回 linux-tools.json 的非秘密目标声明，供 Server 构建明确批准的 GUI 模型路由。
  * 功能概述：在 Server 生命周期中打开 MCP，合并已有 Memory 工具路由并提供管理端按需读取入口。
  * openServerMcp 缺省关闭；mcpRuntimeOptions 复用 W4 注册/W3 provider，不创建第二个执行循环。
  * registerMcpRoutes 每个请求验证 Gateway management token；prompt 展开仅由明确用户 POST 创建选择。
@@ -156,6 +157,10 @@ export function mcpRuntimeOptions(
       tasks: [...combined.values()],
     },
   };
+}
+/** 宿主批准的 GUI 模型声明，凭据仍由 selected Profile 的 resolver 提供。 */
+export function serverGuiModelBindings(host: McpHost) {
+  return linuxHosts.get(host)?.configuration.bindings.flatMap(b => b.guiModel ? [b.guiModel] : []) ?? [];
 }
 export function withServerMcp<
   T extends {

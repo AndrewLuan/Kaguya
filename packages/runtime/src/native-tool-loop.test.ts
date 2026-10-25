@@ -1,4 +1,5 @@
 /**
+ * 用 receipt 提交后、下一步 freeze 前的故障边界核验原点/模型冻结；重启换配置后不新建 run 或重复效果。
  * 功能概述：用真实 Core、ModelTaskClient、W3 及两种数据库验证原生工具循环持久窗口。
  * fixture 固定 observation 与 Memory，上游模型为合成单步生成器；外部效果由受控 provider 计数。
  * 同一用例检查实际 requested、dispatch、call→intent→receipt、下一步 messages 与停止状态。
@@ -91,7 +92,7 @@ const call = (id: string, tool = "test.tool", input: unknown = {}) =>
   }) as NativeToolCall;
 async function fixture(
   postgres: boolean,
-  options: { budget?: any; memory?: boolean; noMemory?: boolean } = {},
+  options: { budget?: any; memory?: boolean; noMemory?: boolean; guiRoute?: "matching" | "other" } = {},
 ) {
   const pg = postgres
     ? await createPostgresTestingDatabaseScope(url!)
@@ -281,6 +282,9 @@ async function fixture(
     authorize: async () => true,
   };
   let executor: ActionExecutor;
+  let modelIdentity = { providerId: "test", modelId: "native", configurationDigest: "a".repeat(64) };
+  let nativeEnabled = true;
+  let routeAvailable = true;
   const createLoop = () => {
     const memoryTools = options.memory
       ? createNativeMemoryTools(db)
@@ -297,7 +301,7 @@ async function fixture(
       core,
       renderStructuredOutputPrompt:
         createStructuredOutputPromptRenderer("{{json_schema}}"),
-      resolveModel: () => ({ providerId: "test", modelId: "native" }),
+      resolveModel: () => { if (!routeAvailable) throw new Error("route deleted"); return modelIdentity; },
       admitNativeDispatch: (id, step) =>
         db.nativeTools.admitModel(
           step.runInformationId,
@@ -349,9 +353,10 @@ async function fixture(
       core,
       actions: executor,
       model,
+      resolveModel: () => { if (!routeAvailable) throw new Error("route deleted"); return modelIdentity; },
       options: {
         registrations: [tool, ...(memoryTools?.registrations ?? [])],
-        tasks: [
+        tasks: nativeEnabled ? [
           {
             taskId: request.task.taskId,
             definitionId: "agent.heavy",
@@ -360,8 +365,10 @@ async function fixture(
               ...(memoryTools?.registrations.map((t) => t.id) ?? []),
             ],
           },
-        ],
+        ] : [],
         budget: options.budget,
+        modelRoutes: options.guiRoute ? [{scope: options.guiRoute === "matching" ? scope : "other",
+          definitionId: "agent.heavy", taskId: "agent.heavy.respond", selectionPolicy: {tier: "heavy", routeId: "gui.approved"}}] : [],
       },
     });
   };
@@ -377,6 +384,9 @@ async function fixture(
       return loop;
     },
     request,
+    modelIdentity: (value: Partial<typeof modelIdentity>) => { modelIdentity = {...modelIdentity, ...value}; },
+    disableNative: () => { nativeEnabled = false; },
+    deleteRoute: () => { routeAvailable = false; },
     scope,
     original,
     actionRun,
@@ -505,6 +515,85 @@ async function fixture(
 }
 for (const postgres of backends)
   describe(postgres ? "native PostgreSQL" : "native PGlite", () => {
+    it.each(["matching", "other"] as const)("selects the explicit GUI route before the first model request only in its scope: %s", async guiRoute => {
+      const f = await fixture(postgres, {guiRoute});
+      await f.loop.execute(f.request);
+      const rows = (await f.db.sql.query<any>("SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' ORDER BY payload->'nativeStep'->>'stepIndex'")).rows;
+      expect(rows).toHaveLength(2);
+      for (const {payload} of rows) {
+        expect(payload.selectionPolicy).toEqual(guiRoute === "matching" ? {tier: "heavy", routeId: "gui.approved"} : {tier: "heavy"});
+        expect(payload.nativeModelBinding.selectionPolicy).toEqual(payload.selectionPolicy);
+      }
+    });
+    it("refuses a legacy source candidate without requested-origin proof before creating any replacement", async () => {
+      const f = await fixture(postgres);
+      const boundary = vi.spyOn(f.db.nativeTools, "freeze").mockRejectedValueOnce(new Error("before first request"));
+      await expect(f.loop.execute(f.request)).rejects.toThrow("before first request");
+      boundary.mockRestore();
+      await f.db.sql.query("UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'");
+      await f.restart();
+      await expect(f.loop.execute({...f.request, selectionPolicy: {tier: "heavy", routeId: "another"}})).rejects.toThrow("native-origin-proof-missing");
+      expect(f.requests).toHaveLength(0);
+      expect(f.effects()).toBe(0);
+      expect((await f.db.sql.query("SELECT * FROM information_native_tool_runs")).rows).toHaveLength(1);
+    });
+    it.each([false, true])("derives legacy origin only from actual requested proof and preserves stopped facts: completed=%s", async completed => {
+      const f = await fixture(postgres);
+      let boundary: {mockRestore(): void} | undefined;
+      if (!completed) {
+        const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
+        boundary = vi.spyOn(f.db.nativeTools, "freeze").mockImplementation(async (...args) => {
+          if (args[0].stepIndex === 1) throw new Error("legacy boundary");
+          return freeze(...args);
+        });
+        await expect(f.loop.execute(f.request)).rejects.toThrow("legacy boundary");
+      } else await f.loop.execute(f.request);
+      boundary?.mockRestore();
+      const before = (await f.db.sql.query<any>("SELECT * FROM information_native_tool_runs")).rows[0];
+      // 模拟迁移前行；不可变 information_atoms 保持原样，不从当下配置补写 binding。
+      await f.db.sql.query("UPDATE information_native_tool_runs SET origin_key=NULL,spec=spec-'origin'-'modelBinding'");
+      await f.restart();
+      const result = await f.loop.execute({...f.request, selectionPolicy: {tier: "heavy", routeId: "changed"}});
+      expect(result.status).toBe(completed ? "completed" : "failed");
+      const after = (await f.db.sql.query<any>("SELECT * FROM information_native_tool_runs")).rows;
+      expect(after).toHaveLength(1);
+      expect(after[0].run_key).toBe(before.run_key);
+      expect(after[0].origin_key).toBeTruthy();
+      expect(after[0].spec.modelBinding).toBeUndefined();
+      if (completed) expect(after[0].stopped_id).toBe(before.stopped_id);
+      else expect((await f.core.get(after[0].stopped_id))!.payload.reason).toBe("native-model-binding-missing");
+      expect(f.requests).toHaveLength(completed ? 2 : 1);
+      expect(f.effects()).toBe(1);
+    });
+    it.each(["model", "configuration", "route", "native-off", "policy", "unchanged"])(
+      "freezes origin and model across restart after the committed receipt: %s", async (change) => {
+        const f = await fixture(postgres);
+        const freeze = f.db.nativeTools.freeze.bind(f.db.nativeTools);
+        const boundary = vi.spyOn(f.db.nativeTools, "freeze").mockImplementation(async (...args) => {
+          if (args[0].stepIndex === 1) throw new Error("synthetic restart after receipt");
+          return freeze(...args);
+        });
+        await expect(f.loop.execute(f.request)).rejects.toThrow("synthetic restart after receipt");
+        expect(f.effects()).toBe(1);
+        expect(f.requests).toHaveLength(1);
+        expect((await f.db.sql.query("SELECT result_id FROM information_native_tool_calls")).rows[0]!.result_id).toBeTruthy();
+        boundary.mockRestore();
+        if (change === "model") f.modelIdentity({modelId: "different"});
+        if (change === "configuration") f.modelIdentity({configurationDigest: "b".repeat(64)});
+        if (change === "route") f.deleteRoute();
+        if (change === "native-off") f.disableNative();
+        await f.restart();
+        const request = change === "policy" ? {...f.request, selectionPolicy: {tier: "light" as const}} : f.request;
+        const result = await f.loop.execute(request);
+        expect(result.status).toBe(change === "unchanged" ? "completed" : "failed");
+        await f.restart();
+        expect(await f.loop.execute(request)).toEqual(result);
+        expect(f.requests).toHaveLength(change === "unchanged" ? 2 : 1);
+        expect(f.effects()).toBe(1);
+        expect((await f.db.sql.query("SELECT * FROM information_native_tool_runs")).rows).toHaveLength(1);
+        expect((await f.db.sql.query("SELECT * FROM information_native_tool_steps")).rows).toHaveLength(change === "unchanged" ? 2 : 1);
+      },
+    );
     it("runs a real model-task → W3 receipt → paired next step and replays without effects", async () => {
       const f = await fixture(postgres);
       const result = await f.loop.execute(f.request);

@@ -1,4 +1,5 @@
 /**
+ * 验证显式 GUI 模型路由及同 provider/model id 的并发对象隔离，使用合成模型，无外部请求。
  * Web 入站 DAG 同样产生当前会话背景投影，保持 Composition 与 Runtime 的事实集合断言同步。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
  * 默认 DAG 验证 eligible turn 先调用 Light，再由 Heavy 生成消息。
@@ -1024,12 +1025,14 @@ describe("unified server composition", () => {
       modelId: "default-light",
       model: { modelId: "default-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
     expect(resolver({ modelTier: "heavy" })).toEqual({
       providerId: "provider-1",
       modelId: "default-heavy",
       model: { modelId: "default-heavy" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
     expect(chatModel).toHaveBeenCalledWith("default-light");
     expect(chatModel).toHaveBeenCalledWith("default-heavy");
@@ -1071,12 +1074,14 @@ describe("unified server composition", () => {
       modelId: "selected-light",
       model: { modelId: "selected-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
     expect(resolver({ modelTier: "heavy" })).toEqual({
       providerId: "provider-1",
       modelId: "selected-heavy",
       model: { modelId: "selected-heavy" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
     expect(chatModel).toHaveBeenCalledWith("selected-light");
     expect(chatModel).toHaveBeenCalledWith("selected-heavy");
@@ -1209,6 +1214,7 @@ describe("unified server composition", () => {
     expect(resolver({ modelTier: "heavy" })).toMatchObject({
       providerId: "provider-2",
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
   });
 
@@ -1260,6 +1266,7 @@ describe("unified server composition", () => {
       modelId: "default-light",
       model: { modelId: "default-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {adapter: "@ai-sdk/openai-compatible", protocol: "chat-completions", endpoint: "https://llm.example/v1", revision: "1"},
     });
     expect(chatModel).toHaveBeenCalledWith("default-light");
   });
@@ -1314,6 +1321,26 @@ describe("unified server composition", () => {
         output: { text: "from-provider-two" },
       },
     ]);
+  });
+
+  it("keeps concurrent routes with identical provider/model ids bound to their own model objects and configuration", async () => {
+    const make = (text: string) => ({providerId: "same", modelId: "same", model: createRepeatingDeterministicModel({text}),
+      configuration: {adapter: "synthetic", protocol: "local", endpoint: "local", revision: text}});
+    const a = make("a"), b = make("b");
+    const composition = createMessageComposition(() => a, {
+      moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+      nativeTaskModels: [a,b].map((model, i) => ({definitionId: "agent.heavy", taskId: "task", routeId: String(i), tier: "heavy", resolve: () => model})),
+    });
+    const run = async (routeId: string) => {
+      const identity = composition.modelTask.resolveModel({tier: "heavy", routeId});
+      await Promise.resolve();
+      const generation = await composition.modelTask.client.generate({modelId: identity.modelId,
+        messages: [{role: "user", content: "synthetic"}], outputMode: "object", outputSchema: z.object({text: z.string()})});
+      return {identity, output: generation.output};
+    };
+    const results = await Promise.all([run("0"), run("1")]);
+    expect(results.map(r => r.output)).toEqual([{text: "a"}, {text: "b"}]);
+    expect(results[0]!.identity.configurationDigest).not.toBe(results[1]!.identity.configurationDigest);
   });
 
   it("isolates an explicitly approved GUI task model from the ordinary Heavy model", async () => {

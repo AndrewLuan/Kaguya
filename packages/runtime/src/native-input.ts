@@ -1,4 +1,5 @@
 /**
+ * toolResults 接收与实时循环相同的归档投影；工具结果与关联图像保持在同一历史段中。
  * 功能概述：由冻结历史组装 provider 原生上下文；reasoning/图像与完整工具交互作为一组保留。
  * 工具调用只连接同一 completed 的持久结果，SDK 临时 tool-error 不构成执行证据。
  * 缺失配对时拒绝向新模型派发，裁剪不会留下孤立调用或结果。
@@ -17,8 +18,9 @@ export function assembleNativeInput(input: {
   atoms: readonly DeepReadonly<InformationAtom>[];
   taskId: string;
   instanceId: string;
-  model: { providerId: string; modelId: string };
+  model: { providerId: string; modelId: string; configurationDigest?: string };
   maxBytes: number;
+  toolResults?: ReadonlyMap<string, NativeMessage[]>;
 }): NativeMessage[] {
   const messages: NativeMessage[] = [];
   let used = Buffer.byteLength(
@@ -69,6 +71,10 @@ export function assembleNativeInput(input: {
           openCalls.delete(String(part.toolCallId));
       }
     }
+    const compatible =
+      payload.resolvedModel.providerId === input.model.providerId &&
+      payload.resolvedModel.modelId === input.model.modelId &&
+      payload.resolvedModel.configurationDigest === input.model.configurationDigest;
     const toolResults = input.atoms.filter(
       (a) =>
         a.kind === "agent.heavy.tool.result.v1" &&
@@ -85,7 +91,11 @@ export function assembleNativeInput(input: {
           ordered.length
       )
         throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
-      native.data.messages.push(
+      const projected = input.toolResults?.get(atom.informationId);
+      if (compatible && !projected && ordered.some((r: any) => r.payload.value?.result?.image))
+        throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
+      if (projected) native.data.messages.push(...projected);
+      else native.data.messages.push(
         ...nativeMessagesSchema.parse([
           {
             role: "tool",
@@ -100,9 +110,6 @@ export function assembleNativeInput(input: {
       );
       for (const r of ordered) openCalls.delete(String(r!.payload.toolCallId));
     }
-    const compatible =
-      payload.resolvedModel.providerId === input.model.providerId &&
-      payload.resolvedModel.modelId === input.model.modelId;
     if (!compatible) {
       if (openCalls.size) throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
       continue;

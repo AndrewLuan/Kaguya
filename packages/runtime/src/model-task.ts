@@ -1,4 +1,5 @@
 /**
+ * 原生步骤核对冻结模型配置；历史 GUI 回执经共享投影读取原始归档图，缺失或失配时不派发模型。
  * 功能概述：提供模块可声明的通用模型任务能力，任务 ID 及输出 schema 由调用方拥有。
  * 主要职责：modelTaskCapability 是版本化 token；ModelTaskClient.execute 重载 selected atoms、
  * 校验 Prompt provenance 并以规范 JSON 摘要 registerOnce，随后复用或竞争唯一终态；cancel
@@ -17,6 +18,7 @@
  * readFailureMetrics/readProviderFailure 对跨边界值再次校验，非法指标或诊断不会阻断失败终态提交。
  */
 import { createHash, randomUUID } from "node:crypto";
+import { projectNativeToolResults, type NativeArtifactReader } from "./native-tool-results.js";
 import { assembleNativeInput } from "./native-input.js";
 import { InformationCore } from "@kaguya/engine";
 import { KaguyaLlmError, type KaguyaLlmClient } from "@kaguya/llm/client";
@@ -44,6 +46,7 @@ import {
 import {
   informationCompiledPromptSchema,
   modelTaskMetadataSchema,
+  nativeModelBindingSchema,
   modelTaskContextTrimmingSchema,
   modelTaskResolvedModelSchema,
   modelTaskSelectionPolicySchema,
@@ -77,6 +80,7 @@ export interface ModelTaskRequest<TOutput> {
   readonly nativeContinuation?: boolean;
   readonly tools?: readonly NativeToolDeclaration[];
   readonly contextTrimming?: z.infer<typeof modelTaskContextTrimmingSchema>;
+  readonly nativeModelBinding?: z.infer<typeof nativeModelBindingSchema>;
   readonly nativeStep?: {
     runInformationId: string;
     stepIndex: number;
@@ -132,6 +136,7 @@ export interface ModelTaskClientOptions {
   ) => z.infer<typeof modelTaskResolvedModelSchema>;
   readonly now?: () => Date;
   readonly renderStructuredOutputPrompt: StructuredOutputPromptRenderer;
+  readonly readNativeArtifact?: NativeArtifactReader;
   readonly admitNativeDispatch?: (
     requestedInformationId: string,
     step: NonNullable<ModelTaskRequest<unknown>["nativeStep"]>,
@@ -148,6 +153,7 @@ type Requested = DeepReadonly<
 export class ModelTaskClient implements ModelTaskCapability {
   readonly #core: InformationCore;
   readonly #client: Pick<KaguyaLlmClient, "generate">;
+  readonly #readNativeArtifact: NativeArtifactReader | undefined;
   readonly #resolveModel: ModelTaskClientOptions["resolveModel"];
   readonly #now: () => Date;
   readonly #renderStructuredOutputPrompt: StructuredOutputPromptRenderer;
@@ -158,6 +164,7 @@ export class ModelTaskClient implements ModelTaskCapability {
     this.#admitNativeDispatch = options.admitNativeDispatch;
     this.#client = options.client;
     this.#resolveModel = options.resolveModel;
+    this.#readNativeArtifact = options.readNativeArtifact;
     this.#now = options.now ?? (() => new Date());
     this.#renderStructuredOutputPrompt = options.renderStructuredOutputPrompt;
   }
@@ -239,6 +246,7 @@ export class ModelTaskClient implements ModelTaskCapability {
           ? { contextTrimming: request.contextTrimming }
           : {}),
         ...(request.nativeStep ? { nativeStep: request.nativeStep } : {}),
+        ...(request.nativeModelBinding ? { nativeModelBinding: request.nativeModelBinding } : {}),
       });
     const selected = await this.#core.getMany(metadata.contextInformationIds);
     if (
@@ -299,7 +307,31 @@ export class ModelTaskClient implements ModelTaskCapability {
           "Explicit messages and continuation are mutually exclusive",
         );
       try {
+        const toolResults = new Map<string, NativeMessage[]>();
+        for (const completed of selected) {
+          const p = completed.payload as any;
+          if (completed.kind !== "core.model.task.completed" || p.taskId !== task.taskId ||
+            p.activation?.instanceId !== request.activation.instanceId || p.generationKind !== "tool-calls") continue;
+          if (canonical(p.resolvedModel) !== canonical(resolvedModel)) continue;
+          const ordered = (p.toolCalls ?? []).map((c: any) => ({call: c, result: selected.find(a =>
+            a.kind === "agent.heavy.tool.result.v1" && a.payload.modelCompletedInformationId === completed.informationId && a.payload.toolCallId === c.toolCallId)}));
+          if (ordered.some((r: any) => !r.result) || !ordered.some((r: any) => r.result.payload.value?.result?.image)) continue;
+          const currentRun = request.nativeStep ? await this.#core.get(request.nativeStep.runInformationId) : undefined;
+          const currentScope = (currentRun?.payload.spec as any)?.scope;
+          if (!currentScope) throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
+          const entries = await Promise.all(ordered.map(async ({call, result}: any) => {
+            const run = await this.#core.get(result.payload.runInformationId);
+            const spec = run?.payload.spec as any;
+            if (spec?.scope !== currentScope) throw new Error("NATIVE_TOOL_INTERACTION_OPEN");
+            return {toolCallId: call.toolCallId, toolName: call.toolName,
+              toolId: spec.declarations.find((d: any) => d.wireName === call.toolName)?.id ?? "",
+              intentId: result.payload.intentId, scope: spec.scope, value: result.payload.value};
+          }));
+          toolResults.set(completed.informationId, await projectNativeToolResults(entries, this.#readNativeArtifact,
+            request.nativeStep?.maxContextBytes ?? 128_000));
+        }
         messages = assembleNativeInput({
+          toolResults,
           prompt: prompt.text,
           atoms: selected,
           taskId: task.taskId,
@@ -311,7 +343,7 @@ export class ModelTaskClient implements ModelTaskCapability {
         if (!(error instanceof Error)) throw error;
         if (error.message === "SITUATION_CONTEXT_BUDGET_EXCEEDED")
           inputBlocked = "context-budget";
-        else if (error.message === "NATIVE_TOOL_INTERACTION_OPEN")
+        else if (error.message === "NATIVE_TOOL_INTERACTION_OPEN" || error.message.startsWith("native-image-"))
           inputBlocked = "native-protocol";
         else throw error;
       }
@@ -386,6 +418,11 @@ export class ModelTaskClient implements ModelTaskCapability {
       const signal = executionSignal
         ? AbortSignal.any([executionSignal, controller.signal])
         : controller.signal;
+      if (request.nativeStep && (
+        !request.nativeModelBinding ||
+        canonical(request.nativeModelBinding.selectionPolicy) !== canonical(persisted.selectionPolicy) ||
+        canonical(request.nativeModelBinding.resolvedModel) !== canonical(persisted.resolvedModel)
+      )) throw new Error("Native model binding unavailable");
       if (requested.payload.inputBlocked) {
         failureStage = requested.payload.inputBlocked;
         throw new Error("Native input blocked");
@@ -478,6 +515,7 @@ export class ModelTaskClient implements ModelTaskCapability {
           : {}),
         ...(requested.payload.nativeStep
           ? {
+              maxInputBytes: requested.payload.nativeStep.maxContextBytes,
               timeoutMs: Math.min(
                 300000,
                 Math.max(

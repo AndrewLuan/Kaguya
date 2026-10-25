@@ -1,4 +1,5 @@
 /**
+ * 合并 GUI 的显式模型路由与归档读取器；模型定义仍由 selected Profile 的 composition 批准。
  * 功能概述：从敏感 linux-tools.json 显式加载 Linux 工具，随 Server 的 MCP/Runtime 生命周期组合。
  * openLinuxTools 缺省关闭、不创建配置或环境；每个 scope 仅绑定管理员预先建立的环境。
  * mergeLinuxTools 合并 registrations/task 路由/providers 并注入 W6 hooks；不覆盖 MCP 或 Memory。
@@ -75,6 +76,8 @@ export function mergeLinuxTools<
     actionEnvironment: linux.actionEnvironment,
     nativeTools: {
       ...composition.nativeTools,
+      readArtifact: linux.nativeTools.readArtifact,
+      modelRoutes: [...(composition.nativeTools?.modelRoutes ?? []), ...(linux.nativeTools.modelRoutes ?? [])],
       registrations: [
         ...(composition.nativeTools?.registrations ?? []),
         ...linux.nativeTools.registrations,

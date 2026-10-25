@@ -1,4 +1,5 @@
 /**
+ * 稳定 origin_key 仅由 activation/task/source 决定；旧记录按 requested 事实回填索引，模型 admission 校验冻结配置绑定。
  * 功能概述：在同一持久事务内裁决工具 run/step、预算、模型 dispatch 和 call→intent 身份。
  * open/freeze 固定不可变上下文，admitModel 在有效 claim 下扣一次步骤预算，calls 固定模型调用顺序。
  * bind 与 W3 register 共用 7149321 锁，stop 阻止后续 admission；结果事实保留实际 receipt，不重执行。
@@ -27,12 +28,19 @@ import type { SqlDatabase, SqlTransaction } from "./driver.js";
 export interface NativeToolRunRow {
   run_id: string;
   run_key: string;
+  origin_key: string | null;
   spec: JsonObject;
   context_id: string;
   stopped_id: string | null;
   steps_count: number;
   calls_count: number;
   output_bytes: number;
+}
+export interface NativeToolOrigin {
+  instanceId: string;
+  definitionId: string;
+  taskId: string;
+  sourceInformationId: string;
 }
 export interface NativeToolCallRow {
   run_id: string;
@@ -52,6 +60,8 @@ export async function prepareNativeToolSchema(db: SqlDatabase) {
       spec jsonb NOT NULL,context_id text NOT NULL REFERENCES information_atoms(information_id),
       stopped_id text REFERENCES information_atoms(information_id),steps_count integer NOT NULL DEFAULT 0,
       calls_count integer NOT NULL DEFAULT 0,output_bytes integer NOT NULL DEFAULT 0);
+    ALTER TABLE information_native_tool_runs ADD COLUMN IF NOT EXISTS origin_key text;
+    CREATE UNIQUE INDEX IF NOT EXISTS information_native_tool_origin ON information_native_tool_runs(origin_key);
     CREATE TABLE IF NOT EXISTS information_native_tool_steps (
       run_id text NOT NULL REFERENCES information_native_tool_runs(run_id), step_index integer NOT NULL,
       frozen_id text NOT NULL REFERENCES information_atoms(information_id), request_id text,
@@ -152,6 +162,9 @@ export class PostgresNativeToolStore {
     guard?: InformationClaim,
   ) {
     return this.tx(async (tx) => {
+      const origin = spec.origin as unknown as NativeToolOrigin | undefined;
+      const prior = origin ? await this.findOrigin(tx, origin) : undefined;
+      if (prior) return prior;
       const old = (
         await tx.query<NativeToolRunRow & Record<string, unknown>>(
           "SELECT * FROM information_native_tool_runs WHERE run_key=$1",
@@ -168,11 +181,48 @@ export class PostgresNativeToolStore {
         refs,
       );
       await tx.query(
-        "INSERT INTO information_native_tool_runs(run_id,run_key,spec,context_id) VALUES($1,$2,$3::jsonb,$4)",
-        [atom.informationId, key, JSON.stringify(spec), context],
+        "INSERT INTO information_native_tool_runs(run_id,run_key,spec,context_id,origin_key) VALUES($1,$2,$3::jsonb,$4,$5)",
+        [atom.informationId, key, JSON.stringify(spec), context, origin ? actionDigest(origin) : null],
       );
       return this.row(tx, atom.informationId);
     });
+  }
+  /** 原点不包含路由。旧 run 仅按真实 requested 事实反查，不修改不可变 run key/spec。 */
+  private async findOrigin(tx: SqlTransaction, origin: NativeToolOrigin) {
+    const key = actionDigest(origin);
+    const current = (await tx.query<NativeToolRunRow & Record<string, unknown>>(
+      "SELECT * FROM information_native_tool_runs WHERE origin_key=$1", [key],
+    )).rows[0];
+    if (current) return current;
+    const candidates = (await tx.query<NativeToolRunRow & Record<string, unknown>>(
+      `SELECT n.* FROM information_native_tool_runs n WHERE n.origin_key IS NULL AND EXISTS (
+        SELECT 1 FROM information_references r WHERE r.information_id=n.run_id
+        AND r.relation='core:uses-context' AND r.target_information_id=$1)`, [origin.sourceInformationId],
+    )).rows;
+    const matches: NativeToolRunRow[] = [];
+    for (const candidate of candidates) {
+      const facts = (await tx.query<{payload: any}>(
+        "SELECT payload FROM information_atoms WHERE kind='core.model.task.requested' AND payload->'nativeStep'->>'runInformationId'=$1",
+        [candidate.run_id],
+      )).rows;
+      if (!facts.length) throw new Error("native-origin-proof-missing");
+      const origins = new Set(facts.map(({payload: p}) => actionDigest({
+        instanceId: p.activation?.instanceId, definitionId: p.activation?.definitionId,
+        taskId: p.taskId, sourceInformationId: p.sourceInformationId,
+      })));
+      if (origins.size !== 1) throw new Error("native-origin-proof-ambiguous");
+      if (origins.has(key)) matches.push(candidate);
+    }
+    if (matches.length > 1) throw new Error("native-origin-proof-ambiguous");
+    const match = matches[0];
+    if (match) {
+      await tx.query("UPDATE information_native_tool_runs SET origin_key=$2 WHERE run_id=$1", [match.run_id, key]);
+      return {...match, origin_key: key};
+    }
+    return undefined;
+  }
+  async byOrigin(origin: NativeToolOrigin) {
+    return this.tx(tx => this.findOrigin(tx, origin));
   }
   async read(id: string) {
     return this.tx((tx) => this.row(tx, id));
@@ -346,6 +396,12 @@ export class PostgresNativeToolStore {
           actionDigest(row.spec.declarations)
       )
         throw new Error("native-request-unproved");
+      const binding = row.spec.modelBinding as any;
+      if (!binding || !binding.resolvedModel?.configurationDigest ||
+        actionDigest(request.payload.nativeModelBinding) !== actionDigest(binding) ||
+        actionDigest(request.payload.selectionPolicy) !== actionDigest(binding.selectionPolicy) ||
+        actionDigest(request.payload.resolvedModel) !== actionDigest(binding.resolvedModel))
+        throw new Error("native-model-binding-unproved");
       const budget = nativeToolBudgetSchema.parse(row.spec.budget);
       if (row.steps_count >= budget.maxSteps)
         throw new Error("native-step-budget");

@@ -1,4 +1,5 @@
 /**
+ * 恢复先查持久原点，再校验当前批准策略；native 关闭或路由消失时不回落到普通模型请求。
  * 入站 expressions 仅透传给插件，Runtime 不推断表情含义或改变调度。
  * 授权消息正文由 composition 注入的渲染器提供；Runtime 只传冻结变量并维持权限检查。
  * Runtime 只接收 outboundAllowlist；目标授权与最终 transport 前终检使用它，入站权限属于 AdapterHost。
@@ -1500,6 +1501,10 @@ class ApprovedModelTaskClient extends ModelTaskClient {
       this.#loop = new NativeToolLoop({
         ...native,
         core: options.core,
+        resolveModel: (request) => {
+          if (!this.approved(request)) throw new Error("Unapproved native model route");
+          return options.resolveModel(request.selectionPolicy);
+        },
         model: {
           execute: (request) => super.execute(request),
           cancel: (request) => super.cancel(request),
@@ -1521,24 +1526,21 @@ class ApprovedModelTaskClient extends ModelTaskClient {
       ? this.#loop.cancelRequest(request)
       : super.cancel(request);
   }
-  override execute<TOutput>(request: ModelTaskRequest<TOutput>) {
-    if (
-      !this.#approvals.some(
-        ({ activation, selectionPolicy, taskId }) =>
-          activation.instanceId === request.activation.instanceId &&
-          activation.definitionId === request.activation.definitionId &&
-          selectionPolicy.tier === request.selectionPolicy.tier &&
-          selectionPolicy.routeId === request.selectionPolicy.routeId &&
-          (!selectionPolicy.routeId || taskId === request.task.taskId) &&
-          (!taskId || taskId === request.task.taskId),
-      )
-    )
-      return Promise.reject(
-        new Error("Model task activation or policy is not approved"),
-      );
-    return this.#loop?.enabled(request)
-      ? this.#loop.execute(request)
-      : super.execute(request);
+  private approved(request: ModelTaskRequest<unknown>) {
+    return this.#approvals.some(({activation, selectionPolicy, taskId}) =>
+      activation.instanceId === request.activation.instanceId &&
+      activation.definitionId === request.activation.definitionId &&
+      selectionPolicy.tier === request.selectionPolicy.tier &&
+      selectionPolicy.routeId === request.selectionPolicy.routeId &&
+      (!selectionPolicy.routeId || taskId === request.task.taskId) &&
+      (!taskId || taskId === request.task.taskId));
+  }
+  override async execute<TOutput>(request: ModelTaskRequest<TOutput>) {
+    // 恢复必须先查稳定原点；关闭 native 或删除路由不会降级成普通新请求。
+    if (request.task?.taskId && request.sourceInformationId && await this.#loop?.existing(request)) return this.#loop!.execute(request);
+    if (!this.approved(request))
+      throw new Error("Model task activation or policy is not approved");
+    return this.#loop?.enabled(request) ? this.#loop.execute(request) : super.execute(request);
   }
 }
 
@@ -1581,6 +1583,7 @@ function composeModelTaskCapabilities(
         {
           ...options.modelTask,
           ...context,
+          ...(options.nativeTools?.readArtifact ? {readNativeArtifact: options.nativeTools.readArtifact} : {}),
           ...(native
             ? {
                 admitNativeDispatch: (id, step) =>
@@ -1594,8 +1597,8 @@ function composeModelTaskCapabilities(
             : {}),
         },
         approvals,
-        native && options.nativeTools
-          ? { ...native, options: options.nativeTools }
+        native
+          ? { ...native, options: options.nativeTools ?? {registrations: [], tasks: []} }
           : undefined,
       ),
     });

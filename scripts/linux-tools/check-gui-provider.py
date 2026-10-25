@@ -183,7 +183,7 @@ def main():
             assert broker.read_artifact({"id": before["artifacts"][0]["id"], "scope": "ci-gui"}) == original_image
             final_image = broker.read_artifact({"id": current["artifacts"][0]["id"], "scope": "ci-gui"})
             Path("gui-provider-final.png").write_bytes(base64.b64decode(final_image["dataBase64"]))
-            evidence.update(passed=True, ledger=ledger(), originalUnknown=unknown, pidStartTime=started,
+            evidence.update(ledger=ledger(), originalUnknown=unknown, pidStartTime=started,
                             preservedOriginalImageSha256=hashlib.sha256(image_bytes).hexdigest())
             # 交接保留 PID 的证明已经完成；另行模拟容器丢失，核对既存 HOME 卷的恢复。
             backend.stop_container(container)
@@ -191,6 +191,7 @@ def main():
             assert app("/bin/cat", "/private/app/recovery-marker") == b"persistent-gui-home"
             assert app("/usr/bin/stat", "-c", "%u:%g:%a", "/private/app").strip() == b"1001:1001:700"
             evidence["existingHomeRecovered"] = True
+            evidence["passed"] = True
         except BaseException:
             evidence["failure"] = traceback.format_exc()
             failed_env = broker.environments.get(key)
