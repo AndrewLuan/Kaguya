@@ -1,10 +1,13 @@
 /**
  * 功能概述：GUI provider 的许可、一次性观察及双向排空合同测试，不连接模型或真实桌面。
+ * 原子发布回归在 rename 前冻结写者，验证 ready 不提前出现、旧 ledger 完整且失败不覆盖。
  * 主要职责：用显式 barrier 制造准备/发送/释放交错，核对零旧输入、未知结果不重放和 ACK 时点。
  * 代码库关系：直接调用 gui.mjs；实际 Cua/X11 行为继续由 check-gui-container.py 验证。
  * 输入输出与副作用：仅临时 HOME；测试结束等待收尾并删除，PNG 字节用于原尺寸/hash 配对断言。
  */
 import test from "node:test";
+import { promises as fs } from "node:fs";
+import { publishFixtureJson } from "./gui-fixture-json.mjs";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -288,4 +291,79 @@ test("unverifiable Cua result stays unknown and is never resent", async (t) => {
     /stale-gui-observation/,
   );
   assert.equal(f.state.input.length, 1);
+});
+
+test(
+  "fixture JSON becomes visible only at the publication barrier",
+  { timeout: 5000 },
+  async (t) => {
+    for (const previous of [undefined, { count: 0 }]) {
+      await t.test(
+        previous
+          ? "keeps the prior ledger"
+          : "does not publish empty readiness",
+        async (t) => {
+          const root = await mkdtemp(join(tmpdir(), "kaguya-gui-publication-"));
+          t.after(() => rm(root, { recursive: true, force: true }));
+          const path = join(root, "fixture.json");
+          if (previous) await publishFixtureJson(path, previous);
+          const entered = barrier(),
+            release = barrier();
+          const rename = fs.rename;
+          t.mock.method(fs, "rename", async (...args) => {
+            if (args[1] === path) {
+              entered.resolve();
+              await release.promise;
+            }
+            return rename(...args);
+          });
+          const current = { uid: 1001, pid: 42, count: 1 };
+          const pending = publishFixtureJson(path, current);
+          try {
+            await Promise.race([
+              entered.promise,
+              pending.then(() => {
+                throw new Error("publication bypassed barrier");
+              }),
+            ]);
+            assert.deepEqual(
+              JSON.parse(await fs.readFile(`${path}.pending`, "utf8")),
+              current,
+            );
+            if (previous)
+              assert.deepEqual(
+                JSON.parse(await fs.readFile(path, "utf8")),
+                previous,
+              );
+            else await assert.rejects(fs.readFile(path), { code: "ENOENT" });
+          } finally {
+            release.resolve();
+            await pending;
+          }
+          assert.deepEqual(
+            JSON.parse(await fs.readFile(path, "utf8")),
+            current,
+          );
+          await assert.rejects(fs.stat(`${path}.pending`), { code: "ENOENT" });
+        },
+      );
+    }
+  },
+);
+
+test("failed fixture publication preserves the complete previous ledger", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "kaguya-gui-publication-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "fixture.json");
+  await publishFixtureJson(path, { count: 0 });
+  const rename = fs.rename;
+  t.mock.method(fs, "rename", async (...args) => {
+    if (args[1] === path) throw new Error("synthetic publication failure");
+    return rename(...args);
+  });
+  await assert.rejects(
+    publishFixtureJson(path, { count: 1 }),
+    /synthetic publication failure/,
+  );
+  assert.deepEqual(JSON.parse(await fs.readFile(path, "utf8")), { count: 0 });
 });

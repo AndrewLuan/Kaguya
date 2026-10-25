@@ -1,13 +1,14 @@
 /**
  * 功能概述：应用 UID 的可见 Chromium 合成页面，用实际页面事件独立记录 GUI 输入结果。
- * 主要职责：固定启动 sandbox Chromium 和本容器 HTTP 服务；事件队列原子更新 ledger。
+ * 主要职责：固定启动 sandbox Chromium 和本容器 HTTP 服务；ready 与串行 ledger 均完整写入后原子发布。
  * 代码库关系：check-gui-container.py 固定以 UID1001 启动；gui-chromium-probe.mjs 通过 Cua 输入。
  * 输入输出与副作用：不开放 CDP、不执行页面自动化；记录 uid/pid/text/count，终止时回收自身浏览器。
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { openSync, closeSync } from "node:fs";
-import { writeFile, rename, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
+import { publishFixtureJson } from "./gui-fixture-json.mjs";
 import { chromium } from "/opt/kaguya-browser/node_modules/playwright/index.mjs";
 if (process.getuid() !== 1001) throw new Error("gui-app-uid-required");
 const root = "/home/app/session";
@@ -16,14 +17,9 @@ let browser;
 let chain = Promise.resolve();
 let current = { uid: 1001, pid: 0, text: "", count: 0 };
 async function save() {
-  await writeFile(`${root}/chromium-ledger.pending`, JSON.stringify(current), {
-    mode: 0o600,
-  });
-  await rename(
-    `${root}/chromium-ledger.pending`,
-    `${root}/chromium-ledger.json`,
-  );
+  await publishFixtureJson(`${root}/chromium-ledger.json`, current);
 }
+
 const html = `<!doctype html><meta charset="utf-8"><title>Kaguya Chromium acceptance</title>
 <style>body{font:24px sans-serif;padding:48px}input,button{font:inherit;margin:12px;padding:12px}</style>
 <h1>Kaguya Chromium acceptance</h1><label>Browser unsaved text<input aria-label="Browser unsaved text"></label>
@@ -107,10 +103,11 @@ browser.once("exit", (code) => {
 });
 current.pid = browser.pid;
 await save();
-await writeFile(
-  `${root}/chromium-fixture.json`,
-  JSON.stringify({ uid: 1001, pid: browser.pid, url }),
-);
+await publishFixtureJson(`${root}/chromium-fixture.json`, {
+  uid: 1001,
+  pid: browser.pid,
+  url,
+});
 process.once("SIGTERM", () => {
   browser.kill("SIGTERM");
   server.close();

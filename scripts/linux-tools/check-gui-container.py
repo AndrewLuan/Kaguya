@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """功能概述：rootless Linux 的首阶段双 UID GUI 实测，不调用模型或连接用户桌面。
 主要职责：固定 OCI 隔离参数启动可信显示，再由宿主固定 UID 启动 app-session 与合成 GTK。
+until/until_json 共享剩余预算；published_identity 验证就绪记录，application_identity 核实实际进程。
 代码库关系：Linux tools workflow 构建 Dockerfile.gui 后调用；证据绑定输入镜像 digest。
-输入输出与副作用：仅临时命名容器与 HOME，finally 清理；有界条件检查总线/GTK，不固定 sleep 猜就绪。
+输入输出与副作用：仅临时命名容器与 HOME，finally 清理；按总预算等待完整 JSON 和实际条件，原始异常与清理失败分别保留。
 """
 import argparse
 import hashlib
@@ -12,9 +13,9 @@ import re
 from pathlib import Path
 import subprocess
 import sys
-import time
 import traceback
 import uuid
+from gui_fixture_wait import wait_for_command
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linux-environments"))
 from broker import chromium_profile
@@ -76,25 +77,16 @@ def command(*parts, timeout=30, check=True, input=None):
 
 
 def until(parts, seconds=15):
-    deadline = time.monotonic() + seconds
-    while True:
-        result = command(*parts, check=False)
-        if result.returncode == 0:
-            return result.stdout
-        if time.monotonic() >= deadline:
-            raise RuntimeError(result.stderr.decode(errors="replace") or "gui-readiness-timeout")
-        time.sleep(.02)
+    return wait_for_command(command, parts, seconds=seconds)
 
 
 def until_json(parts, predicate, seconds=15):
-    deadline = time.monotonic() + seconds
-    while True:
-        value = json.loads(command(*parts).stdout)
-        if predicate(value):
-            return value
-        if time.monotonic() >= deadline:
-            raise AssertionError({"applicationConditionTimeout": value})
-        time.sleep(.02)
+    return wait_for_command(command, parts, seconds=seconds, predicate=predicate)
+
+
+def published_identity(value, uid=None):
+    return (isinstance(value, dict) and isinstance(value.get("pid"), int) and value["pid"] > 1
+            and (uid is None or value.get("uid") == uid))
 
 
 def application_identity(pid):
@@ -142,12 +134,11 @@ try:
     command("exec", name, "/usr/bin/dbus-send", "--bus=" + address, "--print-reply", "--dest=org.freedesktop.DBus", "/", "org.freedesktop.DBus.ListNames")
     print(json.dumps({"controlUid": 1000, "appUid": 1001, "atspiAddress": address, "bothBusesConnected": True}), flush=True)
     command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/bin/python3", "/opt/kaguya-tools/gui-fixture.py")
-    until(["exec", "--user=1001:1001", name, "/usr/bin/test", "-s", "/home/app/session/gui-ledger.json"])
-    ledger = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
+    ledger = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json"], lambda value: published_identity(value, 1001))
     assert ledger["uid"] == 1001
     gtk_identity = application_identity(ledger["pid"])
     probe_process = subprocess.Popen(["/usr/bin/podman", "exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-probe.mjs", str(ledger["pid"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    driver = json.loads(until(["exec", name, "/bin/cat", "/home/tool/gui-probe-driver.json"]))
+    driver = until_json(["exec", name, "/bin/cat", "/home/tool/gui-probe-driver.json"], published_identity)
     health = json.loads(command("exec", "-i", name, "/opt/kaguya-tools/helper", input=b'{"helperProtocolVersion":1,"kind":"health"}').stdout)
     assert health["ready"] is True and health["generation"] == 0 and health["serviceInstanceId"]
     print(json.dumps({"controlHealth": health}), flush=True)
@@ -166,7 +157,8 @@ try:
     preserved = json.loads(command("exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/gui-ledger.json").stdout)
     assert preserved == after, preserved
     command("exec", "--detach", "--user=1001:1001", "--env=HOME=/home/app/session", "--env=GTK_MODULES=gail:atk-bridge", "--env=NO_AT_BRIDGE=0", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-fixture.mjs")
-    browser = json.loads(until(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-fixture.json"]))
+    browser = until_json(["exec", "--user=1001:1001", name, "/bin/cat", "/home/app/session/chromium-fixture.json"],
+                         lambda value: published_identity(value, 1001) and isinstance(value.get("url"), str) and value["url"].startswith("http://127.0.0.1:"))
     browser_identity = application_identity(browser["pid"])
     browser_result = command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-chromium-probe.mjs", str(browser["pid"]), timeout=120)
     print(browser_result.stdout.decode(), flush=True)
@@ -177,7 +169,8 @@ try:
     command("exec", name, "/usr/local/bin/node", "/opt/kaguya-tools/gui-launch-probe.mjs", timeout=120)
     launches = []
     for kind in ("activation", "shortcut", "menu"):
-        marker = json.loads(until(["exec", "--user=1001:1001", name, "/bin/cat", f"/home/app/session/launch-{kind}.json"]))
+        marker = until_json(["exec", "--user=1001:1001", name, "/bin/cat", f"/home/app/session/launch-{kind}.json"],
+                            lambda value: published_identity(value, 1001) and value.get("kind") == kind)
         assert marker["kind"] == kind and marker["uid"] == 1001 and marker["pid"] > 1, marker
         launches.append(marker)
     print(json.dumps({"applicationLaunches": launches}), flush=True)
