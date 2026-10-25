@@ -84,7 +84,7 @@ Server 从敏感配置目录的 `linux-tools.json` 显式启用；文件不存�
 | `GET /human/operations/:operationId` | 查询原操作与 attempt 的持久结果，不重新输入                                        |
 | `GET /images/:artifactId`            | 经认证读取已归档 PNG 原字节，不接受 URL token                                      |
 
-GUI 任务要求对应 scope 已有完整、有效的冻结观察，并要求环境处于 ready。宿主冻结 observation、scope、workflow、generation、激活和明确的模型路由；客户端不能指定 origin、nativeStep 或模型选择策略。HTTP 断连后任务继续由现有可靠投递队列处理；同环境与 taskRequestId 的重提返回原任务，提示词冲突返回 409。取消先于 run 创建时，持久取消事实阻止后续模型和工具派发；执行已开始时，保留实际回执与 unknown。human、draining 或隔离未确认状态下提交会被拒绝，恢复自动化须单独调用 resume。配置或环境代次改变会停止原任务，不为旧任务自动切换模型或重新取得新代次执行权。
+GUI 任务要求对应 scope 已有完整、有效的冻结观察，并要求环境处于 ready。宿主冻结 observation、scope、workflow、generation、激活和明确的模型路由；客户端不能指定 origin、nativeStep 或模型选择策略。HTTP 断连后任务继续由现有可靠投递队列处理；同环境与 taskRequestId 的重提返回原任务，提示词冲突返回 409。取消先于 run 创建时，持久取消事实阻止后续模型和工具派发；执行已开始时，保留实际回执与 unknown。查询中的 cancellation 单独报告 pending 或 forwarded；可靠消费者会在重启和转发失败后继续处理 pending，即使 GUI 任务已是 stopped。forwarded 只表示请求已送达，不表示物理效果已撤回。重启后的取消按当前配置取得控制租约，并保留原 attempt 身份；环境拒绝租约时保持 pending，等待管理员显式恢复。human、draining 或隔离未确认状态下提交会被拒绝，恢复自动化须单独调用 resume。配置或环境代次改变会停止原任务，不为旧任务自动切换模型或重新取得新代次执行权。
 
 人工操作的 operationId 使用 UUID。同一操作丢失响应时，保留原 ID 并查询结果；同 ID 重复请求共用原 attempt，不派发第二次输入。交接先阻止新输入，再终止控制进程组、释放按键和鼠标、恢复借用键码，最后确认隔离。正常 handoff/resume 保留应用 PID 与未保存状态。到期或关闭先撤销输入权限，隔离未确认时保留清理归属并拒绝继续输入；恢复自动化始终需要显式 resume。
 

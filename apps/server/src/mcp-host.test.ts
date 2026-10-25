@@ -992,5 +992,5 @@ it.each(["before-unknown", "after-unknown"] as const)(
       await f.update({ release: true });
     }
   },
-  40000, // Router 前置、MCP 开始、迟到事实和最终收敛各 8 秒，其余用于初始化和清理。
+  55000, // Router 前置、MCP 开始、unknown 前置、迟到事实、最终收敛最多五段各 8 秒；另留 15 秒供真实初始化、取消和清理。
 );

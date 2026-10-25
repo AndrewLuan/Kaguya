@@ -3,6 +3,7 @@
  * readArtifact 只允许绑定环境与 scope，并向原生循环提供归档 blob，无截图副作用。
  * 功能概述：把显式宿主配置的 Linux shell/Chromium/GUI 工具接入 W4 原生目录和 W3/W6 执行边界。
  * LinuxToolsHost 延迟 acquire 并在 bind 前 renew；同一环境的绑定串行，保持秘密仅在 client 内存。
+ * 取消在新进程中按当前配置取得控制租约，保留原 attempt；环境拒绝 acquire 时等待显式恢复，不自动接管。
  * snapshot 提供 shell.exec 的有界 schema、scope/target 授权与 broker provider，不另建工具循环。
  * close 释放所持 lease，W6 负责物理隔离；失败保留 owner 以便再次清理，禁止盲目 recover。
  * 管理接管与 lease 共享 scope 锁；人工输入不占用控制锁，使关闭/恢复可立即撤销正在执行的输入。
@@ -15,6 +16,7 @@ import {
   type HumanOperation,
 } from "./environment.js";
 import type { NativeToolLoopOptions } from "./native-tool-loop.js";
+import type { ActionExecutorOptions } from "./action.js";
 import {
   linuxBrowserObserveSchema,
   linuxBrowserActSchema,
@@ -495,7 +497,32 @@ export class LinuxToolsHost {
     return {
       nativeTools: tools,
       actionProviders: tools.registrations.length ? [provider] : [],
-      actionEnvironment: this.client.actionHooks,
+      actionEnvironment: {
+        ...this.client.actionHooks,
+        resolveLeaseCredential: async (input, mode) => {
+          if (mode === "cancel") {
+            const original = input.intent.environment;
+            if (
+              !input.controlAuthorizationId ||
+              !original ||
+              !this.configuration.bindings.some(
+                (binding) =>
+                  binding.scope === input.intent.scope &&
+                  binding.environmentId === original.environmentId &&
+                  binding.workflowId === original.workflowId,
+              )
+            )
+              throw new Error("linux-tools-cancel-binding-denied");
+            await this.bind(input.intent.scope);
+          }
+          return this.client.actionHooks.resolveLeaseCredential(input, mode);
+        },
+      } satisfies Required<
+        Pick<
+          ActionExecutorOptions,
+          "resolveLeaseCredential" | "validateEnvironment"
+        >
+      >,
     };
   }
   async close() {

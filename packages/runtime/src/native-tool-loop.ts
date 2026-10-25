@@ -247,7 +247,7 @@ export class NativeToolLoop {
     private readonly deps: {
       db: KaguyaDatabase;
       core: InformationCore;
-      actions: ActionAccess;
+      actions: ActionAccess & { cancelForwarded?: ActionAccess["cancel"] };
       model: ModelTaskCapability;
       resolveModel: (
         request: ModelTaskRequest<unknown>,
@@ -917,6 +917,7 @@ export class NativeToolLoop {
     runInformationId: string,
     causeId: string,
     reason = "cancelled",
+    requireForwarded = false,
   ) {
     const row = await this.deps.db.nativeTools.read(runInformationId),
       spec = json(row.spec) as unknown as Spec;
@@ -930,12 +931,22 @@ export class NativeToolLoop {
       await this.deps.model.cancel({ requestedInformationId: id, reason });
     for (const id of await this.deps.db.nativeTools.intents(runInformationId)) {
       const view = await this.deps.actions.read(id, spec.scope);
+      if (
+        requireForwarded &&
+        ["succeeded", "rejected", "cancelled", "superseded"].includes(
+          view.state,
+        )
+      )
+        continue;
       const tool = this.registrations.get(view.intent.toolName);
       if (
         !tool ||
         !(await tool.authorize({ intent: view.intent, mode: "cancel" }))
-      )
+      ) {
+        if (requireForwarded)
+          throw new Error("native-cancel-forwarding-unavailable");
         continue;
+      }
       const control = {
         ...view.intent,
         authorizationId: `native-cancel:${stopped}:${id}:${randomUUID()}`,
@@ -957,7 +968,11 @@ export class NativeToolLoop {
         expiresAt: control.deadline,
         causeInformationId: causeId,
       });
-      await this.deps.actions.cancel({
+      const cancel = requireForwarded
+        ? this.deps.actions.cancelForwarded
+        : this.deps.actions.cancel;
+      if (!cancel) throw new Error("native-cancel-forwarding-unavailable");
+      await cancel.call(this.deps.actions, {
         intentId: id,
         scope: spec.scope,
         causeInformationId: causeId,

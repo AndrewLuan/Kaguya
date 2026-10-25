@@ -1,5 +1,6 @@
 /**
  * cancelOrigin 与 open/admission 共锁，持久取消未创建 run 的来源；admitModel 同时核对四项原点和冻结模型配置。
+ * cancellationForwarded 与停止事实分开追加；转发失败保留 pending，避免任务终态掩盖未送达的取消。
  * 稳定 origin_key 仅由 activation/task/source 决定；旧记录按 requested 事实回填索引，模型 admission 校验冻结配置绑定。
  * 功能概述：在同一持久事务内裁决工具 run/step、预算、模型 dispatch 和 call→intent 身份。
  * open/freeze 固定不可变上下文，admitModel 在有效 claim 下扣一次步骤预算，calls 固定模型调用顺序。
@@ -202,6 +203,54 @@ export class PostgresNativeToolStore {
         return { ...row, stopped_id: terminal.informationId };
       }
       return undefined;
+    });
+  }
+  async cancellation(origin: NativeToolOrigin) {
+    const key = actionDigest(origin);
+    const rows = (
+      await this.db.query<{ kind: string; information_id: string }>(
+        "SELECT kind,information_id FROM information_atoms WHERE kind IN ('agent.heavy.tool.origin.cancelled.v1','agent.heavy.tool.cancel.forwarded.v1') AND payload->>'originKey'=$1",
+        [key],
+      )
+    ).rows;
+    const pending = rows.find(
+      (r) => r.kind === "agent.heavy.tool.origin.cancelled.v1",
+    );
+    return pending
+      ? {
+          state: rows.some(
+            (r) => r.kind === "agent.heavy.tool.cancel.forwarded.v1",
+          )
+            ? ("forwarded" as const)
+            : ("pending" as const),
+          requestedInformationId: pending.information_id,
+        }
+      : null;
+  }
+  async cancellationForwarded(
+    origin: NativeToolOrigin,
+    context: string,
+    guard?: InformationClaim,
+  ) {
+    return this.tx(async (tx) => {
+      if (guard) await assertClaimInTransaction(tx, guard);
+      const key = actionDigest(origin);
+      const pending = await this.originCancelled(tx, key);
+      if (!pending) throw new Error("native-cancellation-missing");
+      const done = (
+        await tx.query(
+          "SELECT information_id FROM information_atoms WHERE kind='agent.heavy.tool.cancel.forwarded.v1' AND payload->>'originKey'=$1",
+          [key],
+        )
+      ).rows[0];
+      if (!done)
+        await this.fact(
+          tx,
+          "agent.heavy.tool.cancel.forwarded.v1",
+          { originKey: key },
+          context,
+          [pending, origin.sourceInformationId],
+        );
     });
   }
   async open(

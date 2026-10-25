@@ -25,6 +25,8 @@ class BundleTest(unittest.TestCase):
             (self.root / name).write_bytes(b"synthetic OCI " + role.encode())
             self.manifest["images"][role] = {"file": name, "archiveSha256": bundle.digest(self.root / name)}
         self.save()
+        self.acl = patch.object(bundle, "set_broker_read_acl").start()
+        self.addCleanup(patch.stopall)
 
     def save(self):
         (self.root / "manifest.json").write_text(json.dumps(self.manifest))
@@ -55,18 +57,18 @@ class BundleTest(unittest.TestCase):
         inbox = self.root / "inbox"
         inbox.mkdir()
         image = self.manifest["images"]["gui"]
-        bundle.stage_image(self.root, image, inbox)
+        bundle.stage_image(self.root, image, inbox, 65534)
         target = inbox / (image["archiveSha256"] + ".oci")
         inode = target.stat().st_ino
-        bundle.stage_image(self.root, image, inbox)
+        bundle.stage_image(self.root, image, inbox, 65534)
         self.assertEqual(target.stat().st_ino, inode)
         target.write_bytes(b"partial")
         with self.assertRaisesRegex(RuntimeError, "existing-inbox-checksum-mismatch"):
-            bundle.stage_image(self.root, image, inbox)
+            bundle.stage_image(self.root, image, inbox, 65534)
         target.unlink()
         target.symlink_to(self.root / image["file"])
-        with self.assertRaisesRegex(RuntimeError, "nonregular-file"):
-            bundle.stage_image(self.root, image, inbox)
+        with self.assertRaises(OSError):
+            bundle.stage_image(self.root, image, inbox, 65534)
 
     def test_linked_source_is_not_accepted(self):
         path = self.root / "server.py"
@@ -92,7 +94,7 @@ class BundleTest(unittest.TestCase):
         (artifacts / "workflow-run.json").write_text(json.dumps(run))
         evidence = artifacts / ("gui-evidence-" + sha)
         evidence.mkdir()
-        (evidence / "gui-provider-receipt.json").write_text(json.dumps({"passed": True, "existingHomeRecovered": True}))
+        (evidence / "gui-provider-receipt.json").write_text(json.dumps({"passed": True, "existingHomeRecovered": True, "imageDigest": "sha256:" + "b" * 64}))
         for role in bundle.IMAGE_ROLES:
             directory = artifacts / (role + "-tools-" + sha)
             directory.mkdir()
@@ -106,6 +108,11 @@ class BundleTest(unittest.TestCase):
         result = bundle.verify_manifest(output)
         self.assertEqual(result["commit"], sha)
         self.assertEqual(set(result["images"]), set(bundle.IMAGE_ROLES))
+        (evidence / "gui-provider-receipt.json").write_text(json.dumps({"passed": True, "existingHomeRecovered": True, "imageDigest": "sha256:" + "c" * 64}))
+        with patch.object(package_bundle.subprocess, "check_output", side_effect=[sha, ""]):
+            with self.assertRaisesRegex(RuntimeError, "receipt-image-mismatch"):
+                package_bundle.package(self.root, artifacts, self.root / "wrong-image", sha)
+        self.assertFalse((self.root / "wrong-image").exists())
         run["head_sha"] = "c" * 40
         (artifacts / "workflow-run.json").write_text(json.dumps(run))
         with patch.object(package_bundle.subprocess, "check_output", side_effect=[sha, ""]):

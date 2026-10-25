@@ -560,6 +560,13 @@ async function fixture(
         { subscriptionId: "kaguya.gui.task", kind: guiTaskRequestedKind.kind },
         true,
       );
+      await db.information.reliable!.setSubscription!(
+        {
+          subscriptionId: "kaguya.gui.task.cancel",
+          kind: "agent.heavy.tool.origin.cancelled.v1",
+        },
+        true,
+      );
       return service;
     },
     guiState: (state: string, generation = 1) => {
@@ -716,6 +723,25 @@ async function fixture(
       }),
   };
 }
+async function guiAcknowledged(
+  f: Awaited<ReturnType<typeof fixture>>,
+  requestedInformationId: string,
+) {
+  return vi.waitFor(
+    async () => {
+      const row = (
+        await f.db.sql.query<{ state: string; attempts: number }>(
+          "SELECT state,attempts FROM information_deliveries WHERE subscription_id='kaguya.gui.task' AND information_id=$1",
+          [requestedInformationId],
+        )
+      ).rows[0];
+      expect(row?.state).toBe("acked");
+      expect(row!.attempts).toBeGreaterThanOrEqual(1);
+      return row!;
+    },
+    { timeout: 8000, interval: 20 },
+  );
+}
 async function imageHistory(
   f: Awaited<ReturnType<typeof fixture>>,
   closed = false,
@@ -760,7 +786,7 @@ async function imageHistory(
 }
 for (const postgres of backends)
   describe(postgres ? "native PostgreSQL" : "native PGlite", () => {
-    it("persists one explicit GUI task across duplicate HTTP submissions and core restart", async () => {
+    it("persists one explicit GUI task across duplicate management submissions and core restart", async () => {
       const f = await fixture(postgres, { guiImage: true });
       let service = await f.guiService();
       const input = { taskRequestId: randomUUID(), prompt: "inspect desktop" };
@@ -787,6 +813,7 @@ for (const postgres of backends)
           ).toBe("completed"),
         { timeout: 8000, interval: 20 },
       );
+      const delivery = await guiAcknowledged(f, queued.requestedInformationId);
       await f.core.stopReliableDelivery({ drain: true });
       expect(f.providerCalls()).toBe(1);
       expect(f.requests).toHaveLength(2);
@@ -807,11 +834,16 @@ for (const postgres of backends)
       );
       await f.restart();
       service = await f.guiService();
-      await f.core.startReliableDelivery();
-      await f.core.stopReliableDelivery({ drain: true });
+      // 重提没有创建新 delivery；原任务已 acked，重启只核对同一持久状态。
+      expect(await guiAcknowledged(f, queued.requestedInformationId)).toEqual(
+        delivery,
+      );
+      expect(
+        (await service.read("synthetic-desktop", input.taskRequestId)).status,
+      ).toBe("completed");
       expect(f.providerCalls()).toBe(1);
       expect(f.requests).toHaveLength(2);
-    });
+    }, 40000); // 完成状态和两次 ack 核对各最多 8 秒，另留初始化与两次重启预算。
     it("cancels an accepted GUI origin before any run and keeps it stopped after restart", async () => {
       const f = await fixture(postgres, { guiImage: true });
       let service = await f.guiService();
@@ -819,13 +851,14 @@ for (const postgres of backends)
         taskRequestId: randomUUID(),
         prompt: "cancel before start",
       };
-      await service.submit("synthetic-desktop", input);
+      const queued = await service.submit("synthetic-desktop", input);
       expect(
         (await service.cancel("synthetic-desktop", input.taskRequestId)).status,
       ).toBe("stopped");
       await f.restart();
       service = await f.guiService();
       await f.core.startReliableDelivery();
+      await guiAcknowledged(f, queued.requestedInformationId);
       await f.core.stopReliableDelivery({ drain: true });
       expect(
         (await service.read("synthetic-desktop", input.taskRequestId)).status,
@@ -836,7 +869,7 @@ for (const postgres of backends)
         (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
           .rows,
       ).toHaveLength(0);
-    });
+    }, 25000); // 等待消费 ack 最多 8 秒，另留真实数据库初始化与重启预算。
     it("cancels while the durable handler is about to create its run", async () => {
       const f = await fixture(postgres, { guiImage: true });
       const service = await f.guiService();
@@ -852,7 +885,7 @@ for (const postgres of backends)
           return open(...args);
         });
       try {
-        await service.submit("synthetic-desktop", input);
+        const queued = await service.submit("synthetic-desktop", input);
         await f.core.startReliableDelivery();
         let reached = false;
         void entered.promise.then(() => {
@@ -866,6 +899,8 @@ for (const postgres of backends)
           (await service.cancel("synthetic-desktop", input.taskRequestId))
             .status,
         ).toBe("stopped");
+        release.resolve();
+        await guiAcknowledged(f, queued.requestedInformationId);
       } finally {
         release.resolve();
         await f.core.stopReliableDelivery({ drain: true });
@@ -877,7 +912,7 @@ for (const postgres of backends)
         (await f.db.sql.query("SELECT * FROM information_native_tool_runs"))
           .rows,
       ).toHaveLength(0);
-    });
+    }, 30000); // 进入 open 与消费 ack 各最多 8 秒，另留初始化、取消和清理预算。
     it("stops an inflight GUI model and never executes its late tool calls", async () => {
       const f = await fixture(postgres, { guiImage: true });
       const service = await f.guiService();
@@ -887,13 +922,17 @@ for (const postgres of backends)
       };
       const release = Promise.withResolvers<void>();
       let entered = false;
+      let requestedInformationId = "";
+      let delivery: { state: string; attempts: number } | undefined;
       f.generate(async () => {
         entered = true;
         await release.promise;
         return [call("late", "gui.observe")];
       });
       try {
-        await service.submit("synthetic-desktop", input);
+        requestedInformationId = (
+          await service.submit("synthetic-desktop", input)
+        ).requestedInformationId;
         await f.core.startReliableDelivery();
         await vi.waitFor(() => expect(entered).toBe(true), {
           timeout: 8000,
@@ -903,6 +942,8 @@ for (const postgres of backends)
           (await service.cancel("synthetic-desktop", input.taskRequestId))
             .status,
         ).toBe("stopped");
+        release.resolve();
+        delivery = await guiAcknowledged(f, requestedInformationId);
       } finally {
         release.resolve();
         await f.core.stopReliableDelivery({ drain: true });
@@ -911,14 +952,143 @@ for (const postgres of backends)
       expect(f.providerCalls()).toBe(0);
       await f.restart();
       const restored = await f.guiService();
-      await f.core.startReliableDelivery();
-      await f.core.stopReliableDelivery({ drain: true });
+      // 取消处理已经 acked；重启不创建新任务来制造恢复活动。
+      expect(await guiAcknowledged(f, requestedInformationId)).toEqual(
+        delivery,
+      );
       expect(
         (await restored.read("synthetic-desktop", input.taskRequestId)).status,
       ).toBe("stopped");
       expect(f.requests).toHaveLength(1);
       expect(f.providerCalls()).toBe(0);
-    });
+    }, 40000); // 进入模型与两次 ack 核对各最多 8 秒，另留初始化、重启和取消预算。
+    it.each(["before-forward", "provider-failure"] as const)(
+      "retries durable cancellation after restart even with a GUI terminal: %s",
+      async (mode) => {
+        const f = await fixture(postgres, { guiImage: true });
+        let service = await f.guiService();
+        const input = {
+          taskRequestId: randomUUID(),
+          prompt: "cancel durable forwarding",
+        };
+        const release = Promise.withResolvers<void>();
+        f.behavior(async () => {
+          await release.promise;
+          return outcome;
+        });
+        const cancelledAttempts: string[] = [];
+        let fail = mode === "provider-failure";
+        f.provider.cancel = async (input) => {
+          cancelledAttempts.push(input.attemptId);
+          if (fail) throw new Error("synthetic cancellation transport failure");
+        };
+        const queued = await service.submit("synthetic-desktop", input);
+        try {
+          await f.core.startReliableDelivery();
+          await vi.waitFor(() => expect(f.providerCalls()).toBe(1), {
+            timeout: 8000,
+            interval: 20,
+          });
+          await f.core.stopReliableDelivery();
+          const spy =
+            mode === "before-forward"
+              ? vi
+                  .spyOn(f.loop, "cancel")
+                  .mockRejectedValueOnce(
+                    new Error("synthetic crash after durable stop"),
+                  )
+              : undefined;
+          await expect(
+            service.cancel("synthetic-desktop", input.taskRequestId),
+          ).rejects.toThrow("synthetic");
+          spy?.mockRestore();
+          expect(
+            (await service.read("synthetic-desktop", input.taskRequestId))
+              .cancellation?.state,
+          ).toBe("pending");
+          // 兼容旧版本已提交 GUI terminal 但未转发完成的持久窗口。
+          const source = await f.core.get(queued.requestedInformationId);
+          const current = await service.read(
+            "synthetic-desktop",
+            input.taskRequestId,
+          );
+          await f.core.commitTerminal(
+            "kaguya.gui.task",
+            queued.requestedInformationId,
+            guiTaskTerminalKind,
+            {
+              payload: {
+                status: "stopped",
+                reason: "cancelled",
+                runInformationId: current.runInformationId,
+                output: null,
+              },
+              source: "test:native",
+              occurredAt: new Date().toISOString(),
+              references: [
+                source!.references.find((r) => r.relation === "core:context")!,
+                {
+                  relation: "core:caused-by",
+                  informationId: queued.requestedInformationId,
+                },
+                {
+                  relation: "core:status-of",
+                  informationId: queued.requestedInformationId,
+                },
+              ],
+            },
+          );
+        } finally {
+          release.resolve();
+        }
+        await f.restart();
+        service = await f.guiService();
+        fail = false;
+        const priorAttempts = cancelledAttempts.length;
+        if (mode === "provider-failure") {
+          expect(priorAttempts).toBe(1);
+          expect(
+            (await service.cancel("synthetic-desktop", input.taskRequestId))
+              .cancellation?.state,
+          ).toBe("forwarded");
+          expect(cancelledAttempts).toHaveLength(2);
+        }
+        await f.core.startReliableDelivery();
+        await vi.waitFor(
+          async () => {
+            const state = await service.read(
+              "synthetic-desktop",
+              input.taskRequestId,
+            );
+            expect(state.cancellation?.state).toBe("forwarded");
+            const delivery = (
+              await f.db.sql.query<{ state: string; attempts: number }>(
+                "SELECT state,attempts FROM information_deliveries WHERE subscription_id='kaguya.gui.task.cancel' AND information_id=$1",
+                [state.cancellation!.requestedInformationId],
+              )
+            ).rows[0];
+            expect(delivery?.state).toBe("acked");
+            expect(delivery!.attempts).toBeGreaterThanOrEqual(1);
+          },
+          { timeout: 8000, interval: 20 },
+        );
+        await guiAcknowledged(f, queued.requestedInformationId);
+        await f.core.stopReliableDelivery({ drain: true });
+        expect(cancelledAttempts.length).toBeGreaterThan(priorAttempts);
+        expect(new Set(cancelledAttempts).size).toBe(1);
+        expect(f.providerCalls()).toBe(1);
+        expect(f.requests).toHaveLength(1);
+        const action = (
+          await f.db.sql.query<{ intent_id: string }>(
+            "SELECT intent_id FROM information_action_heads",
+          )
+        ).rows[0]!;
+        expect(
+          (await f.db.actions.read(action.intent_id, f.scope)).state,
+        ).not.toBe("cancelled");
+      },
+      40000, // provider 进入、取消 ack、任务 ack 各最多 8 秒，另留初始化与重启预算。
+    );
     it.each(["human", "draining", "unknown"])(
       "rejects GUI tasks in %s without taking control",
       async (state) => {

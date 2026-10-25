@@ -5,6 +5,7 @@
  * 代码库关系：消费生产 LinuxToolsHost/Client，受影响 schema 与 hooks 均在此覆盖。
  */
 import { describe, expect, it, vi } from "vitest";
+import type { ActionExecution } from "@kaguya/sdk";
 import { LinuxToolsHost, linuxShellSchema } from "./linux-tools.js";
 import { LinuxEnvironmentClient } from "./environment.js";
 import {
@@ -14,6 +15,148 @@ import {
 import { linuxGuiActSchema } from "./linux-gui.js";
 
 describe("Linux native shell registry", () => {
+  it("reacquires a control lease in a fresh host and cancels the original attempt only after acquisition succeeds", async () => {
+    const original = {
+      environmentId: "desktop",
+      generation: 0,
+      workspaceId: "work",
+      resourceIds: ["gui"],
+      workflowId: "flow",
+      leaseId: "old",
+      fencing: "1",
+      expiresAt: "2026-01-01T00:00:00.000Z",
+    };
+    const current = {
+      ...original,
+      generation: 1,
+      leaseId: "current",
+      fencing: "2",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    const calls: { method: string; params: unknown }[] = [];
+    let available = false;
+    const host = new LinuxToolsHost(
+      {
+        version: 1,
+        revision: "one",
+        bindings: [
+          {
+            scope: "scope",
+            environmentId: "desktop",
+            workflowId: "flow",
+            gui: true,
+            guiModel: {
+              routeId: "gui",
+              providerId: "vision",
+              modelId: "model",
+            },
+          },
+        ],
+      },
+      new LinuxEnvironmentClient(async (method, params) => {
+        calls.push({ method, params });
+        if (method === "lease.acquire") {
+          if (!available) throw new Error("environment-not-ready");
+          return {
+            environment: current,
+            token: "private-control-token-for-test-123456",
+          };
+        }
+        if (method === "operation.cancel")
+          return {
+            status: "unknown",
+            evidence: "unconfirmed",
+            result: { reason: "old-effect-unconfirmed" },
+            artifacts: [],
+            truncated: false,
+          };
+        if (method === "lease.release")
+          return {
+            environmentId: "desktop",
+            scope: "scope",
+            generation: 1,
+            state: "quarantined",
+          };
+        throw new Error(`unexpected RPC: ${method}`);
+      }),
+    );
+    const input: ActionExecution = {
+      intentId: "intent",
+      attemptId: "original-attempt",
+      operationId: "original-operation",
+      digest: "original-digest",
+      controlAuthorizationId: "control",
+      signal: new AbortController().signal,
+      intent: {
+        environment: original,
+        scope: "scope",
+        operationId: "original-operation",
+        toolName: "gui.observe",
+        runInformationId: "run",
+        decisionInformationId: "decision",
+        sceneId: "scene",
+        authorizationId: "authorization",
+        authorizationVersion: 1,
+        domain: "tool",
+        providerId: "linux.environment",
+        providerVersion: "1",
+        executor: "linux",
+        dependencies: {
+          observationId: "observation",
+          memoryRevisions: [],
+          sourceInformationIds: [],
+        },
+        dependsOn: [],
+        arguments: {},
+        target: { scope: "scope", revision: "one" },
+        deadline: "2026-01-01T00:00:00.000Z",
+      },
+    };
+    try {
+      const snapshot = host.snapshot();
+      await expect(
+        snapshot.actionEnvironment.resolveLeaseCredential(input, "cancel"),
+      ).rejects.toThrow("environment-not-ready");
+      expect(calls.map((call) => call.method)).toEqual(["lease.acquire"]);
+      available = true;
+      input.leaseCredential =
+        await snapshot.actionEnvironment.resolveLeaseCredential(
+          input,
+          "cancel",
+        );
+      await snapshot.actionProviders[0]!.cancel!(input);
+      expect(calls.map((call) => call.method)).toEqual([
+        "lease.acquire",
+        "lease.acquire",
+        "operation.cancel",
+      ]);
+      expect(calls.at(-1)?.params).toMatchObject({
+        environment: original,
+        controlEnvironment: current,
+        attemptId: "original-attempt",
+        operationId: "original-operation",
+        digest: "original-digest",
+        controlAuthorizationId: "control",
+      });
+      const count = calls.length;
+      await expect(
+        snapshot.actionEnvironment.resolveLeaseCredential(
+          {
+            ...input,
+            intent: {
+              ...input.intent,
+              environment: { ...original, workflowId: "other" },
+            },
+          },
+          "cancel",
+        ),
+      ).rejects.toThrow("cancel-binding-denied");
+      expect(calls).toHaveLength(count);
+    } finally {
+      await host.close();
+    }
+  });
+
   it("registers GUI only for its configured scope and keeps insertion distinct from replacement", async () => {
     const host = new LinuxToolsHost(
       {

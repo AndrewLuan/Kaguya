@@ -7,6 +7,7 @@
 安装进度可重试；已有 inbox 文件必须内容相同，不覆盖不明文件；失败保留实际状态供核对。
 """
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -72,21 +73,61 @@ def rpc(method, params, timeout=310):
     return response["result"]
 
 
-def stage_image(root, image, inbox):
+def set_broker_read_acl(fd, broker_uid):
+    # acl_set_fd 绑定已验证 inode；不对可被另一 UID 替换的目录项调用 setfacl。
+    lib = ctypes.CDLL("libacl.so.1", use_errno=True)
+    lib.acl_from_text.argtypes = [ctypes.c_char_p]
+    lib.acl_from_text.restype = ctypes.c_void_p
+    lib.acl_set_fd.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    lib.acl_get_fd.argtypes = [ctypes.c_int]
+    lib.acl_get_fd.restype = ctypes.c_void_p
+    lib.acl_cmp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.acl_free.argtypes = [ctypes.c_void_p]
+    desired = lib.acl_from_text(f"u::rw-,u:{broker_uid}:r--,g::---,m::r--,o::---".encode())
+    if not desired:
+        raise RuntimeError("image-acl-invalid")
+    actual = None
+    try:
+        if lib.acl_set_fd(fd, desired) != 0:
+            raise OSError(ctypes.get_errno(), "image-acl-set-failed")
+        actual = lib.acl_get_fd(fd)
+        if not actual or lib.acl_cmp(actual, desired) != 0:
+            raise RuntimeError("image-acl-readback-mismatch")
+    finally:
+        if actual:
+            lib.acl_free(actual)
+        lib.acl_free(desired)
+
+
+def stage_image(root, image, inbox, broker_uid):
     target = inbox / (image["archiveSha256"] + ".oci")
-    if target.exists() or target.is_symlink():
-        regular(target)
-        if digest(target) != image["archiveSha256"]:
+    created = False
+    try:
+        fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(target, os.O_RDWR | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r+b") as dst:
+        info = os.fstat(dst.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+            raise RuntimeError("inbox-file-owner-or-type-invalid")
+        if created:
+            with (root / image["file"]).open("rb") as src:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        dst.seek(0)
+        if hashlib.file_digest(dst, "sha256").hexdigest() != image["archiveSha256"]:
             raise RuntimeError("existing-inbox-checksum-mismatch")
-        return
-    # O_EXCL 拒绝符号链接及并发覆盖；不自动删除失败副本，保留供管理员核对。
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as dst, (root / image["file"]).open("rb") as src:
-        shutil.copyfileobj(src, dst, 1024 * 1024)
-        dst.flush()
+        def same_inode():
+            current = target.lstat()
+            retained = os.fstat(dst.fileno())
+            if not stat.S_ISREG(current.st_mode) or retained.st_nlink != 1 or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise RuntimeError("inbox-path-replaced")
+        same_inode()
+        set_broker_read_acl(dst.fileno(), broker_uid)
+        same_inode()
         os.fsync(dst.fileno())
-    if digest(target) != image["archiveSha256"]:
-        raise RuntimeError("staged-image-checksum-mismatch")
 
 
 def main():
@@ -125,9 +166,7 @@ def main():
     for role in IMAGE_ROLES:
         image = manifest["images"][role]
         inbox = Path("/var/lib/kaguya-tools-storage/containers/inbox")
-        stage_image(root, image, inbox)
-        # 文件归受信用户所有且初始 0600；只给 broker 专用账户读权限，不开放其他用户。
-        subprocess.run(["setfacl", "-m", "u:kaguya-tools:r--", str(inbox / (image["archiveSha256"] + ".oci"))], check=True)
+        stage_image(root, image, inbox, pwd.getpwnam("kaguya-tools").pw_uid)
         result = rpc("image.import", {"sha256": image["archiveSha256"]})
         if result != {"imported": True, "archiveSha256": image["archiveSha256"]}:
             raise RuntimeError("image-import-unconfirmed")

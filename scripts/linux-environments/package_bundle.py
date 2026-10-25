@@ -40,6 +40,8 @@ def package(root, artifacts, output, sha):
             raise RuntimeError("bundle-archive-identity-invalid")
         images[role] = {"file": archive.name, "archiveSha256": checksum,
                         "image": "localhost/kaguya-" + role + "@" + image_digest}
+    if receipt.get("imageDigest") != images["gui"]["image"].split("@", 1)[1]:
+        raise RuntimeError("bundle-receipt-image-mismatch")
     output.mkdir(parents=False, exist_ok=False)
     manifest = {"version": 1, "commit": sha, "workflowRun": run["html_url"], "sources": {}, "images": images}
     source = root / "scripts/linux-environments"

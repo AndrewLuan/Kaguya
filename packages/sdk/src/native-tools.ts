@@ -122,8 +122,18 @@ export const nativeToolOriginCancelledInformationKind = defineInformationKind({
   references: refs,
   log: { enabled: false },
 });
+export const nativeToolCancellationForwardedInformationKind =
+  defineInformationKind({
+    kind: "agent.heavy.tool.cancel.forwarded.v1",
+    displayName: "工具取消已转发",
+    description: "下游取消请求已完成转发；这不证明外部物理效果被撤回。",
+    payloadSchema: z.object({ originKey: id }).strict(),
+    references: refs,
+    log: { enabled: false },
+  });
 export const nativeToolInformationKinds = [
   nativeToolOriginCancelledInformationKind,
+  nativeToolCancellationForwardedInformationKind,
   nativeToolRunInformationKind,
   nativeToolStepInformationKind,
   nativeToolResultInformationKind,

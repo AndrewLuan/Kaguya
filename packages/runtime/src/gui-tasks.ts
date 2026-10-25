@@ -2,12 +2,14 @@
  * 功能概述：管理 API 的独立 agent.gui.execute 入口，复用现有 reliable runner 与 NativeToolLoop。
  * submit 以环境和客户端 UUID 去重，并由宿主选择有效观察、模型路由与环境代际；read 查询同一来源。
  * cancel 与 NativeToolStore 的 open/admission 共锁，覆盖未创建 run 的取消，随后转发既有取消协议。
+ * pending/forwarded 取消事实独立于任务终态；同一可靠队列重试转发，任务停止不吞掉控制请求。
  * durable handler 重启后读取同一来源及 run；HTTP 连接不拥有执行生命周期，不创建第二套调度器。
  * 配置/环境变化停止任务，普通模块不能通过本类选择路由；输出只返回公开身份和实际终态。
  */
 import type { KaguyaDatabase } from "@kaguya/database";
 import type { InformationCore } from "@kaguya/engine";
 import { z, type InformationAtom, type DeepReadonly } from "@kaguya/schema";
+import { nativeToolOriginCancelledInformationKind } from "@kaguya/sdk";
 import { guiTaskRequestedKind, guiTaskTerminalKind } from "./gui-task-kinds.js";
 import { runtimeContextInformationKind } from "./information-kinds.js";
 import { nativeToolOrigin, type NativeToolLoop } from "./native-tool-loop.js";
@@ -60,6 +62,19 @@ export class GuiTaskService {
   ) {
     deps.core.onDurable(namespace, guiTaskRequestedKind, (atom) =>
       this.execute(atom),
+    );
+    deps.core.onDurable(
+      namespace + ".cancel",
+      nativeToolOriginCancelledInformationKind,
+      async (atom) => {
+        const id = atom.references.find(
+          (r) => r.relation === "core:uses-context",
+        )?.informationId;
+        const source = id ? await deps.core.get(id) : undefined;
+        if (source?.kind === guiTaskRequestedKind.kind)
+          await this.forwardCancellation(source as Requested);
+      },
+      { retryForever: true, retryDelayMs: 1000 },
     );
   }
   private async slot(type: string, key: string, group = namespace) {
@@ -233,6 +248,25 @@ export class GuiTaskService {
       },
     );
   }
+  private async forwardCancellation(source: Requested) {
+    const request = await this.request(source),
+      origin = nativeToolOrigin(request);
+    const pending = await this.deps.db.nativeTools.cancellation(origin);
+    if (pending?.state !== "pending") return;
+    const run = await this.deps.db.nativeTools.byOrigin(origin);
+    if (run)
+      await this.deps.loop.cancel(
+        run.run_id,
+        pending.requestedInformationId,
+        "cancelled",
+        true,
+      );
+    await this.deps.db.nativeTools.cancellationForwarded(
+      origin,
+      request.contextInformationId,
+      this.deps.core.executionClaim,
+    );
+  }
   private async execute(source: Requested) {
     if (
       (
@@ -243,6 +277,7 @@ export class GuiTaskService {
       )?.informationId !== source.informationId
     )
       throw new Error("gui-task-origin-unapproved");
+    await this.forwardCancellation(source);
     if (await this.slot("terminal", source.informationId)) return;
     const request = await this.request(source);
     const p = source.payload,
@@ -263,12 +298,7 @@ export class GuiTaskService {
         nativeToolOrigin(request),
         request.contextInformationId,
       );
-      if (run)
-        await this.deps.loop.cancel(
-          run.run_id,
-          source.informationId,
-          "unavailable",
-        );
+      if (run) await this.forwardCancellation(source);
       await this.terminal(source, "stopped", "environment-unavailable");
       return;
     }
@@ -351,11 +381,15 @@ export class GuiTaskService {
       runInformationId: run?.run_id ?? null,
       status: result?.status ?? (run ? "running" : "queued"),
       terminal: result,
+      cancellation: await this.deps.db.nativeTools.cancellation(
+        nativeToolOrigin(request),
+      ),
     };
   }
   async cancel(environmentId: string, taskRequestId: string) {
     const source = await this.source(environmentId, taskRequestId);
     if (!source) throw new Error("gui-task-not-found");
+    await this.forwardCancellation(source);
     if (await this.slot("terminal", source.informationId))
       return this.read(environmentId, taskRequestId);
     const request = await this.request(source);
@@ -369,8 +403,8 @@ export class GuiTaskService {
         : undefined;
       if (stopped?.payload.reason !== "cancelled")
         return this.read(environmentId, taskRequestId);
-      await this.deps.loop.cancel(run.run_id, source.informationId);
     }
+    await this.forwardCancellation(source);
     await this.terminal(source, "stopped", "cancelled");
     return this.read(environmentId, taskRequestId);
   }

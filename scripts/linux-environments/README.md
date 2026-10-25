@@ -87,7 +87,7 @@ supervisor 在放行 argv 前设置 systemd 运行上限和日历截止 timer，
 
 文件 verify 在 broker journal 中核对原 operation 存在且 scope/environment/workspace/attempt 匹配，返回 `verificationKind=current-file-state`。hash 证明核验时的文件内容；原操作引用提供身份关联，不自动证明文件由该命令造成。workspace 文件由固定宿主程序经 rootless `podman unshare` 逐级 openat/O_NOFOLLOW 读取，拒绝符号链接与非普通文件，不执行 workspace 中的代码。
 
-本变更增加两份宿主模块，必须随最终审定的 bootstrap bundle 一起安装。旧 `9fd7bae` staging 暂缓执行，不能仅导入新镜像配旧 broker。由协调 chat 汇总 W7/W8 宿主改动后制作一次性安装包；本分支不覆盖旧 staging 或执行生产安装。已安装环境升级前先停止 admission、核对所有旧 job 已结束；保留 journal/workspace/private 卷。旧 workspace `.kaguya-tools` 回执不作为新可信 manifest 导入，保留为历史文件。
+本变更增加两份宿主模块，必须随最终审定的 bootstrap bundle 一起安装。旧 `9fd7bae` staging 已废弃，不得执行，不能仅导入新镜像配旧 broker。由协调 chat 汇总 W7/W8 宿主改动后制作一次性安装包；本分支不覆盖旧 staging 或执行生产安装。已安装环境升级前先停止 admission、核对所有旧 job 已结束；保留 journal/workspace/private 卷。旧 workspace `.kaguya-tools` 回执不作为新可信 manifest 导入，保留为历史文件。
 
 ## 自检与验收
 

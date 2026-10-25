@@ -2,7 +2,7 @@
 
 本包对应 `manifest.json` 中的 Git SHA 和成功 CI run，包含完整宿主 broker、shell 监督程序、固定依赖清单、两份 Chromium seccomp 配置，以及 shell、Chromium、GUI 三份 OCI 镜像。`SHA256SUMS` 校验整个包；部署前还须核对交接消息中的 manifest SHA-256。实际执行入口为 `install_bundle.py`，特权系统变更全部复用包内的 `bootstrap.py`。
 
-在 **Ubuntu 26.04 x86_64 本机终端**以 `andrew` 登录，将整个包放到新目录。保留旧 staging，不覆盖已有安装包。先审阅 `HOST-DETAILS.md`、`TOOLS-DETAILS.md`、代码和依赖清单；父会话的独立安装审查通过后执行：
+在 **Ubuntu 26.04 x86_64 本机终端**以 `andrew` 登录，将整个包放到新目录。旧 `9fd7bae` 安装包已废弃，不得执行；保留旧 staging 供核对，不覆盖已有安装包。先审阅 `HOST-DETAILS.md`、`TOOLS-DETAILS.md`、代码和依赖清单；父会话的独立安装审查通过后执行：
 
 ```bash
 sha256sum -c SHA256SUMS
