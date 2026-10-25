@@ -1,4 +1,5 @@
 /**
+ * 恢复先查持久原点，再校验当前批准策略；native 关闭或路由消失时不回落到普通模型请求。
  * 入站 expressions 仅透传给插件，Runtime 不推断表情含义或改变调度。
  * 授权消息正文由 composition 注入的渲染器提供；Runtime 只传冻结变量并维持权限检查。
  * Runtime 只接收 outboundAllowlist；目标授权与最终 transport 前终检使用它，入站权限属于 AdapterHost。
@@ -13,6 +14,8 @@
  * 代码库关系：依赖 Database、Core、ModuleHost 和平台适配契约；具体 Agent 列表与 LLM 模型绑定位于 apps composition root。
  * 输入输出与副作用：连接、迁移、账本写入和 transport I/O 均在生命周期内执行；close 拒绝新入口并停止可靠领取。
  * 数据库初始化错误脱敏；只关闭自行创建的连接。submit 的 deliveries 是当次实际收集快照，可靠链通常异步完成。
+ * guiTasks 仅向管理 Server 提供独立任务入口；私有 WeakMap 复用同一个 NativeToolLoop，模块不能提交 GUI 任务或 native 内部字段。
+ * nativeTools 可选注入宿主工具目录，经批准任务协调持久原生循环；独立 route 不替换 Heavy 全局模型。
  * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
  * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
  * 模块只通过 #76 的 context.use 获得通用能力。缺少批准或无效 capability 在任何 create 前拒绝。
@@ -20,30 +23,12 @@
  * Runtime 过滤旧检索策略，不创建稀疏、向量或认知工作者。
  * inspectModules 仅在 started 状态返回模块声明、版本、Kind、Prompt 和能力绑定的只读投影。
  * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
+ * 启动注入数据库 observationCapability，Memory 热重载保留同一绑定；观察端口不改变平台投递和 Memory 发布的状态拥有者。
  */
-/**
- * 入站 expressions 仅透传给插件，Runtime 不推断表情含义或改变调度。
- * 授权消息正文由 composition 注入的渲染器提供；Runtime 只传冻结变量并维持权限检查。
- * Runtime 只接收 outboundAllowlist；目标授权与最终 transport 前终检使用它，入站权限属于 AdapterHost。
- * 为 Router 注入 conversation/route 窄能力，结构化候选由宿主冻结，自动跨会话投递继续经过最终授权检查。
- * close({ drain: true }) 用于热应用：停止调度与 claim 领取，允许已领取任务有界完成，
- * 然后 abort/清理旧宿主；外部注入的数据库保持打开，可供下一 Runtime 复用。
- * createRuntimeKindRegistry 冻结完整 Kind（包括兼容读取版本），供数据库预检与 Runtime 共享；moduleLifecycle 注入真实插件 fiber。
- * 功能概述：以 PostgreSQL information ledger 装配通用 Runtime，接受显式 Catalog、activations 和宿主 capabilities。
- * 主要职责：start 注册完整 kind 并预检模块，最后开放 ingress；submit 持久化 context/inbound 后返回接受凭据；
- * 最终发送前使用当前出站 GatewayAllowlist 校验目的地，拒绝时只记录安全失败码和目标类型。
- * 平台投递使用 durable subscription，终态唯一槽避免重放再次落账，已有终态时不重复调用 transport。
- * 代码库关系：依赖 Database、Core、ModuleHost 和平台适配契约；具体 Agent 列表与 LLM 模型绑定位于 apps composition root。
- * 输入输出与副作用：连接、迁移、账本写入和 transport I/O 均在生命周期内执行；close 拒绝新入口并停止可靠领取。
- * 数据库初始化错误脱敏；只关闭自行创建的连接。submit 的 deliveries 是当次实际收集快照，可靠链通常异步完成。
- * Model Task 由 composeModelTaskCapabilities 注入批准的 ModelTaskClient；ApprovedModelTaskClient
- * 校验宿主 activation/tier 白名单，provider、resolver、Core 与 approval 数据均保存在私有字段，
- * 模块只通过 #76 的 context.use 获得通用能力。缺少批准或无效 capability 在任何 create 前拒绝。
- * 原始事件 Memory 常开；可选 Memory 开关只装配额外的入站文档、稀疏索引与召回能力。
- * Runtime 过滤旧检索策略，不创建稀疏、向量或认知工作者。
- * inspectModules 仅在 started 状态返回模块声明、版本、Kind、Prompt 和能力绑定的只读投影。
- * ModuleHost observation 在这里映射到 lifecycle/module 命名空间，持久 Atom 单独进入 information logger。
- */
+import {
+  nativeToolInformationKinds,
+  actionDecisionInformationKind,
+} from "@kaguya/sdk";
 import {
   MessageTargetService,
   type AuthorizedMessagePromptRenderer,
@@ -111,7 +96,18 @@ import type {
   OutboundMessageContent,
   PlatformDestination,
 } from "@kaguya/schema";
-import { defineInformationSelector } from "@kaguya/sdk";
+import { createNativeMemoryTools } from "./native-memory-tools.js";
+import {
+  NativeToolLoop,
+  type NativeToolLoopOptions,
+} from "./native-tool-loop.js";
+import { ActionExecutor, type ActionExecutorOptions } from "./action.js";
+import {
+  actionCapability,
+  actionRunValidityCapability,
+  type ActionProvider,
+} from "@kaguya/sdk";
+import { defineInformationSelector, observationCapability } from "@kaguya/sdk";
 import type {
   InformationKindDefinition,
   InformationModuleActivation,
@@ -137,9 +133,13 @@ import {
   modelTaskInformationKinds,
 } from "./information-kinds.js";
 
+import { GuiTaskService } from "./gui-tasks.js";
+const hostNativeLoops = new WeakMap<ModelTaskClient, NativeToolLoop>();
+
 export interface RuntimeModelTaskApproval {
   readonly activation: ModuleActivationProvenance;
   readonly selectionPolicy: ModelTaskRequest<unknown>["selectionPolicy"];
+  readonly taskId?: string;
 }
 export type RuntimeModelTaskOptions = Pick<
   ModelTaskClientOptions,
@@ -181,6 +181,12 @@ function isMemoryCapability(id: string): boolean {
 }
 
 type KaguyaRuntimeBaseOptions = {
+  readonly nativeTools?: NativeToolLoopOptions;
+  readonly actionProviders?: readonly ActionProvider[];
+  readonly actionEnvironment?: Pick<
+    ActionExecutorOptions,
+    "resolveLeaseCredential" | "validateEnvironment"
+  >;
   /** 由 composition 注入已选择 default/local 的授权消息渲染器。 */
   readonly authorizedMessagePromptRenderer?: AuthorizedMessagePromptRenderer;
   /** 当前生效的出站策略；未注入时非 Web 默认拒绝。 */
@@ -350,6 +356,14 @@ export class KaguyaRuntime implements InformationIngress {
   #hostCapabilities: readonly ModuleCapabilityImplementation[] = [];
   #memoryOptions: RuntimeMemoryOptions = { enabled: false };
   #nativeAccess: NativeMemoryAccess | undefined;
+  #guiTasks: GuiTaskService | undefined;
+  get guiTasks(): GuiTaskService | undefined {
+    return this.#state === "started" ? this.#guiTasks : undefined;
+  }
+  #actionExecutor: ActionExecutor | undefined;
+  get actions(): ActionExecutor {
+    return required(this.#actionExecutor, "action executor");
+  }
   #nativeFacade(access: NativeMemoryAccess): NativeMemoryAccess {
     this.#nativeAccess = access;
     return new Proxy(access, {
@@ -698,7 +712,52 @@ export class KaguyaRuntime implements InformationIngress {
             })
           : this.options.capabilities;
       const enabledSuppliedCapabilities = suppliedCapabilities ?? [];
+      await database.actions.recoverExpired();
+      if (
+        this.options.actionProviders?.some(
+          (p) => p.id === "core.native-memory",
+        ) ||
+        this.options.nativeTools?.registrations.some(
+          (t) => t.providerId === "core.native-memory",
+        )
+      )
+        throw new Error("Reserved native Memory provider");
+      const memoryTools =
+        this.options.nativeTools?.memory && memoryEnabled
+          ? createNativeMemoryTools(database)
+          : undefined;
+      const nativeOptions =
+        this.options.nativeTools && memoryTools
+          ? {
+              ...this.options,
+              nativeTools: {
+                ...this.options.nativeTools,
+                registrations: [
+                  ...this.options.nativeTools.registrations,
+                  ...memoryTools.registrations,
+                ],
+              },
+            }
+          : this.options;
+      this.#actionExecutor = new ActionExecutor({
+        store: database.actions,
+        providers: [
+          ...(this.options.actionProviders ?? []),
+          ...(memoryTools ? [memoryTools.provider] : []),
+        ],
+        core,
+        ...this.options.actionEnvironment,
+        onRecoveryError: () =>
+          this.#runtimeLogger?.error(
+            { event: "action.recovery.failed" },
+            "Action recovery failed; the next bounded scan will retry",
+          ),
+      });
+      this.#actionExecutor.startRecovery();
       const capabilities = [
+        { capability: actionCapability, value: this.#actionExecutor },
+        { capability: actionRunValidityCapability, value: database.actions },
+        { capability: observationCapability, value: database.observations },
         { capability: rawContextCapability, value: database.rawEvents },
         {
           capability: nativeMemoryCapability,
@@ -732,13 +791,29 @@ export class KaguyaRuntime implements InformationIngress {
           }),
         },
         ...composeModelTaskCapabilities(
-          this.options,
+          nativeOptions,
           { core, now: this.#now, oneShotSchedule },
           enabledSuppliedCapabilities,
+          { db: database, actions: this.#actionExecutor },
         ),
       ];
 
       this.#hostCapabilities = capabilities;
+      const modelClient = capabilities.find(
+        (c) => c.capability.id === modelTaskCapability.id,
+      )?.value;
+      const nativeLoop =
+        modelClient instanceof ModelTaskClient
+          ? hostNativeLoops.get(modelClient)
+          : undefined;
+      if (nativeLoop)
+        this.#guiTasks = new GuiTaskService({
+          db: database,
+          core,
+          loop: nativeLoop,
+          host: nativeOptions.nativeTools?.guiTasks,
+          activations: this.options.activations,
+        });
       this.#memoryOptions = this.options.memory ?? { enabled: false };
       const moduleHost = new ModuleHost({
         drainTimeoutMs: this.options.drainTimeoutMs ?? 5000,
@@ -867,6 +942,7 @@ export class KaguyaRuntime implements InformationIngress {
       this.#state === "starting" ? this.#startPromise : undefined;
     this.#state = "closing";
     this.#closePromise = (async () => {
+      await this.#actionExecutor?.close();
       // scheduler 必须先停止，随后再让 ModuleHost abort 正在等待的启动或 handler。
       await this.#oneShotScheduler?.stop().catch(() => undefined);
       if (options.drain) {
@@ -899,6 +975,11 @@ export class KaguyaRuntime implements InformationIngress {
     if (this.#cleanupPromise !== undefined) return this.#cleanupPromise;
     this.#cleanupPromise = (async () => {
       const failures: unknown[] = [];
+      try {
+        await this.#actionExecutor?.close();
+      } catch (error) {
+        failures.push(error);
+      }
       if (this.#rawProjectionTimer) clearInterval(this.#rawProjectionTimer);
       this.#rawProjectionTimer = undefined;
       if (this.#rawProjectionPromise)
@@ -1094,6 +1175,37 @@ export class KaguyaRuntime implements InformationIngress {
     )
       return;
     const context = uniqueContextReference(request);
+    const durableOutcome = await required(
+      this.#database,
+      "database",
+    ).actions.deliveryResult(request.informationId);
+    if (durableOutcome) {
+      if (durableOutcome.status === "succeeded")
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryDeliveredInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: deliveryDeliveredInformationKind.payloadSchema.parse(
+              durableOutcome.result,
+            ),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      else
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Recovered durable action result",
+          durableOutcome.evidence === "not-executed" ? "failed" : "unknown",
+        );
+      return;
+    }
     // Old versions had no started marker. A recovered delivery may already have
     // reached the platform, so an earlier lease is evidence of an unknown result.
     const attempts = await required(this.#database, "database").sql.query<{
@@ -1124,8 +1236,7 @@ export class KaguyaRuntime implements InformationIngress {
         request.payload.platform,
         request.payload.destination,
       ) ||
-      !targetAuthorized ||
-      !this.#messageTargets!.deliveryStillCurrent(request.informationId)
+      !targetAuthorized
     ) {
       await core.commitTerminal(
         "kaguya.delivery.result.v1",
@@ -1173,85 +1284,197 @@ export class KaguyaRuntime implements InformationIngress {
       throw error;
     }
 
-    const attemptId = randomUUID();
-    const started = await core.registerOnce(
-      "kaguya.delivery.started.v1",
+    const actionStore = required(this.#database, "database").actions;
+    const action = await actionStore.prepareDelivery(
       request.informationId,
-      deliveryStartedInformationKind,
-      {
-        occurredAt: this.#now().toISOString(),
-        source: "runtime:delivery",
-        payload: { attemptId },
-        references: [
-          { relation: "core:caused-by", informationId: request.informationId },
-          { relation: "core:context", informationId: context.informationId },
-        ],
-      },
+      core.executionClaim,
     );
-    if (started.payload.attemptId !== attemptId) {
-      await this.#registerDeliveryFailure(
-        request,
-        context.informationId,
-        "Delivery result is unknown after recovery",
-        "unknown",
-      );
+    const admission = await actionStore.admit(
+      action.intentId,
+      action.intent.scope,
+      300000,
+      core.executionClaim,
+    );
+    if (!admission.claim) {
+      if (
+        admission.view.state === "rejected" ||
+        admission.view.state === "cancelled" ||
+        admission.view.state === "superseded"
+      ) {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Action admission rejected",
+        );
+      } else {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Action result is unknown after recovery",
+          "unknown",
+        );
+      }
       return;
     }
-    let receipt: PlatformDeliveryReceipt;
+    const actionClaim = admission.claim;
     try {
-      receipt = await registration.transport.sendMessage(
-        request.payload.destination,
-        request.payload.message,
-        { rootInformationId: context.informationId },
+      const attemptId = actionClaim.attemptId;
+      const started = await core.registerOnce(
+        "kaguya.delivery.started.v1",
+        request.informationId,
+        deliveryStartedInformationKind,
+        {
+          occurredAt: this.#now().toISOString(),
+          source: "runtime:delivery",
+          payload: { attemptId },
+          references: [
+            {
+              relation: "core:caused-by",
+              informationId: request.informationId,
+            },
+            { relation: "core:context", informationId: context.informationId },
+          ],
+        },
       );
-    } catch (cause) {
-      await this.#registerDeliveryFailure(
-        request,
-        context.informationId,
-        "Platform transport result is unknown",
-        "unknown",
+      if (started.payload.attemptId !== attemptId) {
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Delivery result is unknown after recovery",
+          "unknown",
+        );
+        return;
+      }
+      let receipt: PlatformDeliveryReceipt;
+      const allowed = await actionStore.canInvoke(
+        actionClaim,
+        action.intent.scope,
       );
-      throw new OutboundTransportError(
-        request.payload.adapterId,
-        request.payload.platform,
-        cause,
-      );
-    }
+      if (
+        !allowed ||
+        !(
+          this.options.outboundAllowlist ?? new GatewayAllowlist()
+        ).allowsDestination(
+          request.payload.platform,
+          request.payload.destination,
+        ) ||
+        !this.#messageTargets!.deliveryStillCurrent(request.informationId)
+      ) {
+        await actionStore.finish(
+          actionClaim,
+          action.intent.scope,
+          {
+            status: "cancelled",
+            evidence: "not-executed",
+            result: { reason: "delivery-authority-changed" },
+            artifacts: [],
+            truncated: false,
+          },
+          false,
+          core.executionClaim,
+        );
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Delivery authority changed before transport",
+        );
+        return;
+      }
+      core.executionSignal?.throwIfAborted();
+      try {
+        receipt = await registration.transport.sendMessage(
+          request.payload.destination,
+          request.payload.message,
+          { rootInformationId: context.informationId },
+        );
+      } catch (cause) {
+        await actionStore.finish(
+          actionClaim,
+          action.intent.scope,
+          {
+            status: "unknown",
+            evidence: "unconfirmed",
+            result: { reason: "transport-unconfirmed" },
+            artifacts: [],
+            truncated: false,
+          },
+          false,
+          core.executionClaim,
+        );
+        await this.#registerDeliveryFailure(
+          request,
+          context.informationId,
+          "Platform transport result is unknown",
+          "unknown",
+        );
+        throw new OutboundTransportError(
+          request.payload.adapterId,
+          request.payload.platform,
+          cause,
+        );
+      }
 
-    if (receipt.ok) {
-      await core.commitTerminal(
-        "kaguya.delivery.result.v1",
-        request.informationId,
-        deliveryDeliveredInformationKind,
+      await actionStore.finish(
+        actionClaim,
+        action.intent.scope,
         {
-          occurredAt: this.#now().toISOString(),
-          source: "runtime:delivery",
-          payload: safeDeliveredPayload(receipt),
-          references: deliveryResultReferences(
-            request.informationId,
-            context.informationId,
-          ),
+          status: receipt.ok
+            ? "succeeded"
+            : receipt.outcome === "rejected-before-effect"
+              ? "rejected"
+              : "unknown",
+          evidence: receipt.ok
+            ? "effect-verified"
+            : receipt.outcome === "rejected-before-effect"
+              ? "not-executed"
+              : "unconfirmed",
+          result: receipt.ok
+            ? safeDeliveredPayload(receipt)
+            : safeFailedDeliveryPayload(receipt),
+          artifacts: [],
+          truncated: false,
         },
+        false,
+        core.executionClaim,
       );
-    } else {
-      await core.commitTerminal(
-        "kaguya.delivery.result.v1",
-        request.informationId,
-        deliveryFailedInformationKind,
-        {
-          occurredAt: this.#now().toISOString(),
-          source: "runtime:delivery",
-          payload: safeFailedDeliveryPayload(receipt),
-          references: deliveryResultReferences(
-            request.informationId,
-            context.informationId,
-          ),
-        },
-      );
+      await actionStore.acknowledge(action.intentId, action.intent.scope);
+      if (receipt.ok) {
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryDeliveredInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: safeDeliveredPayload(receipt),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      } else {
+        await core.commitTerminal(
+          "kaguya.delivery.result.v1",
+          request.informationId,
+          deliveryFailedInformationKind,
+          {
+            occurredAt: this.#now().toISOString(),
+            source: "runtime:delivery",
+            payload: safeFailedDeliveryPayload(receipt),
+            references: deliveryResultReferences(
+              request.informationId,
+              context.informationId,
+            ),
+          },
+        );
+      }
+      this.#deliveriesByContext
+        .get(context.informationId)
+        ?.push(safeRuntimeReceipt(receipt));
+    } finally {
+      await actionStore.release(actionClaim, action.intent.scope);
     }
-    this.#deliveriesByContext
-      .get(context.informationId)
-      ?.push(safeRuntimeReceipt(receipt));
   }
 
   async #registerDeliveryFailure(
@@ -1286,32 +1509,76 @@ export class KaguyaRuntime implements InformationIngress {
 
 class ApprovedModelTaskClient extends ModelTaskClient {
   readonly #approvals: readonly RuntimeModelTaskApproval[];
+  readonly #loop?: NativeToolLoop;
   constructor(
     options: ModelTaskClientOptions,
     approvals: readonly RuntimeModelTaskApproval[],
+    native?: {
+      db: KaguyaDatabase;
+      actions: ActionExecutor;
+      options: NativeToolLoopOptions;
+    },
   ) {
     super(options);
-    this.#approvals = approvals.map(({ activation, selectionPolicy }) => ({
-      activation: Object.freeze({ ...activation }),
-      selectionPolicy: Object.freeze(
-        modelTaskSelectionPolicySchema.parse(selectionPolicy),
-      ),
-    }));
+    if (native)
+      this.#loop = new NativeToolLoop({
+        ...native,
+        core: options.core,
+        resolveModel: (request) => {
+          if (!this.approved(request))
+            throw new Error("Unapproved native model route");
+          return options.resolveModel(request.selectionPolicy);
+        },
+        model: {
+          execute: (request) => super.execute(request),
+          cancel: (request) => super.cancel(request),
+        },
+      });
+    if (this.#loop) hostNativeLoops.set(this, this.#loop);
+    this.#approvals = approvals.map(
+      ({ activation, selectionPolicy, taskId }) => ({
+        ...(taskId ? { taskId } : {}),
+        activation: Object.freeze({ ...activation }),
+        selectionPolicy: Object.freeze(
+          modelTaskSelectionPolicySchema.parse(selectionPolicy),
+        ),
+      }),
+    );
   }
 
-  override execute<TOutput>(request: ModelTaskRequest<TOutput>) {
+  override cancel(request: import("./model-task.js").ModelTaskCancellation) {
+    return this.#loop
+      ? this.#loop.cancelRequest(request)
+      : super.cancel(request);
+  }
+  private approved(request: ModelTaskRequest<unknown>) {
+    return this.#approvals.some(
+      ({ activation, selectionPolicy, taskId }) =>
+        activation.instanceId === request.activation.instanceId &&
+        activation.definitionId === request.activation.definitionId &&
+        selectionPolicy.tier === request.selectionPolicy.tier &&
+        selectionPolicy.routeId === request.selectionPolicy.routeId &&
+        (!selectionPolicy.routeId || taskId === request.task.taskId) &&
+        (!taskId || taskId === request.task.taskId),
+    );
+  }
+  override async execute<TOutput>(request: ModelTaskRequest<TOutput>) {
+    if (request.task?.taskId === "agent.gui.execute")
+      throw new Error("GUI tasks require the host management entry");
+    if (request.nativeStep || request.nativeModelBinding)
+      throw new Error("Native step fields are reserved for the host");
+    // 恢复必须先查稳定原点；关闭 native 或删除路由不会降级成普通新请求。
     if (
-      !this.#approvals.some(
-        ({ activation, selectionPolicy }) =>
-          activation.instanceId === request.activation.instanceId &&
-          activation.definitionId === request.activation.definitionId &&
-          selectionPolicy.tier === request.selectionPolicy.tier,
-      )
+      request.task?.taskId &&
+      request.sourceInformationId &&
+      (await this.#loop?.existing(request))
     )
-      return Promise.reject(
-        new Error("Model task activation or policy is not approved"),
-      );
-    return super.execute(request);
+      return this.#loop!.execute(request);
+    if (!this.approved(request))
+      throw new Error("Model task activation or policy is not approved");
+    return this.#loop?.enabled(request)
+      ? this.#loop.execute(request)
+      : super.execute(request);
   }
 }
 
@@ -1319,6 +1586,7 @@ function composeModelTaskCapabilities(
   options: KaguyaRuntimeOptions,
   context: RuntimeCapabilityContext,
   supplied: readonly ModuleCapabilityImplementation[],
+  native?: { db: KaguyaDatabase; actions: ActionExecutor },
 ): readonly ModuleCapabilityImplementation[] {
   const capabilities = [...supplied];
   if (options.modelTask) {
@@ -1350,8 +1618,31 @@ function composeModelTaskCapabilities(
     capabilities.push({
       capability: modelTaskCapability,
       value: new ApprovedModelTaskClient(
-        { ...options.modelTask, ...context },
+        {
+          ...options.modelTask,
+          ...context,
+          ...(options.nativeTools?.readArtifact
+            ? { readNativeArtifact: options.nativeTools.readArtifact }
+            : {}),
+          ...(native
+            ? {
+                admitNativeDispatch: (id, step) =>
+                  native.db.nativeTools.admitModel(
+                    step.runInformationId,
+                    step.stepIndex,
+                    id,
+                    context.core.executionClaim,
+                  ),
+              }
+            : {}),
+        },
         approvals,
+        native
+          ? {
+              ...native,
+              options: options.nativeTools ?? { registrations: [], tasks: [] },
+            }
+          : undefined,
       ),
     });
   }
@@ -1425,6 +1716,8 @@ function createRegistry(
   for (const definition of [
     ...builtInInformationKinds,
     ...modelTaskInformationKinds,
+    ...nativeToolInformationKinds,
+    actionDecisionInformationKind,
     ...cadenceInformationKinds,
   ]) {
     registered.set(definition.kind, definition);
@@ -1463,6 +1756,8 @@ function collectDefinitions(
     [
       ...builtInInformationKinds,
       ...modelTaskInformationKinds,
+      ...nativeToolInformationKinds,
+      actionDecisionInformationKind,
       ...cadenceInformationKinds,
       ...oneShotInformationKinds,
       executionExhaustedInformationKind,
@@ -1525,6 +1820,9 @@ function safeFailedDeliveryPayload(receipt: PlatformDeliveryReceipt) {
     platform: receipt.platform,
     target: receipt.target,
     error: "Platform delivery failed",
+    ...(receipt.outcome === "rejected-before-effect"
+      ? {}
+      : { outcome: "unknown" as const }),
   };
 }
 
@@ -1533,6 +1831,7 @@ function safeRuntimeReceipt(
 ): PlatformDeliveryReceipt {
   return {
     ok: receipt.ok,
+    ...(receipt.outcome ? { outcome: receipt.outcome } : {}),
     adapterId: receipt.adapterId,
     platform: receipt.platform,
     target: receipt.target,

@@ -4,8 +4,15 @@
  * 主要职责：fixture 安装 Router 与受控模型能力；appendOpportunity/decide 构造通知与观察事实；
  * waitFor/settle 按 8 秒持久化预算等待事实或 durable 队列收敛，否定断言不依赖固定休眠。
  * 代码库关系：配合 planner.test.ts 的纯编译测试及 Server 的真实模型任务协议测试；不访问外部模型。
+ * 资源取得后立即登记清理；启动拒绝或 stop 失败时仍顺序释放全部资源并汇总错误。
  * 输入输出与副作用：每项测试使用独立数据库并在结束时关闭 Host/Core/数据库，保留精确输入水位与动作断言。
+ * 模型替身入口断言观察成功及持久 claim/run 已存在、行动意图尚未创建；观察能力使用真实数据库实现。
  */
+import { closeTestResources } from "../test-support/cleanup.js";
+import {
+  observationCapability,
+  actionRunValidityCapability,
+} from "@kaguya/sdk";
 import { afterEach, expect, it, vi } from "vitest";
 import { createTestingDatabase } from "@kaguya/database/testing";
 import {
@@ -78,18 +85,9 @@ const modelCancelled = terminal("core.model.task.cancelled", false);
 const modelTaskCapability = defineModuleCapability<
   import("../heavy/index.js").ModelTaskCapability
 >("kaguya:model-task", 1);
-const resources: Array<{
-  host: ModuleHost;
-  core: InformationCore;
-  database: Awaited<ReturnType<typeof createTestingDatabase>>;
-}> = [];
-
+const clean: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
-  for (const item of resources.splice(0).reverse()) {
-    await item.host.stop();
-    await item.core.close();
-    await item.database.close();
-  }
+  await closeTestResources(clean);
 });
 
 async function fixture(
@@ -97,19 +95,26 @@ async function fixture(
     action?: any;
     muted?: boolean;
     now?: string;
+    beforeExecute?: (
+      database: Awaited<ReturnType<typeof createTestingDatabase>>,
+    ) => Promise<void>;
   } = {},
 ) {
   const database = await createTestingDatabase();
+  clean.push(() => database.close());
   await database.prepareSchema();
-  const execute = vi.fn(async (request: any) => ({
-    status: "completed" as const,
-    output: options.action ?? {
-      action: "message",
-      reason: "respond",
-    },
-    requestedInformationId: "request",
-    terminalInformationId: request.sourceInformationId,
-  }));
+  const execute = vi.fn(async (request: any) => {
+    await options.beforeExecute?.(database);
+    return {
+      status: "completed" as const,
+      output: options.action ?? {
+        action: "message",
+        reason: "respond",
+      },
+      requestedInformationId: "request",
+      terminalInformationId: request.sourceInformationId,
+    };
+  });
   const promptTemplates = loadFirstPartyPromptTemplates();
   const moduleOptions = {
     rawContextCapability,
@@ -157,11 +162,14 @@ async function fixture(
     now,
     nextInformationId: () => `router-${++sequence}`,
   });
+  clean.push(() => core.close());
   const host = new ModuleHost({
     core,
     catalog,
     now,
     capabilities: [
+      { capability: observationCapability, value: database.observations },
+      { capability: actionRunValidityCapability, value: database.actions },
       { capability: rawContextCapability, value: database.rawEvents },
       {
         capability: modelTaskCapability,
@@ -173,6 +181,7 @@ async function fixture(
       },
     ],
   });
+  clean.push(() => host.stop());
   await core.start();
   await host.start(
     [module, situation].map((definition) => ({
@@ -187,7 +196,6 @@ async function fixture(
       },
     })),
   );
-  resources.push({ host, core, database });
   return { core, database, execute };
 }
 
@@ -499,6 +507,7 @@ async function all(database: any) {
   });
 }
 
+// 单次状态等待 8s；双阶段用例 25s，双轮加清空 45s，新屏障用例 30s；不重复计算 decide 已确认的 context。
 const PERSISTENCE_WAIT = { timeout: 8000, interval: 20 } as const;
 async function settle(
   database: Awaited<ReturnType<typeof createTestingDatabase>>,
@@ -516,6 +525,54 @@ async function waitFor(database: any, kind: string) {
     return atom;
   }, PERSISTENCE_WAIT);
 }
+
+it("persists the observation and run identity before model execution can create an intent", async () => {
+  let checked = false;
+  const f = await fixture({
+    action: { action: "silent", reason: "no-response-needed" },
+    beforeExecute: async (database) => {
+      const atoms = await all(database);
+      const completed = atoms.find(
+        (a: any) => a.kind === "agent.observation.completed.v1",
+      );
+      expect(completed).toBeDefined();
+      const page = await database.observations.read(
+        String(completed.payload.observationId),
+      );
+      expect(page?.status).toBe("completed");
+      expect(page?.complete).toBe(true);
+      expect(page?.manifest?.runInformationId).toBe(
+        completed.payload.runInformationId,
+      );
+      const frozen = atoms.find(
+        (a: any) => a.informationId === page?.manifest?.frozenInformationId,
+      );
+      const turn = atoms.find(
+        (a: any) => a.informationId === frozen?.payload.turnInformationId,
+      );
+      expect(turn?.payload.claimInformationId).toBe(
+        page?.manifest?.runInformationId,
+      );
+      expect(
+        atoms.some(
+          (a: any) => a.informationId === page?.manifest?.runInformationId,
+        ),
+      ).toBe(true);
+      expect(
+        atoms.filter(
+          (a: any) => a.kind === messageIntentRequestedInformationKind.kind,
+        ),
+      ).toHaveLength(0);
+      checked = true;
+    },
+  });
+  const opportunity = await appendOpportunity(f.core, {
+    texts: ["first input"],
+  });
+  await decide(f.core, opportunity.candidate, "observe");
+  await settle(f.database);
+  expect(checked).toBe(true);
+}, 25000);
 
 it("freezes before attention and defer does not call Light or advance progress", async () => {
   const { core, database, execute } = await fixture();
@@ -538,7 +595,7 @@ it("freezes before attention and defer does not call Light or advance progress",
     ),
   ).toBe(true);
   expect(execute).not.toHaveBeenCalled();
-});
+}, 25000);
 
 it("freezes exactly the registration-watermark window before observe", async () => {
   const { core, database } = await fixture({
@@ -566,7 +623,7 @@ it("freezes exactly the registration-watermark window before observe", async () 
     opportunity.unread.at(-1)!.informationId,
   );
   await waitFor(database, turnSilentInformationKind.kind);
-});
+}, 25000);
 
 it("processes a later registered opportunity with an earlier event time after a completed turn", async () => {
   const { core, database, execute } = await fixture({
@@ -603,7 +660,7 @@ it("processes a later registered opportunity with an earlier event time after a 
     atoms.filter((atom: any) => atom.kind === "agent.router.turn.superseded"),
   ).toHaveLength(0);
   expect(execute).toHaveBeenCalledTimes(2);
-});
+}, 45000);
 
 it("waits for Identity terminal before freezing the observed batch", async () => {
   const { core, database } = await fixture({
@@ -627,7 +684,7 @@ it("waits for Identity terminal before freezing the observed batch", async () =>
   );
   await waitFor(database, turnContextCompletedInformationKind.kind);
   await decide(core, opportunity.candidate, "observe");
-});
+}, 25000);
 
 it("keeps the earlier frozen input unchanged when attention receives a newer Focus lease", async () => {
   const { core, database } = await fixture({
@@ -689,20 +746,24 @@ it.each([
     { action: "silent", reason: "no-response-needed" },
     turnSilentInformationKind.kind,
   ],
-] as const)("keeps Light ownership of %s", async (action, expectedKind) => {
-  const { core, database } = await fixture({ action });
-  const opportunity = await appendOpportunity(core, {
-    texts: ["planner input"],
-  });
-  await decide(core, opportunity.candidate, "observe");
-  await waitFor(database, expectedKind);
-  if (action.action === "wait")
-    expect(
-      (await all(database)).some(
-        (atom: any) => atom.kind === waitRequestedInformationKind.kind,
-      ),
-    ).toBe(true);
-});
+] as const)(
+  "keeps Light ownership of %s",
+  async (action, expectedKind) => {
+    const { core, database } = await fixture({ action });
+    const opportunity = await appendOpportunity(core, {
+      texts: ["planner input"],
+    });
+    await decide(core, opportunity.candidate, "observe");
+    await waitFor(database, expectedKind);
+    if (action.action === "wait")
+      expect(
+        (await all(database)).some(
+          (atom: any) => atom.kind === waitRequestedInformationKind.kind,
+        ),
+      ).toBe(true);
+  },
+  25000,
+);
 
 it("applies mute after observe and opens Focus only from a direct group signal", async () => {
   const muted = await fixture({ muted: true });
@@ -722,4 +783,72 @@ it("applies mute after observe and opens Focus only from a direct group signal",
     startedAt: "2026-09-22T08:00:10.000Z",
     expiresAt: "2026-09-22T08:02:10.000Z",
   });
-});
+}, 25000);
+
+it.each([false, true])(
+  "preserves work on unrelated input and rejects a persistently invalidated late decision (%s)",
+  async (invalidate) => {
+    let modelEntered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = await fixture({
+      beforeExecute: async () => {
+        modelEntered = true;
+        await gate;
+      },
+    });
+    // closeTestResources 按逆序清理，先释放模型屏障，避免失败污染 Host/Core shutdown。
+    clean.push(async () => {
+      release();
+    });
+    const op = await appendOpportunity(f.core, { texts: ["正在处理的任务"] });
+    await decide(f.core, op.candidate, "observe");
+    try {
+      await vi.waitFor(() => expect(modelEntered).toBe(true), PERSISTENCE_WAIT);
+      const turn = (
+        await f.core.select(routerStateSelector, op.candidate.informationId)
+      ).find((a) => a.kind === turnContextCompletedInformationKind.kind)!;
+      const incoming = await f.core.register(inboundTextInformationKind, {
+        occurredAt: new Date().toISOString(),
+        source: "test:interjection",
+        payload: {
+          text: "无关插话",
+          source: {
+            ...(op.inputs[0]!.payload.source as any),
+            platformMessageId: "later",
+          },
+        },
+        references: [
+          { relation: "core:context", informationId: op.context.informationId },
+        ],
+      });
+      if (invalidate) {
+        const s = turn.payload.source as any,
+          d = s.destination;
+        await f.database.actions.invalidateRun(
+          String(turn.payload.claimInformationId),
+          JSON.stringify([
+            s.platform,
+            s.adapterId,
+            d.kind,
+            d.userId ?? d.groupId ?? d.conversationId ?? null,
+          ]),
+          incoming.informationId,
+        );
+      }
+      release();
+      await settle(f.database);
+      const all = await f.database.information.find({
+        kinds: [messageIntentRequestedInformationKind.kind],
+        limit: 100,
+      });
+      expect(all).toHaveLength(invalidate ? 0 : 1);
+      expect(f.execute).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+    }
+  },
+  30000, // 初始化、8s 模型入口、8s 持久清空和资源清理共享总预算。
+);

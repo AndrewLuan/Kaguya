@@ -1,3 +1,8 @@
+/**
+ * 功能概述：声明 native Memory 来源、形成、修订、重试及观察确认的事实契约。
+ * 主要职责：formationSchemaFor 按持久 cutoff 选择输出协议，既有无 cutoff 请求保持原 v1 schema。
+ * 代码库关系：模块生产事实，database 核验其原始来源、冻结输入与完成依据；schema 本身无 I/O。
+ */
 import { memorySourceSchema } from "@kaguya/memory";
 import { personEvidenceSchema, z } from "@kaguya/schema";
 import { defineInformationKind } from "@kaguya/sdk";
@@ -101,3 +106,57 @@ export const nativeMemoryRetry = defineInformationKind({
   references: { "core:context": { required: true, multiple: false } },
   log: { enabled: false },
 });
+
+export const nativeMemorySource = defineInformationKind({
+  kind: "memory.native.source.v1",
+  displayName: "Memory 正规来源",
+  description: "epoch 后原始证据的持久正规化证明，保留原文及成功投递引用。",
+  payloadSchema: z
+    .object({
+      source: z.record(z.string(), z.json()),
+      text: z.string(),
+      originalInformationId: z.string(),
+      memorySource: memorySourceSchema,
+    })
+    .strict(),
+  references: { "core:uses-context": { required: true, multiple: false } },
+  log: { enabled: false },
+});
+export const nativeMemoryObservationCompleted = defineInformationKind({
+  kind: "memory.native.observation.completed.v1",
+  displayName: "Memory 来源消费完成",
+  description: "以持久成功形成终态确认正规来源页，不越过失败缺口。",
+  payloadSchema: z
+    .object({ observationId: z.string(), operationId: z.string() })
+    .strict(),
+  references: {
+    "core:caused-by": { required: true, multiple: false },
+    "core:context": { required: true, multiple: false },
+    "core:uses-context": { required: true, multiple: true },
+  },
+  log: { enabled: false },
+});
+
+/** 新冻结使用明确经历状态；既有无 cutoff 请求继续使用原 output schema 和模型指纹。 */
+export const revisableFormationOutputSchema = formationOutputSchema.extend({
+  nodes: z
+    .array(
+      formationOutputSchema.shape.nodes.element.extend({
+        experience: z
+          .object({
+            state: z.enum(["open", "sealed"]),
+            policyVersion: z.literal("experience.v1"),
+          })
+          .strict()
+          .optional(),
+      }),
+    )
+    .max(24),
+});
+
+/** 以持久冻结字段选择协议；旧 v1 请求永远保持原模型输出 schema。 */
+export function formationSchemaFor(existing: { cutoff?: unknown }) {
+  return existing.cutoff
+    ? revisableFormationOutputSchema
+    : formationOutputSchema;
+}
