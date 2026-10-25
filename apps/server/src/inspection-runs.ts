@@ -171,6 +171,12 @@ export function runInspection(d: DomainReader) {
           );
           const p = object(result?.payload),
             receipt = p.receiptId ? await r.fact(p.receiptId) : undefined;
+          const declaration = list(row.spec.declarations).find(
+            (x) => x.wireName === c.call.toolName,
+          );
+          const decision = action
+            ? await r.fact(action.input.decisionInformationId)
+            : undefined;
           let valid =
             completed?.kind === "core.model.task.completed" &&
             completed.payload.nativeStep?.runInformationId === id &&
@@ -188,7 +194,25 @@ export function runInspection(d: DomainReader) {
               action &&
               action.input.runInformationId ===
                 row.spec.actionRunInformationId &&
-              action.input.toolCallId === c.call_id;
+              action.input.toolCallId === c.call_id &&
+              action.input.operationId ===
+                `native:${id}:${c.step_index}:${c.call_index}:${actionDigest(c.call_id)}` &&
+              action.input.toolName === declaration?.id &&
+              actionDigest(action.input.arguments) ===
+                actionDigest(c.call.input) &&
+              action.input.dependencies.observationId ===
+                row.spec.observationId &&
+              action.input.dependencies.evidenceInformationId ===
+                c.completed_id &&
+              decision?.kind === "agent.action.decision.v1" &&
+              decision.payload.observationId === row.spec.observationId &&
+              decision.payload.domain === "tool" &&
+              hasReference(decision, c.completed_id, "core:uses-context") &&
+              hasReference(
+                decision,
+                row.spec.actionRunInformationId,
+                "core:uses-context",
+              );
           if (result)
             valid =
               valid &&
@@ -203,7 +227,7 @@ export function runInspection(d: DomainReader) {
               valid &&
               receipt &&
               action &&
-              verifiedReceipt(receipt, action) &&
+              (await verifiedReceipt(r, receipt, action, q.scope)) &&
               hasReference(result, receipt.id, "core:uses-context") &&
               (actionDigest(p.value) ===
                 actionDigest({
@@ -219,9 +243,6 @@ export function runInspection(d: DomainReader) {
                   }));
           if (result && action && !p.receiptId)
             valid = valid && action.state === "queued";
-          const declaration = list(row.spec.declarations).find(
-            (x) => x.wireName === c.call.toolName,
-          );
           calls.push({
             stepIndex: c.step_index,
             callIndex: c.call_index,

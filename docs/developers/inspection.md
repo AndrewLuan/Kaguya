@@ -35,7 +35,7 @@ description: 观察、原生工具循环、行动、Memory 历史与环境控制
 
 模型完成、工具结果、任务停止和取消转发分别展示。`dispatched-without-terminal` 来自保存的 typed `reasonCode`；`model-outcome-unknown` 保留未知语义。请求的 `contextTrimming` 原样给出测量方式、省略段数和字节预算，缺失时为 null。该统计测量追加当前 Prompt 之前的 native message array，不代表完整请求体大小。
 
-**`GET /actions` 与 `/actions/:id`** — 返回原 intent、当前状态、原执行与 reconciliation 回执、取消引用和经过匹配的迟到 MCP 证据。receipt 验证 kind、原 intent、attempt 和结果摘要；迟到数据还核对 scope、连接及定义版本、transport generation、类型化 RPC 身份与原操作关联。拒绝的候选计入 `rejectedEvidenceCount`。迟到数据本身不会把 unknown/partial 改为成功。
+**`GET /actions` 与 `/actions/:id`** — 返回原 intent、当前状态、原执行与 reconciliation 回执、取消引用和经过匹配的迟到 MCP 证据。receipt 复用正式行动回执证明，验证注册身份、kind、原 intent、attempt、started 引用与结果摘要；GUI 回执还验证 artifact 归属、generation、哈希和图像元数据。迟到数据还核对 scope、连接及定义版本、transport generation、类型化 RPC 身份与原操作关联。拒绝的候选计入 `rejectedEvidenceCount`。迟到数据本身不会把 unknown/partial 改为成功。
 
 native run 最多返回 32 个步骤与 128 个调用，行动最多返回 100 个回执和 100 条迟到证据；每组独立标记截断。`admittedSteps`、`registeredCalls` 和 `projectedOutputBytes` 是持久预算计数，不是成功次数。
 
@@ -65,4 +65,4 @@ GUI clean 说明输入进程与 X11 清理完成；文件哈希验证说明当�
 
 引用最多显示 100 项，并给出 `available`、`missing-or-denied` 或 `invalid` 等状态。缺失、跨 scope、旧记录证明缺失、正文省略和数组截断分别表达，不用空正文冒充没有历史。数据库驱动异常不会进入 HTTP 错误正文。
 
-测试通过真实 HTTP 路由在独立 PGlite 与 PostgreSQL schema 上检查只读事务、认证、窗口与过滤、来源证明、结果配对和内容清理。fixture 先等待写入完成再读取，退出时等待应用及数据库关闭；测试不调用外部模型或生产服务。
+测试通过真实 HTTP 路由在独立 PGlite 与 PostgreSQL schema 上检查只读事务、认证、窗口与过滤、来源证明、结果配对和内容清理。领域 fixture 直接构造持久事实，验证读取投影与证明边界；完整生产写入链路另行验收。fixture 先等待写入完成再读取，退出时尝试关闭全部应用及数据库，再汇总清理错误；测试不调用外部模型或生产服务。

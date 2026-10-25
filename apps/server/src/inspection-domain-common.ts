@@ -316,6 +316,20 @@ export class DomainReader {
     if (!this.database)
       throw new InspectionDomainError(503, "inspection_unavailable");
     const q = parse(querySchema, input);
+    if (
+      binding === "observations" ||
+      binding === "progress" ||
+      binding.startsWith("observation:")
+    ) {
+      try {
+        const value = z
+          .tuple([identifier, identifier, identifier, identifier.nullable()])
+          .parse(JSON.parse(q.scope));
+        if (JSON.stringify(value) !== q.scope) throw new Error();
+      } catch {
+        throw new InspectionDomainError(400, "invalid_inspection_request");
+      }
+    }
     const filter = JSON.stringify([binding, q.scope, q.consumerId ?? null]);
     let saved: z.infer<typeof cursorSchema> | undefined;
     if (q.cursor) {

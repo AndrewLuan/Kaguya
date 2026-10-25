@@ -4,10 +4,14 @@
  * late evidence 必须匹配 scope、连接版本、类型化 RPC 与原操作身份，不会修改 unknown/partial。
  * 代码库关系：inspection-domain 使用本模块，读取现有 action 表与 Information；返回内容统一清理。
  */
+import {
+  planNativeToolResults,
+  linuxGuiObservationSchema,
+} from "@kaguya/runtime";
 import { createHash } from "node:crypto";
 import {
-  actionDigest,
   type InspectionFact,
+  type InspectionReader,
   type InspectionRow,
 } from "@kaguya/database";
 import {
@@ -37,21 +41,49 @@ export const actionSummary = (row: InspectionRow, at: string) => ({
   receiptId: row.receipt_id,
   cancellationId: row.cancellation_id,
 });
-export function verifiedReceipt(f: InspectionFact, row: InspectionRow) {
-  const p = f.payload;
-  return (
-    ["core.action.result.v1", "core.action.reconciled.v1"].includes(f.kind) &&
-    hasReference(f, row.intent_id, "core:uses-context") &&
-    p.intentId === row.intent_id &&
-    p.attemptId === row.attempt_id &&
-    actionDigest(p.intent) === actionDigest(row.input) &&
-    p.resultHash ===
-      actionDigest({
-        result: p.outcome?.result,
-        artifacts: p.outcome?.artifacts,
-      })
-  );
+export async function verifiedReceipt(
+  r: InspectionReader,
+  f: InspectionFact,
+  row: InspectionRow,
+  scope: string,
+) {
+  const receipt = await r.receipt(f.id, scope);
+  if (!receipt || receipt.intentId !== row.intent_id) return false;
+  try {
+    planNativeToolResults([
+      {
+        toolCallId: receipt.intent.toolCallId ?? "",
+        toolName: receipt.intent.toolName,
+        toolId: receipt.intent.toolName,
+        intentId: receipt.intentId,
+        scope,
+        value: receipt.outcome,
+      },
+    ]);
+    const result = object(receipt.outcome.result);
+    if (
+      ["gui.observe", "gui.verify"].includes(receipt.intent.toolName) &&
+      result.image
+    ) {
+      const observation = linuxGuiObservationSchema.safeParse(
+          result.observation,
+        ).data,
+        environment = receipt.intent.environment;
+      if (
+        !observation ||
+        !environment ||
+        observation.environmentId !== environment.environmentId ||
+        observation.workflowId !== environment.workflowId ||
+        observation.generation !== environment.generation
+      )
+        return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
+
 export function verifiedLate(
   f: InspectionFact,
   row: InspectionRow,
@@ -126,9 +158,9 @@ export function actionInspection(d: DomainReader) {
             ["mcp.client.late-result.v1"],
             "core:caused-by",
           );
-        const valid = receipts
-          .slice(0, 100)
-          .filter((f) => verifiedReceipt(f, row));
+        const valid: InspectionFact[] = [];
+        for (const f of receipts.slice(0, 100))
+          if (await verifiedReceipt(r, f, row, q.scope)) valid.push(f);
         const evidence = late
           .slice(0, 100)
           .filter((f) => verifiedLate(f, row, q.scope));

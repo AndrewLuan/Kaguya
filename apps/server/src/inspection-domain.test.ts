@@ -35,7 +35,16 @@ const address = {
 const stamp = "2026-01-01T00:00:00.000Z";
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
-  for (const close of cleanups.splice(0).reverse()) await close();
+  const errors: unknown[] = [];
+  for (const close of cleanups.splice(0).reverse()) {
+    try {
+      await close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length)
+    throw new AggregateError(errors, "Inspection fixture cleanup failed");
 });
 const backends = [
   { name: "PGlite", create: createTestingDatabase },
@@ -66,6 +75,8 @@ const kinds = [
   "agent.heavy.tool.origin.cancelled.v1",
   "agent.heavy.tool.cancel.forwarded.v1",
   "core.action.intent.v1",
+  "core.action.started.v1",
+  "agent.action.decision.v1",
   "core.action.result.v1",
   "core.action.reconciled.v1",
   "mcp.client.late-result.v1",
@@ -205,9 +216,15 @@ async function fixture(create: () => Promise<KaguyaDatabase>) {
     controlReads: () => controlReads,
   };
 }
-async function actionFixture(f: Awaited<ReturnType<typeof fixture>>) {
+async function actionFixture(
+  f: Awaited<ReturnType<typeof fixture>>,
+  native = false,
+  overrides: JsonObject = {},
+) {
   const intent = {
-    operationId: "operation",
+    operationId: native
+      ? `native:native-run:0:0:${actionDigest("call")}`
+      : "operation",
     runInformationId: "action-run",
     decisionInformationId: "decision",
     scope,
@@ -230,15 +247,17 @@ async function actionFixture(f: Awaited<ReturnType<typeof fixture>>) {
     dependsOn: [],
     deadline: "2030-01-01T00:00:00.000Z",
     dependencies: {
+      ...(native ? { evidenceInformationId: "model-complete" } : {}),
       observationId: "obs",
       sourceInformationIds: ["source"],
       memoryRevisions: [],
     },
+    ...overrides,
   };
   await f.atom("intent", "core.action.intent.v1", intent);
   await f.db.sql.query(
-    `INSERT INTO information_action_heads(intent_id,operation_id,input,digest,state,attempt_id) VALUES('intent','operation',$1::jsonb,$2,'unknown','attempt')`,
-    [JSON.stringify(intent), actionDigest(intent)],
+    `INSERT INTO information_action_heads(intent_id,operation_id,input,digest,state,attempt_id) VALUES('intent',$3,$1::jsonb,$2,'unknown','attempt')`,
+    [JSON.stringify(intent), actionDigest(intent), intent.operationId],
   );
   const outcome = {
     status: "unknown",
@@ -277,7 +296,8 @@ async function actionFixture(f: Awaited<ReturnType<typeof fixture>>) {
 }
 async function runFixture(f: Awaited<ReturnType<typeof fixture>>) {
   await f.observation();
-  const { payload } = await actionFixture(f);
+  await f.atom("action-run", "core.runtime.context", { scope });
+  const { payload } = await actionFixture(f, true);
   const origin = {
     instanceId: "heavy",
     definitionId: "agent.heavy",
@@ -364,6 +384,20 @@ async function runFixture(f: Awaited<ReturnType<typeof fixture>>) {
     "core.model.task.completed",
     { nativeStep, generationKind: "tool-calls", toolCalls: [call] },
     [{ relation: "core:status-of", informationId: "request" }],
+  );
+  await f.atom(
+    "decision",
+    "agent.action.decision.v1",
+    {
+      observationId: "obs",
+      domain: "tool",
+      reason: "native-call",
+      policyVersion: "native-loop.v1",
+    },
+    [
+      { relation: "core:uses-context", informationId: "model-complete" },
+      { relation: "core:uses-context", informationId: "action-run" },
+    ],
   );
   await f.atom(
     "paired",
@@ -1112,6 +1146,323 @@ for (const backend of backends)
       const response = await f.get("gui-tasks/gui-source");
       expect(response.statusCode).toBe(409);
       expect(response.body).not.toContain("FOREIGN OUTPUT");
+    });
+    it("rejects malformed chat scopes with 400 while retaining opaque scopes in other domains", async () => {
+      const f = await fixture(backend.create);
+      for (const route of ["observations", "progress", "observations/missing"])
+        for (const bad of ["not-json", "{}", '["qq"]']) {
+          const response = await f.get(route, { scope: bad });
+          expect(response.statusCode, response.body).toBe(400);
+          expect(response.json().error.code).toBe("invalid_inspection_request");
+        }
+      await f.atom("opaque", "core.runtime.context", {
+        scope: "opaque-tool-scope",
+        text: "scoped",
+      });
+      expect(
+        (await f.get("sources/opaque", { scope: "opaque-tool-scope" }))
+          .statusCode,
+      ).toBe(200);
+    });
+    it("binds repeated call IDs to the exact step operation and decision evidence", async () => {
+      const f = await fixture(backend.create);
+      await runFixture(f);
+      const payload = (
+        await f.db.sql.query(
+          "SELECT payload FROM information_atoms WHERE information_id='receipt'",
+        )
+      ).rows[0]!.payload as any;
+      const call = (
+        await f.db.sql.query(
+          "SELECT call FROM information_native_tool_calls WHERE run_id='native-run'",
+        )
+      ).rows[0]!.call as any;
+      await f.atom("reused-step", "agent.heavy.tool.step.frozen.v1", {
+        runInformationId: "native-run",
+        observationId: "obs",
+        stepIndex: 1,
+      });
+      await f.atom(
+        "reused-request",
+        "core.model.task.requested",
+        { nativeStep: { runInformationId: "native-run", stepIndex: 1 } },
+        [{ relation: "core:uses-context", informationId: "reused-step" }],
+      );
+      await f.atom(
+        "reused-completed",
+        "core.model.task.completed",
+        {
+          nativeStep: { runInformationId: "native-run", stepIndex: 1 },
+          generationKind: "tool-calls",
+          toolCalls: [call],
+        },
+        [{ relation: "core:status-of", informationId: "reused-request" }],
+      );
+      await f.db.sql.query(
+        "INSERT INTO information_native_tool_steps(run_id,step_index,frozen_id,request_id) VALUES('native-run',1,'reused-step','reused-request')",
+      );
+      const value = {
+        ...payload.outcome,
+        receiptId: "receipt",
+        resultHash: payload.resultHash,
+      };
+      const result = {
+        runInformationId: "native-run",
+        stepIndex: 1,
+        toolCallId: "call",
+        modelCompletedInformationId: "reused-completed",
+        intentId: "intent",
+        receiptId: "receipt",
+        value,
+        outputBytes: 100,
+      };
+      await f.atom("reused-result", "agent.heavy.tool.result.v1", result, [
+        { relation: "core:uses-context", informationId: "receipt" },
+      ]);
+      await f.db.sql.query(
+        "INSERT INTO information_native_tool_calls(run_id,step_index,call_index,call_id,completed_id,call,intent_id,result_id) VALUES('native-run',1,0,'call','reused-completed',$1::jsonb,'intent','reused-result')",
+        [JSON.stringify(call)],
+      );
+      const wrong = (await f.get("runs/native-run")).json().data;
+      expect(wrong.calls.map((c: any) => c.pairing)).toEqual([
+        "verified",
+        "invalid",
+      ]);
+      expect(wrong.calls[1].result).toBeNull();
+      const intent = {
+        ...payload.intent,
+        operationId: `native:native-run:1:0:${actionDigest("call")}`,
+        decisionInformationId: "decision-next",
+        dependencies: {
+          ...payload.intent.dependencies,
+          evidenceInformationId: "reused-completed",
+        },
+      };
+      await f.atom(
+        "decision-next",
+        "agent.action.decision.v1",
+        {
+          observationId: "obs",
+          domain: "tool",
+          reason: "native-call",
+          policyVersion: "native-loop.v1",
+        },
+        [
+          { relation: "core:uses-context", informationId: "reused-completed" },
+          { relation: "core:uses-context", informationId: "action-run" },
+        ],
+      );
+      await f.atom("intent-next", "core.action.intent.v1", intent);
+      await f.db.sql.query(
+        "INSERT INTO information_action_heads(intent_id,operation_id,input,digest,state,attempt_id) VALUES('intent-next',$1,$2::jsonb,$3,'unknown','next-attempt')",
+        [intent.operationId, JSON.stringify(intent), actionDigest(intent)],
+      );
+      await f.atom(
+        "receipt-next",
+        "core.action.result.v1",
+        {
+          ...payload,
+          intentId: "intent-next",
+          intent,
+          attemptId: "next-attempt",
+        },
+        [{ relation: "core:uses-context", informationId: "intent-next" }],
+      );
+      await f.db.sql.query(
+        "INSERT INTO information_action_receipts(receipt_id,intent_id,receipt_key) VALUES('receipt-next','intent-next','next-key')",
+      );
+      await f.atom(
+        "result-next",
+        "agent.heavy.tool.result.v1",
+        {
+          ...result,
+          intentId: "intent-next",
+          receiptId: "receipt-next",
+          value: { ...value, receiptId: "receipt-next" },
+        },
+        [{ relation: "core:uses-context", informationId: "receipt-next" }],
+      );
+      await f.db.sql.query(
+        "UPDATE information_native_tool_calls SET intent_id='intent-next',result_id='result-next' WHERE step_index=1",
+      );
+      const correct = await f.get("runs/native-run");
+      expect(correct.statusCode, correct.body).toBe(200);
+      expect(correct.json().data.calls.map((c: any) => c.pairing)).toEqual([
+        "verified",
+        "verified",
+      ]);
+    });
+    it("rejects unregistered receipts and wrong started evidence through the formal W3 proof read", async () => {
+      const f = await fixture(backend.create);
+      await runFixture(f);
+      const payload = (
+        await f.db.sql.query(
+          "SELECT payload FROM information_atoms WHERE information_id='receipt'",
+        )
+      ).rows[0]!.payload as any;
+      await f.atom("unregistered", "core.action.result.v1", payload, [
+        { relation: "core:uses-context", informationId: "intent" },
+      ]);
+      const paired = (
+        await f.db.sql.query(
+          "SELECT payload FROM information_atoms WHERE information_id='paired'",
+        )
+      ).rows[0]!.payload as any;
+      await f.atom(
+        "unregistered-result",
+        "agent.heavy.tool.result.v1",
+        {
+          ...paired,
+          receiptId: "unregistered",
+          value: { ...paired.value, receiptId: "unregistered" },
+        },
+        [{ relation: "core:uses-context", informationId: "unregistered" }],
+      );
+      await f.db.sql.query(
+        "UPDATE information_native_tool_calls SET result_id='unregistered-result'",
+      );
+      expect(
+        (await f.get("runs/native-run")).json().data.calls[0].pairing,
+      ).toBe("invalid");
+      await f.atom("started", "core.action.started.v1", {
+        intentId: "intent",
+        attemptId: "attempt",
+        operationId: payload.intent.operationId,
+        digest: actionDigest(payload.intent),
+      });
+      await f.db.sql.query(
+        "UPDATE information_action_heads SET started_id='started'",
+      );
+      for (const [id, startedInformationId, includeStarted] of [
+        ["good-started", "started", true],
+        ["wrong-started", "wrong", true],
+        ["missing-start-ref", "started", false],
+      ] as const) {
+        await f.atom(
+          id,
+          "core.action.result.v1",
+          { ...payload, startedInformationId },
+          [
+            { relation: "core:uses-context", informationId: "intent" },
+            ...(includeStarted
+              ? [{ relation: "core:uses-context", informationId: "started" }]
+              : []),
+          ],
+        );
+        await f.db.sql.query(
+          "INSERT INTO information_action_receipts(receipt_id,intent_id,receipt_key) VALUES($1,'intent',$1)",
+          [id],
+        );
+      }
+      const response = await f.get("actions/intent");
+      expect(response.statusCode, response.body).toBe(200);
+      expect(
+        response.json().data.receipts.map((r: any) => r.informationId),
+      ).toEqual(["good-started"]);
+      expect(response.json().data.rejectedEvidenceCount).toBe(3);
+    });
+    it("checks GUI artifacts and image/observation metadata before exposing verified receipts", async () => {
+      const f = await fixture(backend.create);
+      const environment = {
+        environmentId: "env",
+        generation: 7,
+        workflowId: "flow",
+        workspaceId: "workspace",
+        resourceIds: [],
+        leaseId: "lease",
+        fencing: "7",
+        expiresAt: "2030-01-01T00:00:00.000Z",
+      };
+      const { payload } = await actionFixture(f, false, {
+        toolName: "gui.observe",
+        environment,
+      });
+      const image = {
+        captureId: "capture",
+        coordinateFrame: "desktop",
+        width: 100,
+        height: 100,
+        originalWidth: 100,
+        originalHeight: 100,
+        scale: 1,
+        origin: { x: 0, y: 0 },
+        target: { kind: "desktop" },
+        sha256: "a".repeat(64),
+        mime: "image/png",
+        capturedAt: stamp,
+        serviceInstanceId: "service",
+        driverInstanceId: "driver",
+      };
+      const artifact = {
+        id: "artifact",
+        hash: image.sha256,
+        mime: image.mime,
+        size: 100,
+        scope,
+        actionId: "intent",
+        generation: 7,
+        observedAt: stamp,
+        source: "gui",
+        retention: "durable",
+      };
+      const observation = {
+        id: "b".repeat(64),
+        environmentId: "env",
+        workflowId: "flow",
+        generation: 7,
+      };
+      const good = {
+        status: "succeeded",
+        evidence: "observed",
+        result: { image, observation },
+        artifacts: [artifact],
+        truncated: false,
+      };
+      const variants = [
+        good,
+        { ...good, artifacts: [{ ...artifact, scope: other }] },
+        { ...good, artifacts: [{ ...artifact, actionId: "foreign" }] },
+        { ...good, artifacts: [{ ...artifact, generation: 8 }] },
+        { ...good, artifacts: [{ ...artifact, hash: "c".repeat(64) }] },
+        {
+          ...good,
+          result: {
+            image,
+            observation: { ...observation, environmentId: "foreign" },
+          },
+        },
+        {
+          ...good,
+          result: { image, observation: { ...observation, generation: 8 } },
+        },
+        { ...good, status: "unknown", evidence: "returned" },
+      ];
+      for (const [index, outcome] of variants.entries()) {
+        const id = `gui-receipt-${index}`;
+        await f.atom(
+          id,
+          "core.action.result.v1",
+          {
+            ...payload,
+            outcome,
+            resultHash: actionDigest({
+              result: outcome.result,
+              artifacts: outcome.artifacts,
+            }),
+          },
+          [{ relation: "core:uses-context", informationId: "intent" }],
+        );
+        await f.db.sql.query(
+          "INSERT INTO information_action_receipts(receipt_id,intent_id,receipt_key) VALUES($1,'intent',$1)",
+          [id],
+        );
+      }
+      const response = await f.get("actions/intent");
+      expect(response.statusCode, response.body).toBe(200);
+      expect(
+        response.json().data.receipts.map((r: any) => r.informationId),
+      ).toEqual(["gui-receipt-0", "receipt"]);
+      expect(response.json().data.rejectedEvidenceCount).toBe(7);
     });
     it("reads control pending generation and human outcome without exposing private bindings", async () => {
       const f = await fixture(backend.create);

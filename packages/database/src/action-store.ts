@@ -1,4 +1,5 @@
 /**
+ * inspectReceipt 复用正式回执证明校验，仅读已认证管理端提供的只读事务，不签发执行授权或加行锁。
  * register/readReceipt 可复用宿主已持有的事务，供原生工具绑定与 Memory 桥接在同锁下最终验证。
  * 功能概述：持久保存行动身份、授权、取消、执行 claim 和回执，原子裁决副作用开始资格。
  * 主要职责：register 固定参数；admit 在 Memory 锁→action 行之后重验依据和授权；
@@ -1073,75 +1074,111 @@ export class PostgresActionStore {
     authorizationId: string,
     transaction?: SqlTransaction,
   ): Promise<ActionReceipt> {
-    const run = async (tx: SqlTransaction) => {
-      const p = (
-        await tx.query<{ payload: any; position: string; occurred_at: string }>(
-          `SELECT a.payload,l.position::text,a.occurred_at FROM information_action_receipts r JOIN information_atoms a ON a.information_id=r.receipt_id JOIN information_lifecycle l ON l.information_id=a.information_id WHERE r.receipt_id=$1`,
-          [receiptId],
-        )
-      ).rows[0];
-      if (!p) throw new Error("receipt-not-found-or-denied");
-      const r = await this.row(tx, p.payload.intentId, scope);
-      if (
-        !(await this.controlAuthorized(tx, r.input, authorizationId)) ||
-        actionDigest(p.payload.intent) !== r.digest
-      )
-        throw new Error("receipt-not-found-or-denied");
-      const outcome = actionOutcomeSchema.parse(p.payload.outcome);
-      if (
-        p.payload.resultHash !==
-          actionDigest({
-            result: outcome.result,
-            artifacts: outcome.artifacts,
-          }) ||
-        p.payload.startedInformationId !== r.started_id ||
-        p.payload.attemptId !== r.attempt_id
-      )
-        throw new Error("receipt-proof-invalid");
-      this.validateOutcome(r, outcome);
-      const original = (
-        await tx.query<{ payload: unknown }>(
-          "SELECT payload FROM information_atoms WHERE information_id=$1 AND kind='core.action.intent.v1'",
-          [r.intent_id],
-        )
-      ).rows[0];
-      const refs = (
-        await tx.query<{ target_information_id: string }>(
-          "SELECT target_information_id FROM information_references WHERE information_id=$1 AND relation='core:uses-context'",
-          [receiptId],
-        )
-      ).rows.map((ref) => ref.target_information_id);
-      if (
-        !original ||
-        actionDigest(original.payload) !== r.digest ||
-        !refs.includes(r.intent_id) ||
-        (r.started_id && !refs.includes(r.started_id))
-      )
-        throw new Error("receipt-proof-invalid");
-      if (r.started_id) {
-        const started = (
-          await tx.query<{ payload: any }>(
-            "SELECT payload FROM information_atoms WHERE information_id=$1 AND kind='core.action.started.v1'",
-            [r.started_id],
-          )
-        ).rows[0];
-        if (
-          !started ||
-          started.payload.intentId !== r.intent_id ||
-          started.payload.attemptId !== r.attempt_id ||
-          started.payload.digest !== r.digest ||
-          started.payload.operationId !== r.input.operationId
-        )
-          throw new Error("receipt-proof-invalid");
-      }
-      return {
-        ...p.payload,
-        outcome,
-        receiptId,
-        registeredPosition: p.position,
-        recordedAt: p.occurred_at,
-      };
-    };
+    if (typeof authorizationId !== "string" || !authorizationId)
+      throw new Error("receipt-not-found-or-denied");
+    const run = (tx: SqlTransaction) =>
+      this.receiptProof(tx, receiptId, scope, authorizationId);
     return transaction ? run(transaction) : this.transaction(run);
+  }
+  /** Management-only proof read. The caller owns authentication and a READ ONLY transaction. */
+  async inspectReceipt(
+    receiptId: string,
+    scope: string,
+    transaction: SqlTransaction,
+  ): Promise<ActionReceipt> {
+    return this.receiptProof(transaction, receiptId, scope);
+  }
+  private async receiptProof(
+    tx: SqlTransaction,
+    receiptId: string,
+    scope: string,
+    authorizationId?: string,
+  ): Promise<ActionReceipt> {
+    const p = (
+      await tx.query<{
+        payload: any;
+        position: string;
+        occurred_at: string;
+        kind: string;
+        indexed_intent_id: string;
+      }>(
+        `SELECT a.payload,l.position::text,a.occurred_at,a.kind,r.intent_id indexed_intent_id FROM information_action_receipts r JOIN information_atoms a ON a.information_id=r.receipt_id JOIN information_lifecycle l ON l.information_id=a.information_id WHERE r.receipt_id=$1`,
+        [receiptId],
+      )
+    ).rows[0];
+    if (!p) throw new Error("receipt-not-found-or-denied");
+    if (
+      !["core.action.result.v1", "core.action.reconciled.v1"].includes(
+        p.kind,
+      ) ||
+      p.indexed_intent_id !== p.payload.intentId
+    )
+      throw new Error("receipt-proof-invalid");
+    const r = await this.row(
+      tx,
+      p.payload.intentId,
+      scope,
+      authorizationId !== undefined,
+    );
+    if (
+      (authorizationId !== undefined &&
+        !(await this.controlAuthorized(tx, r.input, authorizationId))) ||
+      actionDigest(p.payload.intent) !== r.digest
+    )
+      throw new Error("receipt-not-found-or-denied");
+    const outcome = actionOutcomeSchema.parse(p.payload.outcome);
+    if (
+      p.payload.resultHash !==
+        actionDigest({
+          result: outcome.result,
+          artifacts: outcome.artifacts,
+        }) ||
+      p.payload.startedInformationId !== r.started_id ||
+      p.payload.attemptId !== r.attempt_id
+    )
+      throw new Error("receipt-proof-invalid");
+    this.validateOutcome(r, outcome);
+    const original = (
+      await tx.query<{ payload: unknown }>(
+        "SELECT payload FROM information_atoms WHERE information_id=$1 AND kind='core.action.intent.v1'",
+        [r.intent_id],
+      )
+    ).rows[0];
+    const refs = (
+      await tx.query<{ target_information_id: string }>(
+        "SELECT target_information_id FROM information_references WHERE information_id=$1 AND relation='core:uses-context' AND target_information_id=ANY($2::text[])",
+        [receiptId, [r.intent_id, ...(r.started_id ? [r.started_id] : [])]],
+      )
+    ).rows.map((ref) => ref.target_information_id);
+    if (
+      !original ||
+      actionDigest(original.payload) !== r.digest ||
+      !refs.includes(r.intent_id) ||
+      (r.started_id && !refs.includes(r.started_id))
+    )
+      throw new Error("receipt-proof-invalid");
+    if (r.started_id) {
+      const started = (
+        await tx.query<{ payload: any }>(
+          "SELECT payload FROM information_atoms WHERE information_id=$1 AND kind='core.action.started.v1'",
+          [r.started_id],
+        )
+      ).rows[0];
+      if (
+        !started ||
+        started.payload.intentId !== r.intent_id ||
+        started.payload.attemptId !== r.attempt_id ||
+        started.payload.digest !== r.digest ||
+        started.payload.operationId !== r.input.operationId
+      )
+        throw new Error("receipt-proof-invalid");
+    }
+    return {
+      ...p.payload,
+      outcome,
+      receiptId,
+      registeredPosition: p.position,
+      recordedAt: p.occurred_at,
+    };
   }
 }

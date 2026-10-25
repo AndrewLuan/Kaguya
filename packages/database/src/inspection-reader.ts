@@ -6,6 +6,7 @@
  * 输入输出与副作用：仅参数化 SELECT 和只读事务设置，无回填、租约、运行恢复或外部调用。
  */
 import { createHash } from "node:crypto";
+import { PostgresActionStore } from "./action-store.js";
 import type { SqlDatabase, SqlTransaction } from "./driver.js";
 
 export type InspectionRow = Record<string, any>;
@@ -42,6 +43,7 @@ export class InspectionReader {
   constructor(
     readonly tx: SqlTransaction,
     readonly boundary: InspectionBoundary,
+    private readonly actions: PostgresActionStore,
   ) {}
   async rows(
     sql: string,
@@ -105,6 +107,12 @@ export class InspectionReader {
     limit: number,
     id?: string,
   ) {
+    let jsonScope: string | null = null;
+    try {
+      jsonScope = JSON.stringify(JSON.parse(scope));
+    } catch {
+      /* Non-chat scopes cannot address a chat observation. */
+    }
     const window =
       id === undefined
         ? await this.directory("observations", scope, consumer)
@@ -117,7 +125,7 @@ export class InspectionReader {
       AND o.recorded_at<=$3::timestamptz AND ($4::text IS NULL OR o.observation_id<$4)
       AND ($6::text IS NULL OR o.observation_id=$6) ORDER BY o.observation_id DESC LIMIT $5`,
       [
-        scope,
+        jsonScope,
         consumer,
         this.boundary.recordedAt,
         before,
@@ -233,6 +241,25 @@ export class InspectionReader {
       )
     )[0];
   }
+  async receipt(id: string, scope: string) {
+    try {
+      const receipt = await this.actions.inspectReceipt(id, scope, this.tx);
+      return BigInt(receipt.registeredPosition) <=
+        BigInt(this.boundary.position)
+        ? receipt
+        : undefined;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (/^(receipt-|action-not-found|action-outcome-|action-artifact-)/.test(
+          error.message,
+        ) ||
+          error.name === "ZodError")
+      )
+        return undefined;
+      throw error;
+    }
+  }
   async receipts(id: string) {
     return (
       await this.tx.query<InspectionFact & InspectionRow>(
@@ -281,7 +308,13 @@ export async function withInspectionRead<T>(
         `SELECT COALESCE(max(position),0)::text position,clock_timestamp()::text "recordedAt" FROM information_lifecycle`,
       )
     ).rows[0]!;
-    return run(new InspectionReader(tx, requested ?? current));
+    return run(
+      new InspectionReader(
+        tx,
+        requested ?? current,
+        new PostgresActionStore(db),
+      ),
+    );
   });
 }
 export {
