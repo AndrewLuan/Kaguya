@@ -32,7 +32,10 @@ import {
   writeSensitiveJson,
 } from "@kaguya/config";
 import { createFirstPartyModuleConfigDefaults } from "@kaguya/modules";
-import { syntheticServerSource } from "@kaguya/mcp/testing";
+import {
+  applySyntheticControl,
+  syntheticServerSource,
+} from "@kaguya/mcp/testing";
 import type { ActionExecution } from "@kaguya/sdk";
 import { createMcpLateResultRecorder } from "./mcp-host.js";
 import { McpHost, mcpLateResultInformationKind } from "@kaguya/mcp";
@@ -40,6 +43,7 @@ import { startKaguyaServer, type StartedKaguyaServer } from "./server.js";
 import {
   createPersistenceWait,
   expectPersistenceSettled,
+  withModelGateCleanup,
 } from "./test-support/persistence.js";
 
 const models = vi.hoisted(() => ({ heavy: 0, gui: 0, requests: [] as any[] }));
@@ -300,11 +304,14 @@ async function fixture(
   };
   return {
     manager,
-    update: (next: Record<string, unknown>) =>
-      writeFile(
-        state,
-        JSON.stringify({ protocol: "2025-11-25", ...flags, ...next }),
-      ),
+    update: async (
+      next: Record<string, unknown>,
+      options: { allowStopped?: boolean } = {},
+    ) => {
+      const value = { protocol: "2025-11-25", ...flags, ...next };
+      await writeFile(state, JSON.stringify(value));
+      return applySyntheticControl(journal, value, options);
+    },
     start,
     db,
     logs,
@@ -876,121 +883,127 @@ it.each(["before-unknown", "after-unknown"] as const)(
         }
       },
     );
-    try {
-      const server = await f.start();
-      expect(
-        (
-          await server.app.inject({
-            method: "POST",
-            url: "/api/v1/messages",
-            headers: { authorization: "Bearer synthetic-gateway" },
-            payload: {
-              text: "Run synthetic held tool",
-              conversationId: "47d34f33-c005-45e1-bae4-06df09bd9dc1",
+    await withModelGateCleanup(
+      async () => {
+        const server = await f.start();
+        expect(
+          (
+            await server.app.inject({
+              method: "POST",
+              url: "/api/v1/messages",
+              headers: { authorization: "Bearer synthetic-gateway" },
+              payload: {
+                text: "Run synthetic held tool",
+                conversationId: "47d34f33-c005-45e1-bae4-06df09bd9dc1",
+              },
+            })
+          ).statusCode,
+        ).toBe(202);
+        const wait = createPersistenceWait(f.db, () => ({
+          heavy: models.heavy,
+        }));
+        let action!: Awaited<ReturnType<typeof f.db.actions.read>>;
+        await wait("Router scheduled Heavy", async () => {
+          expect(
+            await f.db.information.find({
+              kinds: ["agent.router.message.intent.requested"],
+              limit: 10,
+            }),
+          ).toHaveLength(1);
+        });
+        await wait("MCP side effect has started", async () => {
+          expect(
+            (await f.logs()).filter((row) => row.kind === "effect"),
+          ).toHaveLength(1);
+          const row = (
+            await f.db.sql.query<{ intent_id: string }>(
+              "SELECT intent_id FROM information_action_heads LIMIT 1",
+            )
+          ).rows[0]!;
+          action = await f.db.actions.read(row.intent_id, f.scope);
+          expect(action.state).toBe("started");
+        });
+        await host.snapshot().actionProviders[0]!.cancel!({
+          attemptId: action.attemptId,
+        } as ActionExecution);
+        if (order === "after-unknown") {
+          await wait("transport interruption is durably unknown", async () => {
+            expect(
+              (await f.db.actions.read(action.intentId, f.scope)).state,
+            ).toBe("unknown");
+            await expectPersistenceSettled(f.db);
+          });
+        }
+        await f.update({ release: true });
+        let observation: any;
+        await wait(
+          "late result is visible through the scope index",
+          async () => {
+            const atoms = await f.db.information.find({
+              kinds: [mcpLateResultInformationKind.kind],
+              scopeKey: f.scope,
+              limit: 10,
+            });
+            expect(atoms).toHaveLength(1);
+            observation = atoms[0]!;
+          },
+        );
+        expect(observation.payload.envelope).toMatchObject({
+          source: {
+            scope: f.scope,
+            connectionId: "synthetic",
+            connectionRevision: action.intent.target.connectionRevision,
+            definitionRevision: action.intent.target.definitionRevision,
+          },
+          requests: [
+            {
+              intentId: action.intentId,
+              operationId: action.intent.operationId,
+              attemptId: action.attemptId,
+              modelToolCallId: "mcp-model-original",
             },
-          })
-        ).statusCode,
-      ).toBe(202);
-      const wait = createPersistenceWait(f.db, () => ({ heavy: models.heavy }));
-      let action!: Awaited<ReturnType<typeof f.db.actions.read>>;
-      await wait("Router scheduled Heavy", async () => {
-        expect(
-          await f.db.information.find({
-            kinds: ["agent.router.message.intent.requested"],
-            limit: 10,
-          }),
-        ).toHaveLength(1);
-      });
-      await wait("MCP side effect has started", async () => {
-        expect(
-          (await f.logs()).filter((row) => row.kind === "effect"),
-        ).toHaveLength(1);
-        const row = (
-          await f.db.sql.query<{ intent_id: string }>(
-            "SELECT intent_id FROM information_action_heads LIMIT 1",
-          )
-        ).rows[0]!;
-        action = await f.db.actions.read(row.intent_id, f.scope);
-        expect(action.state).toBe("started");
-      });
-      await host.snapshot().actionProviders[0]!.cancel!({
-        attemptId: action.attemptId,
-      } as ActionExecution);
-      if (order === "after-unknown") {
-        await wait("transport interruption is durably unknown", async () => {
+          ],
+        });
+        expect(observation.references).toContainEqual({
+          relation: "core:caused-by",
+          informationId: action.intentId,
+        });
+        if (order === "before-unknown")
+          expect(
+            (await f.db.actions.read(action.intentId, f.scope)).state,
+          ).toBe("started");
+        release();
+        await wait("unknown receipt remains after late evidence", async () => {
           expect(
             (await f.db.actions.read(action.intentId, f.scope)).state,
           ).toBe("unknown");
           await expectPersistenceSettled(f.db);
         });
-      }
-      await f.update({ release: true });
-      let observation: any;
-      await wait("late result is visible through the scope index", async () => {
-        const atoms = await f.db.information.find({
-          kinds: [mcpLateResultInformationKind.kind],
-          scopeKey: f.scope,
-          limit: 10,
-        });
-        expect(atoms).toHaveLength(1);
-        observation = atoms[0]!;
-      });
-      expect(observation.payload.envelope).toMatchObject({
-        source: {
-          scope: f.scope,
-          connectionId: "synthetic",
-          connectionRevision: action.intent.target.connectionRevision,
-          definitionRevision: action.intent.target.definitionRevision,
-        },
-        requests: [
-          {
-            intentId: action.intentId,
-            operationId: action.intent.operationId,
-            attemptId: action.attemptId,
-            modelToolCallId: "mcp-model-original",
-          },
-        ],
-      });
-      expect(observation.references).toContainEqual({
-        relation: "core:caused-by",
-        informationId: action.intentId,
-      });
-      if (order === "before-unknown")
-        expect((await f.db.actions.read(action.intentId, f.scope)).state).toBe(
-          "started",
+        const originalHead = await f.db.actions.read(action.intentId, f.scope);
+        // 模拟 append 已提交但调用方报错：相同事实重试只读取同 ID，不新增事实。
+        await createMcpLateResultRecorder(f.db)(
+          committed.payload.envelope,
+          committed.informationId,
         );
-      release();
-      await wait("unknown receipt remains after late evidence", async () => {
-        expect((await f.db.actions.read(action.intentId, f.scope)).state).toBe(
-          "unknown",
+        expect(await f.db.actions.read(action.intentId, f.scope)).toEqual(
+          originalHead,
         );
-        await expectPersistenceSettled(f.db);
-      });
-      const originalHead = await f.db.actions.read(action.intentId, f.scope);
-      // 模拟 append 已提交但调用方报错：相同事实重试只读取同 ID，不新增事实。
-      await createMcpLateResultRecorder(f.db)(
-        committed.payload.envelope,
-        committed.informationId,
-      );
-      expect(await f.db.actions.read(action.intentId, f.scope)).toEqual(
-        originalHead,
-      );
-      expect(
-        await f.db.information.find({
-          kinds: [mcpLateResultInformationKind.kind],
-          scopeKey: f.scope,
-          limit: 10,
-        }),
-      ).toHaveLength(1);
-      expect(
-        (await f.logs()).filter((row) => row.kind === "effect"),
-      ).toHaveLength(1);
-      await server.close();
-      f.clearServer();
-    } finally {
-      release();
-      await f.update({ release: true });
-    }
+        expect(
+          await f.db.information.find({
+            kinds: [mcpLateResultInformationKind.kind],
+            scopeKey: f.scope,
+            limit: 10,
+          }),
+        ).toHaveLength(1);
+        expect(
+          (await f.logs()).filter((row) => row.kind === "effect"),
+        ).toHaveLength(1);
+        await server.close();
+        f.clearServer();
+      },
+      release,
+      () => f.update({ release: true }, { allowStopped: true }),
+    );
   },
   55000, // Router 前置、MCP 开始、unknown 前置、迟到事实、最终收敛最多五段各 8 秒；另留 15 秒供真实初始化、取消和清理。
 );
