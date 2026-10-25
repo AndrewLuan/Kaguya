@@ -3,7 +3,7 @@
 主要职责：固定 OCI 隔离参数启动可信显示，再由宿主固定 UID 启动 app-session 与合成 GTK。
 until/until_json 共享剩余预算；published_identity 验证就绪记录，application_identity 核实实际进程。
 代码库关系：Linux tools workflow 构建 Dockerfile.gui 后调用；证据绑定输入镜像 digest。
-输入输出与副作用：仅临时命名容器与 HOME，finally 清理；按总预算等待完整 JSON 和实际条件，原始异常与清理失败分别保留。
+输入输出与副作用：仅临时命名容器与 HOME，finally 清理；诊断失败也继续资源清理，原始异常与清理失败合并保留。
 """
 import argparse
 import hashlib
@@ -185,10 +185,13 @@ try:
     print(json.dumps({"imageDigest": args.digest, "ociProcess": oci["process"], "rootless": True}), flush=True)
 finally:
     primary = sys.exc_info()[1]
-    if primary:
-        print(f"Primary GUI failure: {primary!r}", file=sys.stderr, flush=True)
-        Path("gui-failure.txt").write_text("".join(traceback.format_exception(primary)))
     cleanup_errors = []
+    if primary:
+        try:
+            print(f"Primary GUI failure: {primary!r}", file=sys.stderr, flush=True)
+            Path("gui-failure.txt").write_text("".join(traceback.format_exception(primary)))
+        except Exception as error:
+            cleanup_errors.append(error)
     try:
         if not podman_unresponsive:
             # 双 GUI 应用、桌面服务与 Cua 的线程共同计入 pids 配额；记录内核计数，
