@@ -34,7 +34,10 @@ export type GroupInspection = {
   afterSnapshot?: (pids: readonly number[], deadline: number) => Promise<void>;
   query?: typeof queryGroup;
 };
-function emit(options: GroupInspection, event: Omit<GroupObservation, "atMs">) {
+function observeGroup(
+  options: GroupInspection,
+  event: Omit<GroupObservation, "atMs">,
+) {
   options.observe?.({ ...event, atMs: performance.now() });
 }
 function unknown(reason: string, cause?: Error): GroupIdentity {
@@ -55,7 +58,7 @@ function presence(
     return { state: "owned" };
   } catch (error) {
     const errno = (error as NodeJS.ErrnoException).code;
-    emit(options, {
+    observeGroup(options, {
       stage: "group-probe",
       reason: errno === "ESRCH" ? "gone" : "probe-error",
       errno: errno === "ESRCH" || errno === "EPERM" ? errno : "OTHER",
@@ -129,7 +132,7 @@ export async function verifyOwnedGroup(
   while (remaining(deadline) > 0) {
     const s1Result = await query("pgrep", [groupId], deadline);
     const s1 = members(s1Result);
-    emit(options, {
+    observeGroup(options, {
       stage: "pgrep-s1",
       reason:
         s1 === undefined ? "exec-error" : !s1.length ? "empty" : "members",
@@ -146,7 +149,7 @@ export async function verifyOwnedGroup(
     await options.afterSnapshot?.(s1, deadline);
     if (remaining(deadline) <= 0) return unknown("deadline");
     const detail = await query("ps", s1, deadline);
-    emit(options, {
+    observeGroup(options, {
       stage: "ps",
       reason: detail.ok ? "read" : "exec-error",
       exitCode: detail.exitCode,
@@ -156,7 +159,7 @@ export async function verifyOwnedGroup(
     if (remaining(deadline) <= 0) return unknown("deadline");
     const s2Result = await query("pgrep", [groupId], deadline);
     const s2 = members(s2Result);
-    emit(options, {
+    observeGroup(options, {
       stage: "pgrep-s2",
       reason:
         s2 === undefined ? "exec-error" : !s2.length ? "empty" : "members",
@@ -168,7 +171,7 @@ export async function verifyOwnedGroup(
     if (currentPresence.state !== "owned") return currentPresence;
     if (s2 === undefined) return unknown("pgrep-exec-error");
     if (!same(s1, s2)) {
-      emit(options, {
+      observeGroup(options, {
         stage: "membership",
         reason: "changed",
         count: s1.length,
@@ -197,10 +200,14 @@ export async function verifyOwnedGroup(
           !row![3]!.split(/\s+/).includes(`KAGUYA_MCP_OWNER=${ownerTag}`),
       )
     ) {
-      emit(options, { stage: "identity", reason: "tag-mismatch" });
+      observeGroup(options, { stage: "identity", reason: "tag-mismatch" });
       return unknown("tag-mismatch");
     }
-    emit(options, { stage: "identity", reason: "owned", count: s2.length });
+    observeGroup(options, {
+      stage: "identity",
+      reason: "owned",
+      count: s2.length,
+    });
     return { state: "owned" };
   }
   return unknown("deadline");
@@ -230,11 +237,11 @@ export async function signalOwnedGroup(
     });
   try {
     process.kill(-groupId, signal);
-    emit(options, { stage: "signal", reason: signal });
+    observeGroup(options, { stage: "signal", reason: signal });
     return "signalled";
   } catch (error) {
     const errno = (error as NodeJS.ErrnoException).code;
-    emit(options, {
+    observeGroup(options, {
       stage: "signal",
       reason: signal,
       errno: errno === "ESRCH" || errno === "EPERM" ? errno : "OTHER",
