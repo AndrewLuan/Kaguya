@@ -1,4 +1,5 @@
 /**
+ * MCP Server 持久闭环加入 PostgreSQL 清单，避免新测试只在 PGlite 上验证。
  * 功能概述：暴露 postgres:start/status/check、默认开发启动和真实 PostgreSQL 测试入口。
  * 主要职责：解析稳定命令与可选端口，尝试数据库准备后启动 Server，测试入口仍要求数据库就绪，并转发
  * SIGINT/SIGTERM；测试 URL 只注入子进程，普通输出不打印连接串或凭据。
@@ -7,16 +8,8 @@
  * 输入输出与副作用：可能启动 Docker 容器、补齐 selected Profile runtime 或创建子进程；
  * 不停止/删除容器和数据卷；开发准备失败提示启动 Docker Desktop 并运行 docker info 确认。
  * 使用独立临时 schema；验证清单包含 Memory 节点／边存储契约。
- */
-/**
- * 功能概述：暴露 postgres:start/status/check、默认开发启动和真实 PostgreSQL 测试入口。
- * 主要职责：解析稳定命令与可选端口，尝试数据库准备后启动 Server，测试入口仍要求数据库就绪，并转发
- * SIGINT/SIGTERM；测试 URL 只注入子进程，普通输出不打印连接串或凭据。
- * 代码库关系：根 package scripts 调用构建后的本文件；生命周期实现在
- * postgres-development.ts，生产 pnpm start 不经过这里。
- * 输入输出与副作用：可能启动 Docker 容器、补齐 selected Profile runtime 或创建子进程；
- * 不停止/删除容器和数据卷；开发准备失败提示启动 Docker Desktop 并运行 docker info 确认。
- * 使用独立临时 schema；验证清单包含 Memory 节点／边存储契约。
+ * 真实 PostgreSQL 清单覆盖 observation-store 与 observation-runtime，验证跨事务冻结、确认和重连。
+ * Lifecycle 超页 fixture 验证批量 owner 的完整关联、分页顺序及重启后的原定时恢复。
  */
 import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
@@ -43,11 +36,19 @@ const serverRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(serverRoot, "../..");
 const pnpmExecutable = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 export const POSTGRES_TEST_FILES = [
+  "apps/server/src/mcp-host.test.ts",
+  "apps/server/src/inspection-domain.test.ts",
+  "packages/database/src/observation-store.test.ts",
+  "packages/runtime/src/action.test.ts",
+  "packages/runtime/src/native-tool-loop.test.ts",
+  "packages/runtime/src/observation-runtime.test.ts",
+  "packages/modules/src/first-party/lifecycle/index.test.ts",
   "packages/database/src/postgres-information-ledger.test.ts",
   "packages/database/src/postgres-index.test.ts",
   "packages/database/src/postgres-reliable.test.ts",
   "packages/database/src/memory-graph.test.ts",
   "packages/database/src/native-memory.test.ts",
+  "packages/database/src/native-memory-revisions.test.ts",
   "packages/database/src/web-conversation-storage.test.ts",
   "packages/database/src/one-shot-schedule-repository.test.ts",
   "packages/database/src/model-request-metrics.test.ts",
