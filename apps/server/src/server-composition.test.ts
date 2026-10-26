@@ -1,4 +1,5 @@
 /**
+ * 验证显式 GUI 模型路由及同 provider/model id 的并发对象隔离，使用合成模型，无外部请求。
  * Web 入站 DAG 同样产生当前会话背景投影，保持 Composition 与 Runtime 的事实集合断言同步。
  * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
  * 默认 DAG 验证 eligible turn 先调用 Light，再由 Heavy 生成消息。
@@ -19,28 +20,7 @@
  * Web DAG fixture 对入站提交及持久订阅收敛统一使用 8 秒/20 毫秒预算；
  * afterEach 在断言或启动失败后也按 HTTP、Runtime、数据库和 logger 顺序释放资源，避免污染后续用例。
  * 启动错误用人工包含密码的连接异常验证返回值与日志均已脱敏。
- */
-/**
- * Web 入站 DAG 同样产生当前会话背景投影，保持 Composition 与 Runtime 的事实集合断言同步。
- * 测试配置分别声明 inboundAllowlist/outboundAllowlist，保持与严格 Profile 或 Runtime 出站策略契约一致。
- * 默认 DAG 验证 eligible turn 先调用 Light，再由 Heavy 生成消息。
- * tier 配置回归同时覆盖 generation.timeoutMs、思考与推荐时长参数传递；
- * 结构化输出仅在对应 Provider 明确声明支持时选择 schema，缺省或 false 均选择 json。
- * 功能概述：验证 Server 作为唯一 composition root 组合 PostgreSQL information
- * database、Runtime、Web/NapCat ingress、HTTP 与启动期选定的全局 Profile。
- * 主要职责：用真实 PGlite 覆盖 Web 到 information DAG，验证 HTTP/Web UI/Vite
- * 组合和启动失败关闭；并区分数据库初始化与模块/Runtime 生命周期失败的固定错误分类，
- * 覆盖未知字母数字类名和抛出型 constructor/name getter；
- * `createRuntimeModelSelectionResolver` 用例保证 selected Profile
- * 在启动时冻结、保留 provider/model 复合身份、light/heavy 共用一个 tier-only resolver，
- * 且模块不能传 `profileId`；同名 model 的跨 provider 并发调用不得串线。
- * 代码库关系：Runtime 业务装配统一来自 @kaguya/composition；直接驱动 `server.ts`、`app.ts`、`web-gateway.ts` 与 `web.ts`；
- * 真实配置 Registry 来自 `@kaguya/config`，信息账本来自 `@kaguya/database/testing`，
- * provider client 创建由 `@ai-sdk/openai-compatible` mock 观察。
- * 输入输出与副作用：每个用例使用独立临时配置目录或内存 PGlite；
- * Web DAG fixture 对入站提交及持久订阅收敛统一使用 8 秒/20 毫秒预算；
- * afterEach 在断言或启动失败后也按 HTTP、Runtime、数据库和 logger 顺序释放资源，避免污染后续用例。
- * 启动错误用人工包含密码的连接异常验证返回值与日志均已脱敏。
+ * 默认 Web 因果图包含观察完成和独立进度事实，原有投递、情境与上下文断言仍逐项核对。
  */
 import {
   createMessageComposition,
@@ -351,6 +331,8 @@ describe("unified server composition", () => {
         "core.delivery.delivered",
         "core.delivery.started",
         "agent.situation.frozen",
+        "agent.observation.completed.v1",
+        "agent.observation.progress.v1",
       ]),
     );
     expect(
@@ -1043,12 +1025,24 @@ describe("unified server composition", () => {
       modelId: "default-light",
       model: { modelId: "default-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
     expect(resolver({ modelTier: "heavy" })).toEqual({
       providerId: "provider-1",
       modelId: "default-heavy",
       model: { modelId: "default-heavy" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
     expect(chatModel).toHaveBeenCalledWith("default-light");
     expect(chatModel).toHaveBeenCalledWith("default-heavy");
@@ -1090,12 +1084,24 @@ describe("unified server composition", () => {
       modelId: "selected-light",
       model: { modelId: "selected-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
     expect(resolver({ modelTier: "heavy" })).toEqual({
       providerId: "provider-1",
       modelId: "selected-heavy",
       model: { modelId: "selected-heavy" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
     expect(chatModel).toHaveBeenCalledWith("selected-light");
     expect(chatModel).toHaveBeenCalledWith("selected-heavy");
@@ -1228,6 +1234,12 @@ describe("unified server composition", () => {
     expect(resolver({ modelTier: "heavy" })).toMatchObject({
       providerId: "provider-2",
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
   });
 
@@ -1279,6 +1291,12 @@ describe("unified server composition", () => {
       modelId: "default-light",
       model: { modelId: "default-light" },
       generationOptions: { structuredOutputMode: "json" },
+      configuration: {
+        adapter: "@ai-sdk/openai-compatible",
+        protocol: "chat-completions",
+        endpoint: "https://llm.example/v1",
+        revision: "1",
+      },
     });
     expect(chatModel).toHaveBeenCalledWith("default-light");
   });
@@ -1335,6 +1353,140 @@ describe("unified server composition", () => {
     ]);
   });
 
+  it("freezes one generation snapshot for its digest and dispatch even when the resolver reuses mutable options", async () => {
+    const model = createRepeatingDeterministicModel({ text: "done" });
+    const dispatch = vi.spyOn(model, "doGenerate");
+    const shared = {
+      reasoning: "low" as "low" | "high",
+      recommendedDurationMs: 1000,
+    };
+    const composition = createMessageComposition(
+      () => ({
+        providerId: "same",
+        modelId: "same",
+        model,
+        generationOptions: shared,
+        configuration: {
+          adapter: "synthetic",
+          protocol: "local",
+          endpoint: "local",
+          revision: "1",
+        },
+      }),
+      { moduleConfigs: createFirstPartyModuleConfigDefaults("test") },
+    );
+    const first = composition.modelTask.resolveModel({ tier: "heavy" });
+    shared.reasoning = "high";
+    shared.recommendedDurationMs = 2;
+    const result = await composition.modelTask.client.generate({
+      modelId: "same",
+      outputMode: "text",
+      outputSchema: z.string(),
+      messages: [{ role: "user", content: "synthetic" }],
+    });
+    expect((dispatch.mock.calls[0]![0] as any).reasoning).toBe("low");
+    expect(result.recommendedDurationMs).toBe(1000);
+    expect(
+      composition.modelTask.resolveModel({ tier: "heavy" }).configurationDigest,
+    ).not.toBe(first.configurationDigest);
+  });
+
+  it("keeps concurrent routes with identical provider/model ids bound to their own model objects and configuration", async () => {
+    const make = (text: string) => ({
+      providerId: "same",
+      modelId: "same",
+      model: createRepeatingDeterministicModel({ text }),
+      configuration: {
+        adapter: "synthetic",
+        protocol: "local",
+        endpoint: "local",
+        revision: text,
+      },
+    });
+    const a = make("a"),
+      b = make("b");
+    const composition = createMessageComposition(() => a, {
+      moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+      nativeTaskModels: [a, b].map((model, i) => ({
+        definitionId: "agent.heavy",
+        taskId: "task",
+        routeId: String(i),
+        tier: "heavy",
+        resolve: () => model,
+      })),
+    });
+    const run = async (routeId: string) => {
+      const identity = composition.modelTask.resolveModel({
+        tier: "heavy",
+        routeId,
+      });
+      await Promise.resolve();
+      const generation = await composition.modelTask.client.generate({
+        modelId: identity.modelId,
+        messages: [{ role: "user", content: "synthetic" }],
+        outputMode: "object",
+        outputSchema: z.object({ text: z.string() }),
+      });
+      return { identity, output: generation.output };
+    };
+    const results = await Promise.all([run("0"), run("1")]);
+    expect(results.map((r) => r.output)).toEqual([
+      { text: "a" },
+      { text: "b" },
+    ]);
+    expect(results[0]!.identity.configurationDigest).not.toBe(
+      results[1]!.identity.configurationDigest,
+    );
+  });
+
+  it("isolates an explicitly approved GUI task model from the ordinary Heavy model", async () => {
+    const chat = createRepeatingDeterministicModel({ text: "chat" }),
+      gui = createRepeatingDeterministicModel({ text: "gui" });
+    const composition = createMessageComposition(
+      () => ({ providerId: "chat", modelId: "heavy-current", model: chat }),
+      {
+        moduleConfigs: createFirstPartyModuleConfigDefaults("test"),
+        nativeTaskModels: [
+          {
+            definitionId: "agent.heavy",
+            taskId: "agent.gui.inspect",
+            routeId: "gui.approved",
+            tier: "heavy",
+            resolve: () => ({
+              providerId: "approved-vision",
+              modelId: "gui-specific",
+              model: gui,
+            }),
+          },
+        ],
+      },
+    );
+    expect(composition.modelTask.resolveModel({ tier: "heavy" })).toEqual({
+      providerId: "chat",
+      modelId: "heavy-current",
+    });
+    expect(
+      composition.modelTask.resolveModel({
+        tier: "heavy",
+        routeId: "gui.approved",
+      }),
+    ).toEqual({ providerId: "approved-vision", modelId: "gui-specific" });
+    expect(composition.modelTask.approvals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskId: "agent.gui.inspect",
+          selectionPolicy: { tier: "heavy", routeId: "gui.approved" },
+        }),
+      ]),
+    );
+    expect(() =>
+      composition.modelTask.resolveModel({ tier: "heavy", routeId: "missing" }),
+    ).toThrow("Unapproved task model route");
+    expect(composition.modelTask.resolveModel({ tier: "heavy" })).toEqual({
+      providerId: "chat",
+      modelId: "heavy-current",
+    });
+  });
   it("keeps Memory disabled unless composition explicitly enables it", () => {
     expect(
       createMessageComposition(undefined, {

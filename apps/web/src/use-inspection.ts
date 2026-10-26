@@ -1,19 +1,23 @@
 /**
  * 功能概述：检查页面共用的可取消 GET 状态，加载新查询时不显示旧数据。
  * useInspection 按 token、路径与刷新版本隔离结果，卸载后取消；认证和 DTO 校验由 api.ts 负责。
- * 不轮询、不保存 Token；错误作为安全接口消息返回给调用组件。
+ * 不轮询、不保存 Token；保留安全错误消息以及 code/status，供领域页明确处理失效游标。
  */
 import { useEffect, useState } from "react";
-import { getInspection } from "./api.js";
+import { getInspection, GatewayRequestError } from "./api.js";
 export function useInspection<T>(
   token: string,
   path: string | undefined,
   schema: { parse(value: unknown): T },
   revision: number,
 ) {
-  const [state, setState] = useState<{ key: string; data?: T; error?: string }>(
-    { key: "" },
-  );
+  const [state, setState] = useState<{
+    key: string;
+    data?: T;
+    error?: string;
+    code?: string;
+    status?: number;
+  }>({ key: "" });
   const key = `${path}:${revision}:${token}`;
   useEffect(() => {
     if (path === undefined) return;
@@ -27,6 +31,9 @@ export function useInspection<T>(
           setState({
             key,
             error: error instanceof Error ? error.message : "读取失败",
+            ...(error instanceof GatewayRequestError
+              ? { code: error.code, status: error.status }
+              : {}),
           });
       },
     );
