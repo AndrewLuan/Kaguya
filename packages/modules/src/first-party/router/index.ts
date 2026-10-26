@@ -1,3 +1,35 @@
+/**
+ * 候选新旧由 Selector 的账本注册顺序确定；相同/迟到业务时间及随机 UUID 不改变消费先后。
+ * Light 的 message 决策只传目标与冻结引用。
+ * manifest 声明 Light 模板；调用 compileLightPrompt 时传入装配阶段加载的 default/local 文本，不再使用代码内默认值。
+ * settings schema 的公开中文元数据供管理表单使用，运行时与保存共用约束。
+ * 管理端批准的跨会话 candidate 由宿主直接认领，不再触发 Light；其 delivery 仍使用本模块统一 turn 终态。
+ * Selector 只遍历开放 candidate 及最近 claim；恢复旧积压时每 scope 只推进一次合并观察。
+ * 在线 Router 编排器。所有推进都由可重放 Information 事实驱动；模块不保存
+ * per-chat 状态，也不依赖订阅安装顺序。
+ * createRouterModule 注入投递/模型失败 kind，返回声明订阅的模块；settings schema
+ * 校验 Focus、时效与安全策略。state/memory selector 从账本读取因果链及记忆，冻结完整输入。
+ * Light 在模型结构修复阶段检查本轮动作边界；同协议重放沿持久化请求复用 Prompt 和上下文，防止迟到历史触发第二次任务。
+ * 规划前使用冻结的本轮输入与聊天历史；未完成的记忆模块不提供额外召回。
+ * 宿主 conversation 能力冻结背景和候选；跨会话获胜决策交给 route 复核，失败关闭当前 turn，不回退发送。
+ * dispatchDecision 仅将独立 Light 的获胜 message 结果按 claim 注册一次意图，末条输入决定目标；
+ * turn 标识及引用保留完整冻结上下文，正文生成交给 composer。wait/silent 与失败路径
+ * 写入等待或终态；registerOnce/commitTerminal 保证重放幂等，模型 I/O 经宿主 capability 执行，平台 I/O 由 delivery 层负责。
+ * 展示契约：Manifest 直接提供中文名称、摘要及输入输出职责，供 Inspection 与 WebUI 展示。
+ * inspection 声明本模块的只读机制、领域数据和历史视图，由 Host/Server 投影给开发者控制台。
+ * Situation 先恢复或登记固定 frame 和观察清单；observe gate 在模型调用前确认完整页并发布连续进度，缺口保留待处理。
+ */
+import {
+  observationCompleted,
+  observationProgress,
+  persistedSituationSelector,
+  recordSituationObservations,
+  confirmSituationObservations,
+} from "../observation.js";
+import {
+  observationCapability,
+  actionRunValidityCapability,
+} from "@kaguya/sdk";
 import {
   frozenLifecycleSelector,
   lifecycleStateInformationKind,
@@ -6,46 +38,6 @@ import {
   backgroundPeopleSelector,
   freezeBackgroundPeople,
 } from "./background-people.js";
-/**
- * 候选新旧由 Selector 的账本注册顺序确定；相同/迟到业务时间及随机 UUID 不改变消费先后。
- * Light 的 message 决策只传目标与冻结引用。
- * manifest 声明 Light 模板；调用 compileLightPrompt 时传入装配阶段加载的 default/local 文本，不再使用代码内默认值。
- * settings schema 的公开中文元数据供管理表单使用，运行时与保存共用约束。
- * 管理端批准的跨会话 candidate 由宿主直接认领，不再触发 Light；其 delivery 仍使用本模块统一 turn 终态。
- * Selector 只遍历开放 candidate 及最近 claim；恢复旧积压时每 scope 只推进一次合并观察。
- * 在线 Router 编排器。所有推进都由可重放 Information 事实驱动；模块不保存
- * per-chat 状态，也不依赖订阅安装顺序。
- * createRouterModule 注入投递/模型失败 kind，返回声明订阅的模块；settings schema
- * 校验 Focus、时效与安全策略。state/memory selector 从账本读取因果链及记忆，冻结完整输入。
- * Light 在模型结构修复阶段检查本轮动作边界；同协议重放沿持久化请求复用 Prompt 和上下文，防止迟到历史触发第二次任务。
- * 规划前使用冻结的本轮输入与聊天历史；未完成的记忆模块不提供额外召回。
- * 宿主 conversation 能力冻结背景和候选；跨会话获胜决策交给 route 复核，失败关闭当前 turn，不回退发送。
- * dispatchDecision 仅将独立 Light 的获胜 message 结果按 claim 注册一次意图，末条输入决定目标；
- * turn 标识及引用保留完整冻结上下文，正文生成交给 composer。wait/silent 与失败路径
- * 写入等待或终态；registerOnce/commitTerminal 保证重放幂等，模型 I/O 经宿主 capability 执行，平台 I/O 由 delivery 层负责。
- * 展示契约：Manifest 直接提供中文名称、摘要及输入输出职责，供 Inspection 与 WebUI 展示。
- * inspection 声明本模块的只读机制、领域数据和历史视图，由 Host/Server 投影给开发者控制台。
- */
-/**
- * 候选新旧由 Selector 的账本注册顺序确定；相同/迟到业务时间及随机 UUID 不改变消费先后。
- * Light 的 message 决策只传目标与冻结引用。
- * manifest 声明 Light 模板；调用 compileLightPrompt 时传入装配阶段加载的 default/local 文本，不再使用代码内默认值。
- * settings schema 的公开中文元数据供管理表单使用，运行时与保存共用约束。
- * 管理端批准的跨会话 candidate 由宿主直接认领，不再触发 Light；其 delivery 仍使用本模块统一 turn 终态。
- * Selector 只遍历开放 candidate 及最近 claim；恢复旧积压时每 scope 只推进一次合并观察。
- * 在线 Router 编排器。所有推进都由可重放 Information 事实驱动；模块不保存
- * per-chat 状态，也不依赖订阅安装顺序。
- * createRouterModule 注入投递/模型失败 kind，返回声明订阅的模块；settings schema
- * 校验 Focus、时效与安全策略。state/memory selector 从账本读取因果链及记忆，冻结完整输入。
- * Light 在模型结构修复阶段检查本轮动作边界；同协议重放沿持久化请求复用 Prompt 和上下文，防止迟到历史触发第二次任务。
- * 规划前使用冻结的本轮输入与聊天历史；未完成的记忆模块不提供额外召回。
- * 宿主 conversation 能力冻结背景和候选；跨会话获胜决策交给 route 复核，失败关闭当前 turn，不回退发送。
- * dispatchDecision 仅将独立 Light 的获胜 message 结果按 claim 注册一次意图，末条输入决定目标；
- * turn 标识及引用保留完整冻结上下文，正文生成交给 composer。wait/silent 与失败路径
- * 写入等待或终态；registerOnce/commitTerminal 保证重放幂等，模型 I/O 经宿主 capability 执行，平台 I/O 由 delivery 层负责。
- * 展示契约：Manifest 直接提供中文名称、摘要及输入输出职责，供 Inspection 与 WebUI 展示。
- * inspection 声明本模块的只读机制、领域数据和历史视图，由 Host/Server 投影给开发者控制台。
- */
 import { situationFrozenInformationKind } from "../situation-runtime.js";
 import { situationHistorySelector } from "../situation-history.js";
 import { buildSituationFrame } from "../situation-model.js";
@@ -228,17 +220,27 @@ const lightInterruptSelector = defineInformationSelector({
             }),
           )[0]
         : sourceAtom;
-    const source = (anchor?.payload as any)?.source;
+    const frozenAnchor =
+      anchor?.kind === attentionArousalCompletedInformationKind.kind
+        ? add(
+            await ledger.related({
+              from: [anchor.informationId],
+              relation: "core:uses-context",
+              direction: "outgoing",
+              limit: 100,
+            }),
+          ).find((a) => a.kind === turnContextCompletedInformationKind.kind)
+        : anchor;
+    const source = (frozenAnchor?.payload as any)?.source;
     if (!source) return [...selected.keys()];
     const scopeKey = scopeOf(source);
     const candidate = add(
       await ledger.find({
         kinds: [turnCandidateInformationKind.kind],
-        ...(sourceAtom.kind === "core.model.task.requested" &&
-        (anchor?.payload as any)?.candidateInformationId
+        ...((frozenAnchor?.payload as any)?.candidateInformationId
           ? {
               informationIds: [
-                String((anchor!.payload as any).candidateInformationId),
+                String((frozenAnchor!.payload as any).candidateInformationId),
               ],
             }
           : {
@@ -556,16 +558,8 @@ function createRoutingModule(
   ] as const;
   const maybeInterruptLight = async (
     context: InformationModuleHandlerContext,
-    settings: DeepReadonly<RouterSettings>,
   ): Promise<boolean> => {
     const atoms = await context.select(lightInterruptSelector);
-    const source =
-      context.sourceAtom ??
-      atoms.find(
-        (atom) =>
-          atom.kind === inboundTextInformationKind.kind ||
-          atom.kind === attentionArousalCompletedInformationKind.kind,
-      );
     const candidate = atoms.find(
       (atom) => atom.kind === turnCandidateInformationKind.kind,
     );
@@ -592,7 +586,7 @@ function createRoutingModule(
       for (const requested of requests) {
         await context.use(options.modelTaskCapability).cancel({
           requestedInformationId: requested.informationId,
-          reason: "New message interrupted Light",
+          reason: "Persistent run invalidation interrupted Light",
         });
       }
       return true;
@@ -611,17 +605,22 @@ function createRoutingModule(
     );
     if (!frozen || !attention) return false;
     const attempt = Number((candidate.payload as any).rebuildAttempt ?? 0);
-    if (attempt >= settings.lightInterruptMaxConsecutiveCount) return false;
-    const consumed = new Set(
-      (frozen.payload.inputs as any[]).map((input) => input.informationId),
-    );
-    const incoming = atoms.filter(
-      (atom) =>
-        atom.kind === inboundTextInformationKind.kind &&
-        !consumed.has(atom.informationId),
-    );
-    const trigger = incoming.at(-1);
-    if (!trigger) return false;
+    const source = frozen.payload.source as any;
+    const d = source.destination;
+    const validity = await context
+      .use(actionRunValidityCapability)
+      .runValidity(
+        claim.informationId,
+        JSON.stringify([
+          source.platform,
+          source.adapterId,
+          d.kind,
+          d.userId ?? d.groupId ?? d.conversationId ?? null,
+        ]),
+      );
+    // 普通插话仅进入后续 observation，只有宿主已持久确认的干预才使旧规划失效。
+    if (validity.valid || !validity.causeInformationId) return false;
+    const trigger = { informationId: validity.causeInformationId };
     const runtime = atoms.find((atom) => atom.kind === "core.runtime.context");
     if (!runtime) return false;
     const winner = await context.commitTerminal(
@@ -669,7 +668,7 @@ function createRoutingModule(
     for (const requested of requests) {
       await context.use(options.modelTaskCapability).cancel({
         requestedInformationId: requested.informationId,
-        reason: "New message interrupted Light",
+        reason: "Persistent run invalidation interrupted Light",
       });
     }
     return true;
@@ -729,6 +728,8 @@ function createRoutingModule(
         options.executionExhaustedInformationKind,
       ],
       produces: [
+        observationCompleted,
+        observationProgress,
         situationFrozenInformationKind,
         ...focusKinds,
         lightDecisionInformationKind,
@@ -748,6 +749,7 @@ function createRoutingModule(
         turnInterruptedInformationKind,
       ],
       selectors: [
+        persistedSituationSelector,
         frozenLifecycleSelector,
         situationHistorySelector,
         backgroundPeopleSelector,
@@ -758,6 +760,8 @@ function createRoutingModule(
       ],
       promptRenderers: [],
       requires: [
+        observationCapability,
+        actionRunValidityCapability,
         oneShotScheduleCapability,
         options.modelTaskCapability,
         options.rawContextCapability,
@@ -785,7 +789,7 @@ function createRoutingModule(
             delivery: "durable",
           },
           async (_atom, context) => {
-            await maybeInterruptLight(context, settings);
+            await maybeInterruptLight(context);
           },
         ),
         ...(options.modelTaskRequestedInformationKind
@@ -797,7 +801,7 @@ function createRoutingModule(
                   delivery: "durable",
                 },
                 async (_atom, context) => {
-                  await maybeInterruptLight(context, settings);
+                  await maybeInterruptLight(context);
                 },
               ),
             ]
@@ -836,6 +840,13 @@ function createRoutingModule(
           },
           async (turn, context) => {
             const payload = turn.payload as any;
+            const previousFreeze = (
+              await context.select(persistedSituationSelector)
+            )[0];
+            if (previousFreeze) {
+              await recordSituationObservations(context, turn, previousFreeze);
+              return;
+            }
             const selected = await context.select(lightContextSelector);
             let raw = selected.find(
               (a) =>
@@ -1185,7 +1196,7 @@ function createRoutingModule(
                   },
                 ];
               });
-            await context.registerOnce(
+            const frozenSituation = await context.registerOnce(
               "agent.situation.frozen",
               turn.informationId,
               situationFrozenInformationKind,
@@ -1213,6 +1224,7 @@ function createRoutingModule(
                 })),
               },
             );
+            await recordSituationObservations(context, turn, frozenSituation);
           },
         ),
         ...[attentionArousalCompletedInformationKind].map((definition) =>
@@ -1252,7 +1264,17 @@ function createRoutingModule(
                   atom.informationId === sourceAtom.payload.claimInformationId,
               );
               if (!decision || !candidate || !claim) return;
-              if (await maybeInterruptLight(context, settings)) return;
+              const frozenSituation = (
+                await context.select(persistedSituationSelector)
+              )[0];
+              if (!frozenSituation)
+                throw new Error("Missing persisted observation frame");
+              await confirmSituationObservations(
+                context,
+                sourceAtom,
+                frozenSituation,
+              );
+              if (await maybeInterruptLight(context)) return;
               const gate = {
                 ...decision.payload,
                 claimInformationId: claim.informationId,
@@ -1389,6 +1411,7 @@ function createRoutingModule(
                   contextAtoms: taskAtoms,
                 });
               if (result.status !== "completed") return;
+              if (await maybeInterruptLight(context)) return;
               const parsed =
                 result.status === "completed"
                   ? lightActionSchema.safeParse(result.output)

@@ -1,4 +1,5 @@
 /**
+ * 原生工具完成分支由 Runtime 循环接续，不进入 Heavy 正文投递。
  * Heavy 根据冻结上下文逐段生成正文，每段成功投递后才创建下一步。
  * 接续绕过参与判断，保留原意图、原生模型历史、实际回执和新增消息。
  * 持久化 one-shot 计入模型耗时后安排短暂停顿，独立步骤键贯穿草稿、助手消息和投递。
@@ -174,6 +175,11 @@ type ModelTaskResultIdentity = {
 export type ModelTaskResult<TOutput> = ModelTaskResultIdentity &
   (
     | { readonly status: "completed"; readonly output: TOutput }
+    | {
+        readonly status: "tool-calls";
+        readonly native: import("@kaguya/schema").NativeResponse;
+        readonly calls: import("@kaguya/schema").NativeToolCall[];
+      }
     | {
         readonly status: "failed";
         readonly error: {
@@ -575,6 +581,8 @@ export function createHeavyModule<
               completed.payload.selectionPolicy.tier !== "heavy"
             )
               return;
+            // 原生工具步骤由宿主循环消费，只有最终正文进入现有投递/recall 路径。
+            if (completed.payload.generationKind === "tool-calls") return;
             const selected = await context.select(completedMessageSelector);
             const modelSource = selected.find(
               (a) => a.informationId === completed.payload.sourceInformationId,
@@ -1090,25 +1098,27 @@ export function createHeavyModule<
                   const selectedCandidates = candidates.filter((n) =>
                     request.payload.candidateIds.includes(n.id),
                   );
-                  snapshot = await (memory.recall ?? memory.freeze).call(
-                    memory,
-                    {
-                      scope: base.scope,
-                      owners: [
-                        ...new Set([
-                          ...base.owners,
-                          ...selectedCandidates.map((n) => n.metadata.ownerId),
-                        ]),
-                      ],
-                      asOf: base.frozenAt,
-                      people: base.people,
-                      participants: base.participants,
-                      query: request.payload.query,
-                      explicitIds: request.payload.candidateIds.filter((id) =>
-                        candidates.some((n) => n.id === id),
-                      ),
-                    },
-                  );
+                  snapshot = !base.cutoff
+                    ? base
+                    : await (memory.recall ?? memory.freeze).call(memory, {
+                        scope: base.scope,
+                        owners: [
+                          ...new Set([
+                            ...base.owners,
+                            ...selectedCandidates.map(
+                              (n) => n.metadata.ownerId,
+                            ),
+                          ]),
+                        ],
+                        asOf: base.frozenAt,
+                        cutoff: base.cutoff,
+                        people: base.people,
+                        participants: base.participants,
+                        query: request.payload.query,
+                        explicitIds: request.payload.candidateIds.filter((id) =>
+                          candidates.some((n) => n.id === id),
+                        ),
+                      });
                   status = "completed";
                 } catch {
                   status = "failed";

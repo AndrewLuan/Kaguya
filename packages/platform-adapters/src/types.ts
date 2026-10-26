@@ -54,6 +54,8 @@ export interface PlatformInboundMessage {
 
 export interface PlatformDeliveryReceipt {
   readonly ok: boolean;
+  /** 未声明的失败保守解释为 unknown，不能据此重发。 */
+  readonly outcome?: "delivered" | "rejected-before-effect" | "unknown";
   readonly adapterId: string;
   readonly platform: PlatformName;
   readonly target: PlatformMessageTarget;

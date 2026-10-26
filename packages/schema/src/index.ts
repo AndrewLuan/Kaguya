@@ -1,4 +1,5 @@
 /**
+ * 跨领域 Inspection DTO 从 inspection-domain 导出，保留独立证据状态和有界读取协议。
  * memory-graph.ts 提供 Memory 节点／边管理与图快照的共享协议。
  * QQ 表情使用独立结构化素材契约，出站保留原 text/reply 兼容性；图片只允许已缓存 base64。
  * module-templates.ts 提供未渲染模板管理 DTO，避免与 CompiledPrompt 混用。
@@ -13,6 +14,7 @@
  * 边界；持久化事实统一使用 `InformationAtom`，数据库不再依赖事件或消息记录 schema。
  * 输入输出与副作用：所有 schema 只做同步解析与校验，不产生 I/O；严格对象 schema
  * 会拒绝未声明字段，平台返回的 `platformMessageId` 仍作为合法外部身份保留。
+ * scene.ts 导出结构化场景身份与历史 scope 映射，供 SDK 和数据库按完整地址隔离观察范围。
  */
 export * from "./inspection.js";
 export * from "./situation-context.js";
@@ -188,3 +190,7 @@ export {
   type ActivitySpan,
   type LifecycleSnapshot,
 } from "./lifecycle.js";
+
+export * from "./scene.js";
+
+export * from "./inspection-domain.js";
